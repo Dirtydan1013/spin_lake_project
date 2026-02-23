@@ -97,3 +97,79 @@ def ed_thermal_density(H: np.ndarray, N: int, beta: float) -> float:
         for k in range(dim):
             density += rho_diag[k] * np.dot(eigvecs[:, k] * n_i, eigvecs[:, k])
     return density / N
+
+
+def ed_ground_state_energy(H: np.ndarray) -> float:
+    """Compute exact ground state energy.
+
+    Args:
+        H:    Hamiltonian matrix.
+
+    Returns:
+        Ground state energy.
+    """
+    eigvals, _ = eigh(H)
+    return eigvals[0]
+
+
+def ed_ground_state_density(H: np.ndarray, N: int) -> float:
+    """Compute exact ground state Rydberg excitation density ⟨n⟩ = (1/N) Σ_i ⟨n_i⟩.
+
+    Args:
+        H:    Hamiltonian matrix.
+        N:    Number of sites.
+
+    Returns:
+        Average site occupation density in the ground state.
+    """
+    dim = 1 << N
+    eigvals, eigvecs = eigh(H)
+    v0 = eigvecs[:, 0]
+
+    density = 0.0
+    for i in range(N):
+        n_i = np.array([(s >> i) & 1 for s in range(dim)], dtype=float)
+        density += np.dot(v0 * n_i, v0)
+    return density / N
+def ed_ground_state_observables(H: np.ndarray, N: int):
+    """Compute exact ground state observables.
+    
+    Returns:
+        (density, staggered_density_squared, staggered_susceptibility, binder_cumulant)
+    """
+    dim = 1 << N
+    if dim <= 1024:
+        from scipy.linalg import eigh
+        eigvals, eigvecs = eigh(H)
+        v0 = eigvecs[:, 0]
+    else:
+        from scipy.sparse.linalg import eigsh
+        eigvals, eigvecs = eigsh(H, k=1, which='SA')
+        v0 = eigvecs[:, 0]
+
+    density = 0.0
+    staggered_abs = 0.0
+    staggered_sq = 0.0
+    staggered_qd = 0.0
+    
+    for s in range(dim):
+        prob = v0[s]**2
+        if prob < 1e-12: continue
+        dens = 0.0
+        stag = 0.0
+        for i in range(N):
+            n_i = (s >> i) & 1
+            dens += n_i
+            stag += n_i * (1 if i % 2 == 0 else -1)
+        dens /= N
+        stag /= N
+        
+        density += prob * dens
+        staggered_abs += prob * abs(stag)
+        staggered_sq += prob * (stag**2)
+        staggered_qd += prob * (stag**4)
+        
+    chi = N * (staggered_sq - staggered_abs**2)
+    binder = 1.5 * (1.0 - (staggered_qd / (3.0 * staggered_sq**2 + 1e-12)))
+        
+    return density, staggered_sq, chi, binder

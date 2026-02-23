@@ -338,23 +338,45 @@ class QAQMC_Rydberg:
         for p in range(self.M):
             if self.op_types[p] == -1:
                 cur[self.op_sites[p]] ^= 1
+                
+        density = np.mean(cur)
+        staggered = np.mean([cur[i] * (1 if i % 2 == 0 else -1) for i in range(self.N)])
         
-        return np.mean(cur)
+        return density, abs(staggered), staggered**2, staggered**4
         
     def run(self, n_equil=5000, n_measure=10000):
         for _ in range(n_equil):
             self.mc_step()
             
         densities = np.empty(n_measure)
+        stag_abs = np.empty(n_measure)
+        stag_sqs = np.empty(n_measure)
+        stag_qds = np.empty(n_measure)
         for step in range(n_measure):
             self.mc_step()
-            densities[step] = self.measure_symmetric()
+            d, s_abs, s2, s4 = self.measure_symmetric()
+            densities[step] = d
+            stag_abs[step] = s_abs
+            stag_sqs[step] = s2
+            stag_qds[step] = s4
             
         n_bins = 50
         bs = n_measure // n_bins
         d_bins = np.array([np.mean(densities[i*bs:(i+1)*bs]) for i in range(n_bins)])
+        s2_bins = np.array([np.mean(stag_sqs[i*bs:(i+1)*bs]) for i in range(n_bins)])
+        s4_bins = np.array([np.mean(stag_qds[i*bs:(i+1)*bs]) for i in range(n_bins)])
+        chi_bins = np.array([self.N * (np.mean(stag_sqs[i*bs:(i+1)*bs]) - np.mean(stag_abs[i*bs:(i+1)*bs])**2) for i in range(n_bins)])
+        
+        # Binder Cumulant U = 1.5 * (1 - 1/3 * <m^4> / <m^2>^2)
+        binder_bins = 1.5 * (1.0 - (s4_bins / (3.0 * s2_bins**2 + 1e-12)))
         
         return {
             'density_mean': float(np.mean(d_bins)),
             'density_err':  float(np.std(d_bins) / np.sqrt(n_bins)),
+            'stag_sq_mean': float(np.mean(s2_bins)),
+            'stag_sq_err':  float(np.std(s2_bins) / np.sqrt(n_bins)),
+            'chi_mean': float(np.mean(chi_bins)),
+            'chi_err':  float(np.std(chi_bins) / np.sqrt(n_bins)),
+            'binder_mean': float(np.mean(binder_bins)),
+            'binder_err':  float(np.std(binder_bins) / np.sqrt(n_bins)),
         }
