@@ -26,7 +26,7 @@ def main():
         
         # Run QAQMC ONCE for the whole sweep
         qaqmc = QAQMC_Rydberg(N=L, Omega=Omega, delta_min=delta_min, delta_max=delta_max, Rb=Rb, M=M, seed=42)
-        res = qaqmc.run_asymmetric(n_equil=4000, n_measure=14000, n_jobs=4)
+        res = qaqmc.run_asymmetric(n_equil=4000, n_measure=14000, n_jobs=32, backend='process')
         
         deltas_qmc = res['deltas']
         chi_qmc = res['chi_mean']

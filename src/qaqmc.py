@@ -15,6 +15,18 @@ from src.hamiltonian import build_rydberg_vij
 from src.qmc_updates import build_alias_table, qaqmc_diagonal_update, qaqmc_cluster_update
 from src.measurement import calc_density, calc_staggered_magnetization
 
+def _split_work(n_total, n_jobs):
+    base = n_total // n_jobs
+    rem = n_total % n_jobs
+    return [base + (1 if i < rem else 0) for i in range(n_jobs)]
+
+def _get_executor_class(backend):
+    if backend == "thread":
+        return concurrent.futures.ThreadPoolExecutor
+    if backend == "process":
+        return concurrent.futures.ProcessPoolExecutor
+    raise ValueError(f"Unsupported backend={backend!r}. Use 'thread' or 'process'.")
+
 def _run_asymmetric_worker(kwargs, seed, n_equil, n_measure, worker_id, verbose):
     np.random.seed(seed)
     instance = QAQMC_Rydberg(**kwargs)
@@ -191,15 +203,18 @@ class QAQMC_Rydberg:
                 
         return densities, m_zs
         
-    def run_asymmetric(self, n_equil=5000, n_measure=10000, verbose=True, n_jobs=1):
+    def run_asymmetric(self, n_equil=5000, n_measure=10000, verbose=True, n_jobs=1, backend="thread"):
         """Runs QAQMC and collects asymmetric expectation values across the parameter sweep."""
         if n_jobs > 1:
-            chunk_size = n_measure // n_jobs
             futures = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
-                for i in range(n_jobs):
+            counts = _split_work(n_measure, n_jobs)
+            executor_cls = _get_executor_class(backend)
+            with executor_cls(max_workers=n_jobs) as executor:
+                for i, count in enumerate(counts):
+                    if count <= 0:
+                        continue
                     seed_i = self.init_kwargs['seed'] + (i + 1) * 1234
-                    futures.append(executor.submit(_run_asymmetric_worker, self.init_kwargs, seed_i, n_equil, chunk_size, i, verbose))
+                    futures.append(executor.submit(_run_asymmetric_worker, self.init_kwargs, seed_i, n_equil, count, i, verbose))
             
             densities_list, mz_list = [], []
             for f in futures:
@@ -254,14 +269,17 @@ class QAQMC_Rydberg:
             'm_z_sq_err': m_z_sq_err
         }
         
-    def run(self, n_equil=5000, n_measure=10000, verbose=True, n_jobs=1):
+    def run(self, n_equil=5000, n_measure=10000, verbose=True, n_jobs=1, backend="thread"):
         if n_jobs > 1:
-            chunk_size = n_measure // n_jobs
             futures = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
-                for i in range(n_jobs):
+            counts = _split_work(n_measure, n_jobs)
+            executor_cls = _get_executor_class(backend)
+            with executor_cls(max_workers=n_jobs) as executor:
+                for i, count in enumerate(counts):
+                    if count <= 0:
+                        continue
                     seed_i = self.init_kwargs['seed'] + (i + 1) * 1234
-                    futures.append(executor.submit(_run_symmetric_worker, self.init_kwargs, seed_i, n_equil, chunk_size, i, verbose))
+                    futures.append(executor.submit(_run_symmetric_worker, self.init_kwargs, seed_i, n_equil, count, i, verbose))
                     
             densities_list, mz_list = [], []
             for f in futures:
