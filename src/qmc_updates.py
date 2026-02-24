@@ -24,7 +24,7 @@ def build_alias_table(weights):
         (small if prob_arr[l_] < 1.0 else large).append(l_)
     return prob_arr, alias_arr
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _alias_sample(prob, alias, n):
     """Sample index from alias table in O(1)."""
     i = np.random.randint(0, n)
@@ -34,7 +34,7 @@ def _alias_sample(prob, alias, n):
 
 # ─── SSE Updates ─────────────────────────────────────────────────────────────
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def sse_diagonal_update(op_types, op_sites, state, M, n_ops,
                     beta, norm_N,
                     bond_sites, bond_W, bond_W_max,
@@ -76,7 +76,7 @@ def sse_diagonal_update(op_types, op_sites, state, M, n_ops,
                         n_ops += 1
     return n_ops
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _flip_segment_range_sse(state_at, site_i, p_start_excl, p_end_incl, M):
     """Flip state_at[p, site_i] for p in (p_start, p_end] (mod M)."""
     if p_end_incl > p_start_excl:
@@ -91,7 +91,7 @@ def _flip_segment_range_sse(state_at, site_i, p_start_excl, p_end_incl, M):
         for p in range(M):
             state_at[p, site_i] ^= 1
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _segment_log_weight_ratio_sse(state_at, op_types, op_sites, site_i,
                                p_start_excl, p_end_incl, M, N,
                                bond_sites, bond_W):
@@ -123,14 +123,14 @@ def _segment_log_weight_ratio_sse(state_at, op_types, op_sites, site_i,
         for p in range(M): _proc(p)
     return log_w_new - log_w_old
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _segment_contains_time0(p_start_excl, p_end_incl, M):
     if p_end_incl > p_start_excl:
         return p_start_excl < 0 <= p_end_incl
     else:
         return True
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def sse_cluster_update(op_types, op_sites, state, M, N, bond_sites, bond_W):
     """Line cluster update for SSE."""
     if M == 0: return
@@ -178,7 +178,7 @@ def sse_cluster_update(op_types, op_sites, state, M, N, bond_sites, bond_W):
 
 # ─── QAQMC Updates ───────────────────────────────────────────────────────────
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def qaqmc_diagonal_update(op_types, op_sites, state, M_total,
                           bond_sites, bond_W_all, bond_W_max_all,
                           n_alias_all, alias_prob_all, alias_idx_all,
@@ -216,13 +216,13 @@ def qaqmc_diagonal_update(op_types, op_sites, state, M_total,
                         op_sites[p] = b
                         inserted = True
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _flip_segment_range_qaqmc(state_at, site_i, p_start_excl, p_end_incl, M_total):
     """Strictly open bounded segment flip function."""
     for p in range(max(0, p_start_excl + 1), min(M_total, p_end_incl + 1)):
         state_at[p, site_i] ^= 1
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _segment_log_weight_ratio_qaqmc(state_at, op_types, op_sites, site_i,
                                p_start_excl, p_end_incl, M_total, N,
                                bond_sites, bond_W_all):
@@ -247,7 +247,7 @@ def _segment_log_weight_ratio_qaqmc(state_at, op_types, op_sites, site_i,
         _proc(p)
     return log_w_new - log_w_old
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def qaqmc_cluster_update(op_types, op_sites, state, M_total, N, bond_sites, bond_W_all):
     """Open boundary cluster update for QAQMC."""
     if M_total == 0: return
