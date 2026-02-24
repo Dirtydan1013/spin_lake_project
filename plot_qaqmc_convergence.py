@@ -24,7 +24,7 @@ def main():
     for M in M_values:
         print(f"Running QAQMC for M = {M}...")
         qaqmc = QAQMC_Rydberg(N=N, Omega=Omega, delta_min=delta_min, delta_max=delta_max, Rb=Rb, M=M, seed=42)
-        res = qaqmc.run(n_equil=20000, n_measure=20000)
+        res = qaqmc.run(n_equil=20000, n_measure=20000, n_jobs=4)
         qaqmc_densities.append(res['density_mean'])
         qaqmc_errors.append(res['density_err'])
         print(f"  Result: {res['density_mean']:.6f} +/- {res['density_err']:.6f}")
