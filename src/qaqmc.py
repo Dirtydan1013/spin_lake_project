@@ -13,7 +13,10 @@ import concurrent.futures
 
 from src.hamiltonian import build_rydberg_vij
 from src.qmc_updates import build_alias_table, qaqmc_diagonal_update, qaqmc_cluster_update
-from src.measurement import calc_density, calc_staggered_magnetization
+from src.measurement import (
+    measure_symmetric_from_ops_numba,
+    measure_asymmetric_all_from_ops_numba,
+)
 
 def _split_work(n_total, n_jobs):
     base = n_total // n_jobs
@@ -36,17 +39,24 @@ def _run_asymmetric_worker(kwargs, seed, n_equil, n_measure, worker_id, verbose)
     for _ in equil_iter:
         instance.mc_step()
         
-    densities_accum = np.zeros((n_measure, instance.M))
-    m_z_accum = np.zeros((n_measure, instance.M))
+    density_sum = np.zeros(instance.M, dtype=np.float64)
+    density_sumsq = np.zeros(instance.M, dtype=np.float64)
+    mz_abs_sum = np.zeros(instance.M, dtype=np.float64)
+    mz_sq_sum = np.zeros(instance.M, dtype=np.float64)
+    mz_quad_sum = np.zeros(instance.M, dtype=np.float64)
     
     measure_iter = trange(n_measure, desc="Meas  (W0)", leave=False) if use_tqdm else range(n_measure)
     for step in measure_iter:
         instance.mc_step()
         d_arr, mz_arr = instance.measure_asymmetric_all()
-        densities_accum[step] = d_arr
-        m_z_accum[step] = mz_arr
-        
-    return densities_accum, m_z_accum
+        mz_sq = mz_arr * mz_arr
+        density_sum += d_arr
+        density_sumsq += d_arr * d_arr
+        mz_abs_sum += np.abs(mz_arr)
+        mz_sq_sum += mz_sq
+        mz_quad_sum += mz_sq * mz_sq
+
+    return n_measure, density_sum, density_sumsq, mz_abs_sum, mz_sq_sum, mz_quad_sum
 
 def _run_symmetric_worker(kwargs, seed, n_equil, n_measure, worker_id, verbose):
     np.random.seed(seed)
@@ -179,29 +189,19 @@ class QAQMC_Rydberg:
             self.bond_sites, self.bond_W_all)
             
     def measure_symmetric(self) -> dict:
-        cur = np.zeros(self.N, dtype=np.int32)
-        for p in range(self.M):
-            if self.op_types[p] == -1:
-                cur[self.op_sites[p]] ^= 1
-                
+        density, m_z = measure_symmetric_from_ops_numba(
+            self.op_types, self.op_sites, self.N, self.M
+        )
         return {
-            'density': calc_density(cur),
-            'm_z': calc_staggered_magnetization(cur)
+            'density': float(density),
+            'm_z': float(m_z)
         }
         
     def measure_asymmetric_all(self):
         """Measures observables at every time slice p from 0 to M."""
-        cur = np.zeros(self.N, dtype=np.int32)
-        densities = np.empty(self.M)
-        m_zs = np.empty(self.M)
-        
-        for p in range(self.M):
-            densities[p] = calc_density(cur)
-            m_zs[p] = calc_staggered_magnetization(cur)
-            if self.op_types[p] == -1:
-                cur[self.op_sites[p]] ^= 1
-                
-        return densities, m_zs
+        return measure_asymmetric_all_from_ops_numba(
+            self.op_types, self.op_sites, self.N, self.M
+        )
         
     def run_asymmetric(self, n_equil=5000, n_measure=10000, verbose=True, n_jobs=1, backend="thread"):
         """Runs QAQMC and collects asymmetric expectation values across the parameter sweep."""
@@ -215,44 +215,54 @@ class QAQMC_Rydberg:
                         continue
                     seed_i = self.init_kwargs['seed'] + (i + 1) * 1234
                     futures.append(executor.submit(_run_asymmetric_worker, self.init_kwargs, seed_i, n_equil, count, i, verbose))
-            
-            densities_list, mz_list = [], []
+
+            actual_measure = 0
+            density_sum = np.zeros(self.M, dtype=np.float64)
+            density_sumsq = np.zeros(self.M, dtype=np.float64)
+            mz_abs_sum = np.zeros(self.M, dtype=np.float64)
+            mz_sq_sum = np.zeros(self.M, dtype=np.float64)
+            mz_quad_sum = np.zeros(self.M, dtype=np.float64)
             for f in futures:
-                d, mz = f.result()
-                densities_list.append(d)
-                mz_list.append(mz)
-                
-            densities_accum = np.vstack(densities_list)
-            m_z_accum = np.vstack(mz_list)
-            actual_measure = densities_accum.shape[0]
+                c, d_sum, d_sumsq, mz_abs_s, mz_sq_s, mz_quad_s = f.result()
+                actual_measure += c
+                density_sum += d_sum
+                density_sumsq += d_sumsq
+                mz_abs_sum += mz_abs_s
+                mz_sq_sum += mz_sq_s
+                mz_quad_sum += mz_quad_s
         else:
             actual_measure = n_measure
             equil_iter = trange(n_equil, desc="Equil  ", leave=False) if (HAS_TQDM and verbose) else range(n_equil)
             for _ in equil_iter:
                 self.mc_step()
-                
-            densities_accum = np.zeros((n_measure, self.M))
-            m_z_accum = np.zeros((n_measure, self.M))
+
+            density_sum = np.zeros(self.M, dtype=np.float64)
+            density_sumsq = np.zeros(self.M, dtype=np.float64)
+            mz_abs_sum = np.zeros(self.M, dtype=np.float64)
+            mz_sq_sum = np.zeros(self.M, dtype=np.float64)
+            mz_quad_sum = np.zeros(self.M, dtype=np.float64)
             
             measure_iter = trange(n_measure, desc="Measure", leave=False) if (HAS_TQDM and verbose) else range(n_measure)
             for step in measure_iter:
                 self.mc_step()
                 d_arr, mz_arr = self.measure_asymmetric_all()
-                densities_accum[step] = d_arr
-                m_z_accum[step] = mz_arr
-            
-        m_z_sq = m_z_accum ** 2
-        m_z_abs = np.abs(m_z_accum)
-        m_z_quad = m_z_sq ** 2
-        
-        densities_mean = np.mean(densities_accum, axis=0)
-        densities_err = np.std(densities_accum, axis=0) / np.sqrt(actual_measure)
-        
-        m_z_sq_mean = np.mean(m_z_sq, axis=0)
-        m_z_sq_err = np.std(m_z_sq, axis=0) / np.sqrt(actual_measure)
-        
-        m_z_abs_mean = np.mean(m_z_abs, axis=0)
-        m_z_quad_mean = np.mean(m_z_quad, axis=0)
+                mz_sq = mz_arr * mz_arr
+                density_sum += d_arr
+                density_sumsq += d_arr * d_arr
+                mz_abs_sum += np.abs(mz_arr)
+                mz_sq_sum += mz_sq
+                mz_quad_sum += mz_sq * mz_sq
+
+        inv_n = 1.0 / actual_measure
+        densities_mean = density_sum * inv_n
+        density_var = np.maximum(density_sumsq * inv_n - densities_mean**2, 0.0)
+        densities_err = np.sqrt(density_var * inv_n)
+
+        m_z_sq_mean = mz_sq_sum * inv_n
+        m_z_abs_mean = mz_abs_sum * inv_n
+        m_z_quad_mean = mz_quad_sum * inv_n
+        m_z_sq_var = np.maximum(m_z_quad_mean - m_z_sq_mean**2, 0.0)
+        m_z_sq_err = np.sqrt(m_z_sq_var * inv_n)
         
         chi_mean = self.N * (m_z_sq_mean - m_z_abs_mean**2)
         binder_mean = 1.5 * (1.0 - m_z_quad_mean / (3.0 * m_z_sq_mean**2 + 1e-12))
