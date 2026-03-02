@@ -10,9 +10,22 @@ except ImportError:
     HAS_TQDM = False
 
 import concurrent.futures
+import multiprocessing
 import h5py
 import datetime
+import os
 import time
+
+# ── Linux: force 'spawn' to avoid fork-after-OpenMP-init deadlock ─────────────
+# On Linux, the default multiprocessing start method is 'fork'. Forking a
+# process that has already initialized OpenMP (via the C++ engine) causes
+# child processes to inherit a broken OpenMP state and hang indefinitely.
+# 'spawn' starts a fresh Python interpreter for each worker, which is safe.
+if multiprocessing.get_start_method(allow_none=True) is None:
+    import platform
+    if platform.system() == "Linux":
+        multiprocessing.set_start_method("spawn", force=True)
+
 
 from src.hamiltonian import build_rydberg_vij
 from src.qaqmc_updates import build_qaqmc_alias_tables, qaqmc_diagonal_update, qaqmc_cluster_update
