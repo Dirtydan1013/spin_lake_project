@@ -17,6 +17,17 @@ import time
 from src.hamiltonian import build_rydberg_vij
 from src.qaqmc_updates import build_qaqmc_alias_tables, qaqmc_diagonal_update, qaqmc_cluster_update
 
+try:
+    import os, subprocess, shutil
+    _gpp = shutil.which('g++')
+    if _gpp and os.name == 'nt':
+        _mingw_bin = os.path.dirname(os.path.realpath(_gpp))
+        os.add_dll_directory(_mingw_bin)
+    import qaqmc_cpp
+    HAS_CPP = True
+except (ImportError, OSError):
+    HAS_CPP = False
+
 
 def _split_work(n_total, n_jobs):
     base = n_total // n_jobs
@@ -35,6 +46,14 @@ def _run_and_save_worker(kwargs, seed, n_equil, n_samples, worker_id, verbose):
     np.random.seed(seed)
     instance = QAQMC_Rydberg(**kwargs)
     
+    # If C++ engine is available, use its bulk run() method for maximum speed
+    if instance._cpp_engine is not None:
+        t0 = time.perf_counter()
+        types_arr, sites_arr = instance._cpp_engine.run(n_equil, n_samples)
+        t_total = time.perf_counter() - t0
+        return types_arr, sites_arr, t_total * 0.3, t_total * 0.7  # approximate split
+    
+    # Fallback: Python/Numba path
     use_tqdm = HAS_TQDM and verbose and worker_id == 0
     t0_equil = time.perf_counter()
     equil_iter = trange(n_equil, desc="Equil (W0)", leave=False) if use_tqdm else range(n_equil)
@@ -62,11 +81,13 @@ def _run_and_save_worker(kwargs, seed, n_equil, n_samples, worker_id, verbose):
 class QAQMC_Rydberg:
     def __init__(self, N: int, Omega: float, delta_min: float, delta_max: float, Rb: float,
                  M: int, epsilon: float = 0.01, seed: int = 42, pos: np.ndarray = None,
-                 verbose: bool = True, n_jobs: int = 1, backend: str = "process"):
+                 verbose: bool = True, n_jobs: int = 1, backend: str = "process",
+                 use_cpp: bool = True):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
-            'verbose': False, 'n_jobs': 1, 'backend': "thread" # Workers shouldn't spawn more workers
+            'verbose': False, 'n_jobs': 1, 'backend': "thread",
+            'use_cpp': use_cpp,
         }
         self.N = N
         self.Omega = Omega
@@ -84,9 +105,24 @@ class QAQMC_Rydberg:
         if self.pos is None:
             self.pos = np.arange(N).reshape(-1, 1).astype(np.float64)
 
+        # ── Try C++ backend ──────────────────────────────────────────────
+        self._cpp_engine = None
+        if use_cpp and HAS_CPP:
+            pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
+            self._cpp_engine = qaqmc_cpp.QAQMCEngine(
+                N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr
+            )
+            # Mirror key attributes for compatibility
+            self.bond_sites = np.array(self._cpp_engine.bond_sites, dtype=np.int32)
+            self.op_types = np.array(self._cpp_engine.op_types, dtype=np.int32)
+            self.op_sites = np.array(self._cpp_engine.op_sites, dtype=np.int32)
+            if verbose:
+                print(f"[QAQMC] Using C++ backend (N={N}, M={M})")
+            return
+
+        # ── Fallback: Python/Numba path ──────────────────────────────────
         np.random.seed(seed)
         
-        # We only need the distance-dependent V_ij without the time-dependent delta yet
         _, bonds_i, bonds_j, vij_list, self.bond_sites = build_rydberg_vij(
             N, Omega, Rb, pos, verbose=verbose, n_jobs=n_jobs, backend=backend
         )
@@ -117,6 +153,14 @@ class QAQMC_Rydberg:
         self.state = np.zeros(N, dtype=np.int32)
 
     def mc_step(self):
+        if self._cpp_engine is not None:
+            self._cpp_engine.mc_step()
+            # Sync numpy views
+            self.op_types = np.array(self._cpp_engine.op_types, dtype=np.int32)
+            self.op_sites = np.array(self._cpp_engine.op_sites, dtype=np.int32)
+            return
+
+        # Fallback: Python/Numba path
         boundary_state = np.zeros(self.N, dtype=np.int32)
         
         qaqmc_diagonal_update(

@@ -1,0 +1,83 @@
+#pragma once
+#include <vector>
+#include <cstdint>
+#include <random>
+#include <cmath>
+#include <algorithm>
+#include <numeric>
+
+#ifdef QAQMC_USE_OPENMP
+#include <omp.h>
+#endif
+
+// ─── V_ij builder ────────────────────────────────────────────────────────────
+
+struct RydbergVij {
+    std::vector<int> bonds_i;
+    std::vector<int> bonds_j;
+    std::vector<double> vij_list;
+    std::vector<int> bond_sites_flat; // (n_bonds * 2), row-major
+    int n_bonds;
+};
+
+RydbergVij build_rydberg_vij(int N, double Omega, double Rb,
+                              const double* pos, int pos_dim);
+
+// ─── Alias Table ─────────────────────────────────────────────────────────────
+
+struct AliasTable {
+    // All arrays: first dimension = M_total (time slices)
+    std::vector<double> bond_W_all;      // (M_total * n_bonds_pad * 4)
+    std::vector<double> bond_W_max_all;  // (M_total * n_bonds_pad)
+    std::vector<int>    n_alias_all;     // (M_total)
+    std::vector<double> alias_prob_all;  // (M_total * max_alias)
+    std::vector<int64_t> alias_idx_all;  // (M_total * max_alias)
+    std::vector<int>    op_map_kind_all; // (M_total * max_alias)
+    std::vector<int>    op_map_loc_all;  // (M_total * max_alias)
+    int max_alias;
+    int n_bonds_pad; // max(n_bonds, 1)
+};
+
+AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
+                                     double Omega,
+                                     const double* delta_sched,
+                                     const double* bond_vij,
+                                     double epsilon);
+
+// ─── QAQMCEngine ─────────────────────────────────────────────────────────────
+
+class QAQMCEngine {
+public:
+    QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
+                double Rb, int M, double epsilon, uint64_t seed,
+                const double* pos, int pos_dim);
+
+    void mc_step();
+
+    // Accessors
+    int get_N() const { return N_; }
+    int get_M() const { return M_; }
+    int get_M_total() const { return M_total_; }
+    const std::vector<int32_t>& get_op_types() const { return op_types_; }
+    const std::vector<int32_t>& get_op_sites() const { return op_sites_; }
+    const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
+    const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
+
+private:
+    int N_, M_, M_total_;
+    double Omega_, Rb_, delta_min_, delta_max_;
+    double site_W_, site_W_max_;
+
+    std::mt19937_64 rng_;
+
+    RydbergVij vij_;
+    AliasTable alias_;
+    std::vector<double> delta_sched_;
+
+    std::vector<int32_t> op_types_;
+    std::vector<int32_t> op_sites_;
+
+    // Internal update functions
+    void diagonal_update();
+    void cluster_update();
+};
