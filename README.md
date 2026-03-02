@@ -95,5 +95,58 @@ from src.qaqmc import QAQMC_Rydberg
 # n_jobs: 在 run_and_save 裡控制平行的馬可夫鏈條數
 qmc = QAQMC_Rydberg(N=6, M=160, Omega=1.0, omp_threads=1)
 
+
 qmc.run_and_save("data/my_run.h5", n_equil=4000, n_samples=30000, n_jobs=4)
+```
+
+---
+
+## 🐍 替代方案：使用 Conda 安裝（無 Docker 環境適用）
+
+若伺服器沒有安裝 Docker，可改用 Conda 建立隔離的 Python 環境並手動編譯 C++ 核心。
+
+### 1. 建立 Conda 環境
+
+```bash
+conda create -n qaqmc python=3.12
+conda activate qaqmc
+```
+
+### 2. 安裝 Python 套件與建置工具
+
+```bash
+pip install -r requirements.txt
+
+# 確保 C++ 編譯相關的系統工具可用
+conda install -c conda-forge cmake ninja openmp
+```
+
+> 若伺服器已有系統級的 `g++` 與 `libomp`（例如 Ubuntu 上的 `build-essential` 和 `libomp-dev`），可跳過 conda 的編譯工具安裝，改用系統版本。
+
+### 3. 編譯 C++ 核心
+
+```bash
+cmake -S . -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DPYTHON_EXECUTABLE=$(which python)
+
+cmake --build build -j
+
+cp build/qaqmc_cpp*.so .
+```
+
+### 4. 執行模擬
+
+```bash
+# 前景執行（測試用）
+python test.py
+
+# 背景執行（SSH 斷線後不中斷）
+nohup python test.py > output.log 2>&1 &
+echo "PID: $!"          # 記下 PID，之後可用 kill <PID> 停止
+
+# 或使用 tmux（若伺服器有安裝）
+tmux new -s qaqmc
+python test.py
+# Ctrl+B → D 放到背景；之後 tmux attach -t qaqmc 回來查看
 ```
