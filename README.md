@@ -26,68 +26,74 @@ spin_lake_project/
 
 ---
 
-## 🛠️ 安裝與建置環境 (Installation & Build)
+## 🐳 安裝與執行 (Installation & Run — via Docker)
 
-要在本機上運行此專案，你需要準備 Python 環境以及 C++ 編譯器。本專案的建置系統基於 **CMake** 與 **Ninja**，並強烈依賴 **OpenMP** 來達成多核心平行加速。
-
-### 1. 準備 Python 依賴環境
-請確保你的 Python 版本為 3.8 以上 (推薦使用虛擬環境 `.venv`)，並安裝以下套件：
-
-```bash
-pip install numpy scipy numba h5py matplotlib tqdm 
-pip install cmake ninja pybind11
-```
-*(註：`cmake` 與 `ninja` 可直接透過 pip 安裝，不需污染系統環境)*
-
-### 2. 準備 C++ 編譯器 (Windows)
-因為本專案的 Windows 環境預設使用 MinGW GCC (為了更好地支援 OpenMP)，請 **不要** 使用 Visual Studio 的 MSVC。
-1. 下載並安裝 [MSYS2](https://www.msys2.org/)。
-2. 開啟 MSYS2 終端機，安裝 UCRT64 版本的 GCC：
-   ```bash
-   pacman -S mingw-w64-ucrt-x86_64-gcc
-   ```
-3. **重要：** 將 GCC 的路徑 (預設為 `C:\msys64\ucrt64\bin` 或 `D:\msys64\ucrt64\bin`) 加入到 Windows 系統的環境變數 `PATH` 中。
-
-*(註：如果你是 Linux / macOS 使用者，只要確保系統裡有 `g++` 或 `clang++` 以及 `libomp` 即可)*
-
-### 3. 一鍵編譯 C++ 核心 (.pyd)
-
-在專案根目錄下 (且已啟動 Python 虛擬環境)，執行：
-
-```bash
-cmd /c build.bat
-```
-
-這支腳本會自動完成：
-1. 呼叫 CMake 進行環境設定 (`-G Ninja`)。
-2. 呼叫 Ninja 且使用多執行緒高速編譯 C++ 原始碼。
-3. 把編譯好的 `.pyd` 擴充模組搬移到專案根目錄。
-
-如果看到 `Build complete!` 且偵測到 OpenMP 多執行緒數量，代表編譯大功告成。
+本專案推薦使用 **Docker** 來建立環境與執行模擬。你只需要安裝好 Docker，無需準備 Python 虛擬環境、C++ 編譯器或任何系統依賴。
 
 ---
 
-## 🚀 測試與使用 (Usage)
+### 1. 取得專案
 
-編譯完成後，就可以直接當作普通的 Python 套件來使用。
-
-### 執行測試
-驗證 QAQMC 結合 C++ 引擎是否正確運作 (會自動對比 Exact Diagonalization 結果)：
 ```bash
-python test.py
+git clone https://github.com/你的帳號/spin_lake_project.git
+cd spin_lake_project
 ```
-*(你應該會看到終端機印出 `[QAQMC] Using C++ backend...` 以及進度條，並在 `data/` 產出一張圖片。)*
 
-### 在自己的腳本中呼叫
-Python 端的 `QAQMC_Rydberg` 已經封裝好所有細節，會自動呼叫 C++ 的平行處理：
+---
+
+### 2. 建立 Docker Image（只需做一次）
+
+```bash
+docker build -t qaqmc_app .
+```
+
+Docker 會自動完成以下所有步驟：
+- 下載 Python 3.12 基底環境
+- 安裝 `g++`、`cmake`、`ninja` 及 OpenMP 函式庫
+- 編譯 C++ 核心引擎（`qaqmc_cpp.so`）
+- 安裝所有 Python 套件（`numpy`, `scipy`, `h5py`, `numba` 等）
+
+---
+
+### 3. 執行模擬
+
+#### 前景執行（適合快速測試）
+
+```bash
+mkdir -p data
+docker run -v $(pwd)/data:/app/data qaqmc_app python test.py
+```
+
+#### 背景執行（適合長時間運算，SSH 斷線後不中斷）
+
+```bash
+mkdir -p data
+docker run -d \
+    -v $(pwd)/data:/app/data \
+    --name qaqmc_run \
+    qaqmc_app python test.py
+```
+
+執行後，模擬結果（`.h5` 數據與圖片）會直接存入當前目錄的 `data/` 資料夾裡。
+
+```bash
+# 隨時查看計算進度
+docker logs -f qaqmc_run
+
+# 確認是否還在運行
+docker ps
+```
+
+---
+
+### 4. 在自己的腳本中呼叫
 
 ```python
 from src.qaqmc import QAQMC_Rydberg
 
-# 建立 6 個原子的 Ruby 晶格，使用 160 個 Trotter 切片
-# 底層會自動呼叫 qaqmc_cpp.QAQMCEngine 並開啟 OpenMP 運算
-qmc = QAQMC_Rydberg(N=6, M=160, Omega=2.0)
+# omp_threads: 控制每個 Process 使用的 OpenMP 核心數（建議設為 1）
+# n_jobs: 在 run_and_save 裡控制平行的馬可夫鏈條數
+qmc = QAQMC_Rydberg(N=6, M=160, Omega=1.0, omp_threads=1)
 
-# 進行模擬與採樣
-qmc.run_and_save(n_equil=5000, n_samples=30000, save_name="my_simulation")
+qmc.run_and_save("data/my_run.h5", n_equil=4000, n_samples=30000, n_jobs=4)
 ```

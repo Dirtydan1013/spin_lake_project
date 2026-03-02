@@ -82,13 +82,17 @@ class QAQMC_Rydberg:
     def __init__(self, N: int, Omega: float, delta_min: float, delta_max: float, Rb: float,
                  M: int, epsilon: float = 0.01, seed: int = 42, pos: np.ndarray = None,
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
-                 use_cpp: bool = True):
+                 use_cpp: bool = True, omp_threads: int = 1):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
             'verbose': False, 'n_jobs': 1, 'backend': "thread",
-            'use_cpp': use_cpp,
+            'use_cpp': use_cpp, 'omp_threads': omp_threads,
         }
+        
+        # Set OpenMP threads environment variable before C++ engine usage
+        if omp_threads > 0:
+            os.environ["OMP_NUM_THREADS"] = str(omp_threads)
         self.N = N
         self.Omega = Omega
         self.Rb = Rb
@@ -97,6 +101,7 @@ class QAQMC_Rydberg:
         self.verbose = verbose
         self.n_jobs = n_jobs
         self.backend = backend
+        self.omp_threads = omp_threads
         
         self.M = M
         self.M_total = 2 * M
