@@ -8,7 +8,14 @@ from numba import njit, int32
 # ─── Alias-table sampling ────────────────────────────────────────────────────
 
 def build_alias_table(weights):
-    """Build Walker's alias table for O(1) categorical sampling."""
+    """Build Walker's alias table for O(1) categorical sampling.
+
+    Args:
+        weights: List of non-negative probabilities (need not be normalised).
+
+    Returns:
+        (prob_arr, alias_arr): Arrays for alias sampling.
+    """
     n = len(weights)
     total = sum(weights)
     prob_arr = np.array([w * n / total for w in weights], dtype=np.float64)
@@ -176,118 +183,3 @@ def sse_cluster_update(op_types, op_sites, state, M, N, bond_sites, bond_W):
             n_after  = state_at[p + 1, site] if p < M - 1 else state[site]
             op_types[p] = 1 if n_before == n_after else -1
 
-# ─── QAQMC Updates ───────────────────────────────────────────────────────────
-
-@njit(cache=True, nogil=True)
-def qaqmc_diagonal_update(op_types, op_sites, state, M_total,
-                          bond_sites, bond_W_all, bond_W_max_all,
-                          n_alias_all, alias_prob_all, alias_idx_all,
-                          op_map_kind_all, op_map_loc_all,
-                          site_W, site_W_max, N):
-    """Zero-temperature QAQMC diagonal update (fixed length, no identity ops)."""
-    for p in range(M_total):
-        ot = op_types[p]
-        if ot == -1:
-            state[op_sites[p]] ^= 1
-        elif ot == 1 or ot == 2:
-            inserted = False
-            while not inserted:
-                n_alias_p = n_alias_all[p]
-                i = np.random.randint(0, n_alias_p)
-                if np.random.random() < alias_prob_all[p, i]: idx = i
-                else: idx = alias_idx_all[p, i]
-                    
-                kind = op_map_kind_all[p, idx]
-                loc = op_map_loc_all[p, idx]
-                
-                if kind == 0:
-                    op_types[p] = 1
-                    op_sites[p] = loc
-                    inserted = True
-                else:
-                    b = loc
-                    si = bond_sites[b, 0]
-                    sj = bond_sites[b, 1]
-                    w_idx = state[si] * 2 + state[sj]
-                    w_actual = bond_W_all[p, b, w_idx]
-                    w_max = bond_W_max_all[p, b]
-                    if w_max > 0.0 and np.random.random() < w_actual / w_max:
-                        op_types[p] = 2
-                        op_sites[p] = b
-                        inserted = True
-
-@njit(cache=True, nogil=True)
-def _flip_segment_range_qaqmc(state_at, site_i, p_start_excl, p_end_incl, M_total):
-    """Strictly open bounded segment flip function."""
-    for p in range(max(0, p_start_excl + 1), min(M_total, p_end_incl + 1)):
-        state_at[p, site_i] ^= 1
-
-@njit(cache=True, nogil=True)
-def _segment_log_weight_ratio_qaqmc(state_at, op_types, op_sites, site_i,
-                               p_start_excl, p_end_incl, M_total, N,
-                               bond_sites, bond_W_all):
-    log_w_old = 0.0
-    log_w_new = 0.0
-    def _proc(p):
-        nonlocal log_w_old, log_w_new
-        if op_types[p] == 2:
-            b = op_sites[p]
-            si = bond_sites[b, 0]
-            sj = bond_sites[b, 1]
-            if si == site_i or sj == site_i:
-                ni = state_at[p, si]
-                nj = state_at[p, sj]
-                w_old = bond_W_all[p, b, ni * 2 + nj]
-                if si == site_i: w_new = bond_W_all[p, b, (1 - ni) * 2 + nj]
-                else: w_new = bond_W_all[p, b, ni * 2 + (1 - nj)]
-                log_w_old += np.log(w_old) if w_old > 1e-300 else -1e30
-                log_w_new += np.log(w_new) if w_new > 1e-300 else -1e30
-
-    for p in range(max(0, p_start_excl + 1), min(M_total, p_end_incl + 1)):
-        _proc(p)
-    return log_w_new - log_w_old
-
-@njit(cache=True, nogil=True)
-def qaqmc_cluster_update(op_types, op_sites, state, M_total, N, bond_sites, bond_W_all):
-    """Open boundary cluster update for QAQMC."""
-    if M_total == 0: return
-    state_at = np.empty((M_total, N), dtype=int32)
-    cur = state.copy()
-    for p in range(M_total):
-        for s in range(N): state_at[p, s] = cur[s]
-        if op_types[p] == -1: cur[op_sites[p]] ^= 1
-
-    for site_i in range(N):
-        site_ops = np.empty(M_total + 2, dtype=int32)
-        n_sops = 0
-        site_ops[n_sops] = -1
-        n_sops += 1
-        
-        for p in range(M_total):
-            ot = op_types[p]
-            if (ot == 1 or ot == -1) and op_sites[p] == site_i:
-                site_ops[n_sops] = p
-                n_sops += 1
-                
-        site_ops[n_sops] = M_total
-        n_sops += 1
-        
-        for seg in range(n_sops - 1):
-            p_start = site_ops[seg]
-            p_end = site_ops[seg + 1]
-            if p_start == -1 or p_end == M_total:
-                continue
-            log_ratio = _segment_log_weight_ratio_qaqmc(
-                state_at, op_types, op_sites, site_i,
-                p_start, p_end, M_total, N, bond_sites, bond_W_all)
-            do_flip = log_ratio >= 0.0 or np.random.random() < np.exp(log_ratio)
-            if do_flip:
-                _flip_segment_range_qaqmc(state_at, site_i, p_start, p_end, M_total)
-
-    for p in range(M_total):
-        ot = op_types[p]
-        if ot == 1 or ot == -1:
-            site = op_sites[p]
-            n_before = state_at[p, site]
-            n_after = state_at[p + 1, site] if p < M_total - 1 else cur[site]  
-            op_types[p] = 1 if n_before == n_after else -1
