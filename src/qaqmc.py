@@ -92,10 +92,11 @@ def _run_and_save_worker(kwargs, seed, n_equil, n_samples, worker_id, verbose):
 
 
 class QAQMC_Rydberg:
-    def __init__(self, N: int, Omega: float, delta_min: float, delta_max: float, Rb: float,
-                 M: int, epsilon: float = 0.01, seed: int = 42, pos: np.ndarray = None,
+    def __init__(self, N: int, M: int, Omega: float = 1.0, 
+                 Rb: float = 1.2, delta_min: float = 0.0, delta_max: float = 1.0,
+                 pos: np.ndarray = None, epsilon: float = 0.01, seed: int = 42,
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
-                 use_cpp: bool = True, omp_threads: int = 1):
+                 use_cpp: bool = True, omp_threads: int = 0):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
@@ -140,9 +141,11 @@ class QAQMC_Rydberg:
 
         # ── Fallback: Python/Numba path ──────────────────────────────────
         np.random.seed(seed)
-        
+        if verbose:
+            print("[QAQMC] Building V_ij (Python fallback)...")
         _, bonds_i, bonds_j, vij_list, self.bond_sites = build_rydberg_vij(
-            N, Omega, Rb, pos, verbose=verbose, n_jobs=n_jobs, backend=backend
+            N, Omega, Rb, pos=self.pos, verbose=verbose, 
+            n_jobs=n_jobs, backend=backend
         )
         
         n_bonds = len(bonds_i)

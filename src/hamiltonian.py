@@ -23,7 +23,6 @@ def _compute_vij_worker_numba(i, N, pos, Omega, Rb):
         for d in range(pos.shape[1]):
             dist += (pos[i, d] - pos[j, d]) ** 2
         dist = np.sqrt(dist)
-        
         vij = Omega * (Rb / dist) ** 6
         bonds_j.append(j)
         vij_list.append(vij)
