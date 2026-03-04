@@ -61,8 +61,43 @@ def _run_and_save_worker(kwargs, seed, n_equil, n_samples, worker_id, verbose):
     
     # If C++ engine is available, use its bulk run() method for maximum speed
     if instance._cpp_engine is not None:
+        use_tqdm = HAS_TQDM and verbose and worker_id == 0
         t0 = time.perf_counter()
-        types_arr, sites_arr = instance._cpp_engine.run(n_equil, n_samples)
+
+        if use_tqdm:
+            equil_bar = trange(n_equil, desc="Equil (W0)", leave=False)
+            samp_bar = trange(n_samples, desc="Samp  (W0)", leave=False)
+            last_eq = 0
+            last_sa = 0
+
+            def _progress_cb(done, total, phase):
+                nonlocal last_eq, last_sa
+                if phase == "equil":
+                    delta = int(done) - last_eq
+                    if delta > 0:
+                        equil_bar.update(delta)
+                        last_eq = int(done)
+                elif phase == "sample":
+                    delta = int(done) - last_sa
+                    if delta > 0:
+                        samp_bar.update(delta)
+                        last_sa = int(done)
+
+            try:
+                types_arr, sites_arr = instance._cpp_engine.run(
+                    n_equil, n_samples, _progress_cb, max(1, n_samples // 200)
+                )
+            except TypeError:
+                # Backward-compatible fallback: old extension without callback support.
+                types_arr, sites_arr = instance._cpp_engine.run(n_equil, n_samples)
+                equil_bar.update(n_equil - last_eq)
+                samp_bar.update(n_samples - last_sa)
+            finally:
+                equil_bar.close()
+                samp_bar.close()
+        else:
+            types_arr, sites_arr = instance._cpp_engine.run(n_equil, n_samples)
+
         t_total = time.perf_counter() - t0
         return types_arr, sites_arr, t_total * 0.3, t_total * 0.7  # approximate split
     

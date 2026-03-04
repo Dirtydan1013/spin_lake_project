@@ -35,10 +35,17 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def("mc_step", &QAQMCEngine::mc_step,
              "Run one diagonal update + cluster update")
 
-        .def("run", [](QAQMCEngine& self, int n_equil, int n_samples) {
+        .def("run", [](QAQMCEngine& self, int n_equil, int n_samples,
+                       py::object progress_callback, int progress_every) {
+            if (progress_every <= 0) progress_every = 1;
+            const bool has_cb = !progress_callback.is_none();
+
             // Equilibration
-            for (int i = 0; i < n_equil; ++i)
+            for (int i = 0; i < n_equil; ++i) {
                 self.mc_step();
+                if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_equil))
+                    progress_callback(i + 1, n_equil, "equil");
+            }
 
             int M2 = self.get_M_total();
 
@@ -56,10 +63,14 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                     t_buf(i, p) = static_cast<int8_t>(ot[p]);
                     s_buf(i, p) = static_cast<int16_t>(os[p]);
                 }
+                if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_samples))
+                    progress_callback(i + 1, n_samples, "sample");
             }
             return py::make_tuple(types_out, sites_out);
         },
         py::arg("n_equil"), py::arg("n_samples"),
+        py::arg("progress_callback") = py::none(),
+        py::arg("progress_every") = 1000,
         "Run equilibration + sampling, returns (op_types, op_sites) numpy arrays")
 
         .def_property_readonly("N", &QAQMCEngine::get_N)
