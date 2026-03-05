@@ -237,7 +237,8 @@ class QAQMC_Rydberg:
     def run_and_save(self, filepath: str, n_equil: int = 5000,
                      n_samples: int = 10000, verbose: bool = True,
                      compression: str = 'gzip', compression_opts: int = 4,
-                     n_jobs: int = 1, backend: str = "thread"):
+                     n_jobs: int = 1, backend: str = "thread",
+                     chunk_samples: int = 1024):
         """
         Run QAQMC and save every operator-sequence snapshot to an HDF5 file.
 
@@ -273,35 +274,6 @@ class QAQMC_Rydberg:
         M2 = self.M_total  # 2M
         t0_overall = time.perf_counter()
 
-        if n_jobs > 1:
-            futures = []
-            counts = _split_work(n_samples, n_jobs)
-            executor_cls = _get_executor_class(backend)
-            with executor_cls(max_workers=n_jobs) as executor:
-                for i, count in enumerate(counts):
-                    if count <= 0:
-                        continue
-                    seed_i = self.init_kwargs['seed'] + (i + 1) * 1234
-                    futures.append(executor.submit(_run_and_save_worker, self.init_kwargs, seed_i, n_equil, count, i, verbose))
-                    
-            types_list, sites_list = [], []
-            t_equil_max, t_sample_max = 0.0, 0.0
-            for f in futures:
-                t_arr, s_arr, t_eq, t_sa = f.result()
-                types_list.append(t_arr)
-                sites_list.append(s_arr)
-                t_equil_max = max(t_equil_max, t_eq)
-                t_sample_max = max(t_sample_max, t_sa)
-                
-            all_types = np.vstack(types_list)
-            all_sites = np.vstack(sites_list)
-            t_equil = t_equil_max
-            t_sample = t_sample_max
-        else:
-            all_types, all_sites, t_equil, t_sample = _run_and_save_worker(
-                self.init_kwargs, self.init_kwargs['seed'], n_equil, n_samples, 0, verbose
-            )
-
         kw = dict(compression=compression, compression_opts=compression_opts) \
              if compression == 'gzip' else dict(compression=compression) \
              if compression else {}
@@ -319,7 +291,7 @@ class QAQMC_Rydberg:
             pg.attrs['n_equil']        = n_equil
             pg.attrs['n_samples']       = n_samples
             pg.attrs['timestamp']       = datetime.datetime.utcnow().isoformat()
-            pg.attrs['equil_time_s']    = t_equil   # max wall time for equilibration
+            pg.attrs['equil_time_s']    = 0.0
 
             # ── geometry ─────────────────────────────────────────────────────
             gg = f.create_group('geometry')
@@ -338,11 +310,119 @@ class QAQMC_Rydberg:
                                   - (self.delta_max - self.delta_min) * ((p - self.M) / self.M))
             sg.create_dataset('delta_schedule', data=delta_sched)
 
-            # ── sample datasets ──────────────────────────────────────────────
+            # ── sample datasets (streamed write in single-worker mode) ──────
             smg = f.create_group('samples')
-            smg.create_dataset('op_types', data=all_types, **kw_i8)
-            smg.create_dataset('op_sites', data=all_sites, **kw_i16)
+            ds_types = smg.create_dataset('op_types', shape=(n_samples, M2), **kw_i8)
+            ds_sites = smg.create_dataset('op_sites', shape=(n_samples, M2), **kw_i16)
 
+            if n_jobs > 1:
+                # Keep original multi-worker behavior for compatibility.
+                futures = []
+                counts = _split_work(n_samples, n_jobs)
+                executor_cls = _get_executor_class(backend)
+                with executor_cls(max_workers=n_jobs) as executor:
+                    for i, count in enumerate(counts):
+                        if count <= 0:
+                            continue
+                        seed_i = self.init_kwargs['seed'] + (i + 1) * 1234
+                        futures.append(executor.submit(_run_and_save_worker, self.init_kwargs, seed_i, n_equil, count, i, verbose))
+
+                write_pos = 0
+                t_equil, t_sample = 0.0, 0.0
+                for fut in futures:
+                    t_arr, s_arr, t_eq, t_sa = fut.result()
+                    n_chunk = t_arr.shape[0]
+                    ds_types[write_pos:write_pos + n_chunk] = t_arr
+                    ds_sites[write_pos:write_pos + n_chunk] = s_arr
+                    write_pos += n_chunk
+                    t_equil = max(t_equil, t_eq)
+                    t_sample = max(t_sample, t_sa)
+            else:
+                # Streaming mode: avoid holding all samples in RAM.
+                chunk_samples = max(1, int(chunk_samples))
+                t_equil = 0.0
+                t_sample = 0.0
+
+                if self._cpp_engine is not None:
+                    # Equilibration first (no data write)
+                    use_tqdm = HAS_TQDM and verbose
+                    t0_eq = time.perf_counter()
+                    if use_tqdm:
+                        eq_bar = trange(n_equil, desc="Equil (W0)", leave=False)
+                        last_eq = 0
+
+                        def _eq_cb(done, total, phase):
+                            nonlocal last_eq
+                            if phase == "equil":
+                                delta = int(done) - last_eq
+                                if delta > 0:
+                                    eq_bar.update(delta)
+                                    last_eq = int(done)
+
+                        try:
+                            self._cpp_engine.run(n_equil, 0, _eq_cb, max(1, n_equil // 200))
+                        except TypeError:
+                            # Old extension ABI: no callback support.
+                            self._cpp_engine.run(n_equil, 0)
+                            eq_bar.update(n_equil - last_eq)
+                        finally:
+                            eq_bar.close()
+                    else:
+                        try:
+                            self._cpp_engine.run(n_equil, 0, None, 1)
+                        except TypeError:
+                            self._cpp_engine.run(n_equil, 0)
+                    t_equil = time.perf_counter() - t0_eq
+
+                    # Sampling in chunks
+                    use_tqdm = HAS_TQDM and verbose
+                    samp_bar = trange(n_samples, desc="Samp  (W0)", leave=False) if use_tqdm else None
+                    written = 0
+                    t0_sa = time.perf_counter()
+                    while written < n_samples:
+                        cur = min(chunk_samples, n_samples - written)
+                        try:
+                            t_arr, s_arr = self._cpp_engine.run(0, cur, None, 1)
+                        except TypeError:
+                            t_arr, s_arr = self._cpp_engine.run(0, cur)
+                        ds_types[written:written + cur] = t_arr
+                        ds_sites[written:written + cur] = s_arr
+                        written += cur
+                        if samp_bar is not None:
+                            samp_bar.update(cur)
+                    if samp_bar is not None:
+                        samp_bar.close()
+                    t_sample = time.perf_counter() - t0_sa
+                else:
+                    # Python/Numba fallback in chunks
+                    use_tqdm = HAS_TQDM and verbose
+                    t0_eq = time.perf_counter()
+                    eq_iter = trange(n_equil, desc="Equil (W0)", leave=False) if use_tqdm else range(n_equil)
+                    for _ in eq_iter:
+                        self.mc_step()
+                    t_equil = time.perf_counter() - t0_eq
+
+                    samp_bar = trange(n_samples, desc="Samp  (W0)", leave=False) if use_tqdm else None
+                    written = 0
+                    t0_sa = time.perf_counter()
+                    while written < n_samples:
+                        cur = min(chunk_samples, n_samples - written)
+                        t_arr = np.empty((cur, M2), dtype=np.int8)
+                        s_arr = np.empty((cur, M2), dtype=np.int16)
+                        for i in range(cur):
+                            self.mc_step()
+                            t_arr[i] = self.op_types[:M2].astype(np.int8)
+                            s_arr[i] = self.op_sites[:M2].astype(np.int16)
+                        ds_types[written:written + cur] = t_arr
+                        ds_sites[written:written + cur] = s_arr
+                        written += cur
+                        if samp_bar is not None:
+                            samp_bar.update(cur)
+                    if samp_bar is not None:
+                        samp_bar.close()
+                    t_sample = time.perf_counter() - t0_sa
+
+            pg.attrs['equil_time_s'] = t_equil
             pg.attrs['sample_time_s'] = t_sample
             pg.attrs['total_time_s']  = t_equil + t_sample
 

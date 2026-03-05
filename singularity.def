@@ -1,0 +1,67 @@
+# ================================================================
+# Singularity Definition File for spin_lake_project (QAQMC)
+# Build:  singularity build spin_lake.sif singularity.def
+# Run:    singularity run spin_lake.sif
+# ================================================================
+Bootstrap: docker
+From: python:3.12-slim
+
+%labels
+    Author spin_lake_project
+    Description QAQMC Rydberg simulation (Python + C++/OpenMP)
+
+%files
+    # Copy project files into the container at build time
+    requirements.txt /app/requirements.txt
+    CMakeLists.txt   /app/CMakeLists.txt
+    csrc/            /app/csrc/
+    src/             /app/src/
+    test.py          /app/test.py
+    scripts/         /app/scripts/
+
+%post
+    # ── System dependencies ──────────────────────────────────────
+    apt-get update && apt-get install -y --no-install-recommends \
+        g++ cmake ninja-build libomp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+    # ── Python dependencies ──────────────────────────────────────
+    pip install --no-cache-dir pybind11
+    pip install --no-cache-dir -r /app/requirements.txt
+
+    # ── Compile C++ extension (qaqmc_cpp.so) ─────────────────────
+    cd /app
+    cmake -S . -B build_dir -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPYTHON_EXECUTABLE=$(which python3)
+    cmake --build build_dir --config Release -j
+    cp build_dir/qaqmc_cpp*.so /app/
+    rm -rf build_dir
+
+    # ── Clean up build-only packages to reduce image size ────────
+    apt-get update && apt-get remove -y g++ cmake ninja-build libomp-dev \
+    && apt-get autoremove -y \
+    && apt-get install -y --no-install-recommends libomp5 \
+    && rm -rf /var/lib/apt/lists/*
+
+    # ── Ensure data directory exists ─────────────────────────────
+    mkdir -p /app/data
+
+%environment
+    export PYTHONPATH=/app:$PYTHONPATH
+    export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+
+%runscript
+    cd /app
+    exec python test.py "$@"
+
+%help
+    Singularity container for QAQMC Rydberg simulation.
+
+    Usage:
+      singularity run spin_lake.sif                      # run test.py
+      singularity exec spin_lake.sif python /app/test.py # same, explicit
+      singularity exec spin_lake.sif python /app/scripts/my_script.py
+
+    Bind-mount your data directory:
+      singularity run --bind ./data:/app/data spin_lake.sif

@@ -101,6 +101,77 @@ qmc.run_and_save("data/my_run.h5", n_equil=4000, n_samples=30000, n_jobs=4)
 
 ---
 
+## 📦 在 HPC Cluster 上執行（Singularity）
+
+若 Cluster 使用 **Singularity**（大多數 HPC 環境皆支援），可將整個環境打包成 `.sif` 映像檔。
+
+### 1. 建置映像檔（需在有 root 或 `--fakeroot` 權限的機器上）
+
+```bash
+git clone https://github.com/你的帳號/spin_lake_project.git
+cd spin_lake_project
+
+# 從 singularity.def 建置（推薦）
+singularity build spin_lake.sif singularity.def
+
+# 或者直接從現有的 Dockerfile 轉換
+singularity build spin_lake.sif docker-daemon://qaqmc_app:latest
+```
+
+> 若 Cluster 不允許 `--fakeroot`，請在本地 Linux 機器（有 root 權限）上 build 完，再把 `spin_lake.sif` 傳到 Cluster。
+
+### 2. 執行模擬
+
+```bash
+# 預設執行 test.py（資料輸出到 ./data/）
+singularity run --bind ./data:/app/data spin_lake.sif
+
+# 執行自訂腳本
+singularity exec --bind ./data:/app/data spin_lake.sif \
+    python /app/scripts/my_script.py
+
+# 進入互動式 shell（除錯用）
+singularity shell --bind ./data:/app/data spin_lake.sif
+```
+
+### 3. 搭配 SLURM 批次提交
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=qaqmc
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=24:00:00
+#SBATCH --output=qaqmc_%j.log
+
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+singularity exec --bind ./data:/app/data spin_lake.sif \
+    python /app/test.py
+```
+
+將上面內容存為 `submit.sh`，然後：
+
+```bash
+mkdir -p data
+sbatch submit.sh
+```
+
+### 4. 驗證環境是否正常
+
+```bash
+# 確認 C++ extension 可載入
+singularity exec spin_lake.sif \
+    python -c "import qaqmc_cpp; print('C++ extension OK')"
+
+# 確認 Python imports
+singularity exec spin_lake.sif \
+    python -c "from src.qaqmc import QAQMC_Rydberg; print('Python imports OK')"
+```
+
+---
+
 ## 🐍 替代方案：使用 Conda 安裝（無 Docker 環境適用）
 
 若伺服器沒有安裝 Docker，可改用 Conda 建立隔離的 Python 環境並手動編譯 C++ 核心。
