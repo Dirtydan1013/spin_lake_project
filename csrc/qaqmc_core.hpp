@@ -70,6 +70,12 @@ public:
     const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
     const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
 
+    // Profiling
+    double get_time_diag() const { return time_diag_; }
+    double get_time_clus() const { return time_clus_; }
+    int get_mc_steps() const { return mc_steps_; }
+    void reset_timers() { time_diag_ = 0; time_clus_ = 0; mc_steps_ = 0; }
+
     // Checkpoint: RNG state serialization
     std::string get_rng_state() const;
     void set_rng_state(const std::string& state_str);
@@ -106,6 +112,10 @@ private:
     double epsilon_;
     bool precompute_;
     int chunk_slices_;  // 0 = full precompute, >0 = chunked
+
+    double time_diag_{0.0};
+    double time_clus_{0.0};
+    int mc_steps_{0};
 
     std::mt19937_64 rng_;
 

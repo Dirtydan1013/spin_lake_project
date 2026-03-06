@@ -564,7 +564,16 @@ void QAQMCEngine::cluster_update() {
 
 // ─── mc_step ─────────────────────────────────────────────────────────────────
 
+#include <chrono>
+
 void QAQMCEngine::mc_step() {
+    auto t0 = std::chrono::high_resolution_clock::now();
     diagonal_update();
+    auto t1 = std::chrono::high_resolution_clock::now();
     cluster_update();
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    time_diag_ += std::chrono::duration<double>(t1 - t0).count();
+    time_clus_ += std::chrono::duration<double>(t2 - t1).count();
+    mc_steps_++;
 }

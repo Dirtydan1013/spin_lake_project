@@ -109,5 +109,11 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             self.set_op_string(static_cast<const int32_t*>(t.ptr),
                                static_cast<const int32_t*>(s.ptr),
                                (int)t.shape[0]);
-        });
+        })
+        
+        // Profiling
+        .def_property_readonly("time_diag", &QAQMCEngine::get_time_diag)
+        .def_property_readonly("time_clus", &QAQMCEngine::get_time_clus)
+        .def_property_readonly("mc_steps", &QAQMCEngine::get_mc_steps)
+        .def("reset_timers", &QAQMCEngine::reset_timers);
 }
