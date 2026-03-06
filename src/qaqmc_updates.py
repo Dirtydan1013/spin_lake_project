@@ -7,7 +7,7 @@ from numba import njit, int32
 
 # ─── Alias-table sampling ────────────────────────────────────────────────────
 
-def build_qaqmc_alias_tables(M_total, N, n_bonds, Omega, delta_sched, bond_vij, epsilon=0.01):
+def build_qaqmc_alias_tables(M_total, N, n_bonds, Omega, delta_sched, bond_vij, bond_si, bond_sj, coord_number, epsilon=0.01):
     max_alias = N + n_bonds
     
     bond_W_all = np.zeros((M_total, max(n_bonds, 1), 4), dtype=np.float64)
@@ -21,7 +21,6 @@ def build_qaqmc_alias_tables(M_total, N, n_bonds, Omega, delta_sched, bond_vij, 
     
     for p in range(M_total):
         delta = delta_sched[p]
-        delta_b = delta / (N - 1) if N > 1 else delta
         
         weights = []
         op_map_kind = []
@@ -34,14 +33,22 @@ def build_qaqmc_alias_tables(M_total, N, n_bonds, Omega, delta_sched, bond_vij, 
             
         for b in range(n_bonds):
             vij = bond_vij[b]
-            m1 = min(0.0, delta_b, 2 * delta_b - vij)
-            m2 = min(delta_b, 2 * delta_b - vij)
-            cij = abs(m1) + epsilon * abs(m2)
+            si, sj = bond_si[b], bond_sj[b]
+            delta_i = delta / coord_number[si] if coord_number[si] > 0 else 0.0
+            delta_j = delta / coord_number[sj] if coord_number[sj] > 0 else 0.0
             
-            bond_W_all[p, b, 0] = cij
-            bond_W_all[p, b, 1] = delta_b + cij
-            bond_W_all[p, b, 2] = delta_b + cij
-            bond_W_all[p, b, 3] = -vij + 2 * delta_b + cij
+            raw0 = 0.0
+            raw1 = delta_j
+            raw2 = delta_i
+            raw3 = -vij + delta_i + delta_j
+            m_min = min(raw0, raw1, raw2, raw3)
+            m_abs = min(abs(raw0), abs(raw1), abs(raw2), abs(raw3))
+            cij = ((-m_min) if m_min < 0.0 else 0.0) + epsilon * m_abs
+            
+            bond_W_all[p, b, 0] = raw0 + cij
+            bond_W_all[p, b, 1] = raw1 + cij
+            bond_W_all[p, b, 2] = raw2 + cij
+            bond_W_all[p, b, 3] = raw3 + cij
             bmax = np.max(bond_W_all[p, b])
             bond_W_max_all[p, b] = bmax
             

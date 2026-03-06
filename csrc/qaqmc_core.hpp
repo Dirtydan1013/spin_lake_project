@@ -17,11 +17,13 @@ struct RydbergVij {
     std::vector<int> bonds_j;
     std::vector<double> vij_list;
     std::vector<int> bond_sites_flat; // (n_bonds * 2), row-major
+    std::vector<int> coord_number;    // z_eff[i]: # active bonds touching site i
     int n_bonds;
 };
 
 RydbergVij build_rydberg_vij(int N, double Omega, double Rb,
-                              const double* pos, int pos_dim);
+                              const double* pos, int pos_dim,
+                              int neighbor_cutoff = -1);
 
 // ─── Alias Table ─────────────────────────────────────────────────────────────
 
@@ -42,7 +44,10 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
                                      double Omega,
                                      const double* delta_sched,
                                      const double* bond_vij,
-                                     double epsilon);
+                                     const int* bond_si, const int* bond_sj,
+                                     const int* coord_number,
+                                     double epsilon,
+                                     int p_start = 0, int p_end = -1);
 
 // ─── QAQMCEngine ─────────────────────────────────────────────────────────────
 
@@ -50,7 +55,9 @@ class QAQMCEngine {
 public:
     QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
                 double Rb, int M, double epsilon, uint64_t seed,
-                const double* pos, int pos_dim);
+                const double* pos, int pos_dim,
+                int neighbor_cutoff = -1, bool precompute = true,
+                int chunk_slices = 0);
 
     void mc_step();
 
@@ -63,10 +70,42 @@ public:
     const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
     const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
 
+    // Checkpoint: RNG state serialization
+    std::string get_rng_state() const;
+    void set_rng_state(const std::string& state_str);
+
+    // Checkpoint: restore operator string from external data
+    void set_op_string(const int32_t* types, const int32_t* sites, int len);
+
+    // Compute 4 bond weights with asymmetric delta per endpoint
+    // delta_i = delta / z_eff[site_i],  delta_j = delta / z_eff[site_j]
+    static inline void compute_bond_W_inline(double delta_i, double delta_j,
+                                              double vij, double epsilon,
+                                              double W[4], double& W_max) {
+        // raw matrix elements: -V_ij * ni*nj + delta_i * ni + delta_j * nj
+        double raw0 = 0.0;                     // |00>: both empty
+        double raw1 = delta_j;                  // |01>: j excited
+        double raw2 = delta_i;                  // |10>: i excited
+        double raw3 = -vij + delta_i + delta_j;  // |11>: both excited
+        // C_ij: shift to make all W >= 0, plus safety margin
+        double m_min = std::min({raw0, raw1, raw2, raw3});
+        double m_abs = std::min({std::abs(raw0), std::abs(raw1),
+                                 std::abs(raw2), std::abs(raw3)});
+        double cij = (m_min < 0.0 ? -m_min : 0.0) + epsilon * m_abs;
+        W[0] = raw0 + cij;
+        W[1] = raw1 + cij;
+        W[2] = raw2 + cij;
+        W[3] = raw3 + cij;
+        W_max = std::max({W[0], W[1], W[2], W[3]});
+    }
+
 private:
     int N_, M_, M_total_;
     double Omega_, Rb_, delta_min_, delta_max_;
     double site_W_, site_W_max_;
+    double epsilon_;
+    bool precompute_;
+    int chunk_slices_;  // 0 = full precompute, >0 = chunked
 
     std::mt19937_64 rng_;
 

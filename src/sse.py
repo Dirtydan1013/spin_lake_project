@@ -5,7 +5,7 @@ import numpy as np
 from numba import int32
 
 from src.hamiltonian import build_rydberg_vij
-from src.qmc_updates import build_alias_table, sse_diagonal_update, sse_cluster_update
+from src.sse_updates import build_alias_table, sse_diagonal_update, sse_cluster_update
 from src.measurement import calc_density, calc_staggered_magnetization
 
 class SSE_Rydberg:
@@ -22,7 +22,7 @@ class SSE_Rydberg:
 
         np.random.seed(seed)
 
-        V, bonds_i, bonds_j, vij_list, self.bond_sites = build_rydberg_vij(N, Omega, Rb, pos)
+        V, bonds_i, bonds_j, vij_list, self.bond_sites, _ = build_rydberg_vij(N, Omega, Rb, pos)
         
         n_bonds = len(bonds_i)
         

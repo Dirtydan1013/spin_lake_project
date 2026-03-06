@@ -17,16 +17,7 @@ Workflow
 import numpy as np
 import h5py
 from pathlib import Path
-import concurrent.futures
-from copy import copy
-
-
-# ── Worker function ───────────────────────────────────────────────────────────
-def _postprocess_worker_chunk(arc, observable_fn, chunk_start, chunk_stop):
-    chunk_results = []
-    for ot, os in arc.iter_samples(chunk_start, chunk_stop):
-        chunk_results.append(observable_fn(ot, os, arc))
-    return chunk_results
+from numba import njit, prange
 
 
 # ── Archive reader ────────────────────────────────────────────────────────────
@@ -73,15 +64,6 @@ class QAQMCArchive:
     def iter_samples(self, start: int = 0, stop: int = None, step: int = 1):
         """
         Lazy iterator yielding (op_types, op_sites) one snapshot at a time.
-
-        Parameters
-        ----------
-        start, stop, step : slice parameters (default: all samples)
-
-        Yields
-        ------
-        op_types : (2M,) int8 ndarray
-        op_sites : (2M,) int16 ndarray
         """
         stop = stop or self.n_samples
         with h5py.File(self.filepath, 'r') as f:
@@ -92,7 +74,7 @@ class QAQMCArchive:
 
     def load_samples(self, start: int = 0, stop: int = None):
         """
-        Load a slice of samples into memory as two arrays.
+        Load a slice of samples into memory as two contiguous arrays.
 
         Returns
         -------
@@ -112,45 +94,31 @@ class QAQMCArchive:
         """
         Apply `observable_fn` to every snapshot and return binned statistics.
 
+        Samples are batch-loaded into memory, then observable_fn receives
+        (all_op_types, all_op_sites, arc) for vectorized/Numba processing.
+
         Parameters
         ----------
         observable_fn : callable
-            Signature: fn(op_types, op_sites, arc) → scalar or ndarray
-            Receives one sample's operator arrays and this archive instance.
+            Signature: fn(op_types_2d, op_sites_2d, arc) → (n_samples, ...) array
         start, stop   : sample range (default: all)
         n_bins        : number of bins for error estimation
-        n_jobs        : number of parallel processes to use (default 1)
 
         Returns
         -------
         dict with keys 'mean', 'err', 'bins'
-            mean : float or (M,) ndarray   – overall estimator
-            err  : float or (M,) ndarray   – binned standard error
-            bins : list of per-bin means
         """
         stop = stop or self.n_samples
-        n_total = (stop - start)
+        n_total = stop - start
+
+        # Batch load all samples at once (much faster than one-by-one HDF5)
+        all_ot, all_os = self.load_samples(start, stop)
+
+        # Call observable function on the full batch
+        all_results = observable_fn(all_ot, all_os, self)
+
+        # Binning for error estimation
         bin_size = max(1, n_total // n_bins)
-        
-        # When multiprocessing is enabled, we need to pass a lightweight
-        # copy of the archive (without open file handles) to the workers
-        arc_copy = copy(self)
-
-        all_results = []
-        if n_jobs > 1:
-            chunk_size = max(1, n_total // n_jobs)
-            chunks = []
-            for i in range(start, stop, chunk_size):
-                end = min(i + chunk_size, stop)
-                chunks.append((i, end))
-
-            with concurrent.futures.ProcessPoolExecutor(max_workers=n_jobs) as executor:
-                futures = [executor.submit(_postprocess_worker_chunk, arc_copy, observable_fn, c[0], c[1]) for c in chunks]
-                for future in concurrent.futures.as_completed(futures):
-                    all_results.extend(future.result())
-        else:
-            all_results = _postprocess_worker_chunk(arc_copy, observable_fn, start, stop)
-
         bins = []
         for i in range(0, len(all_results), bin_size):
             chunk = all_results[i : i + bin_size]
@@ -168,72 +136,182 @@ class QAQMCArchive:
                 f"N={self.N}, M={self.M}, n_samples={self.n_samples})")
 
 
+# ── Numba-accelerated kernels ─────────────────────────────────────────────────
+
+@njit(cache=True, parallel=True)
+def _density_asym_kernel(op_types, op_sites, M, N):
+    """Compute ⟨n⟩ at each forward-sweep slice for all samples (batch)."""
+    n_samples = op_types.shape[0]
+    out = np.empty((n_samples, M), dtype=np.float64)
+    inv_N = 1.0 / N
+    for s in prange(n_samples):
+        state = np.zeros(N, dtype=np.int32)
+        for p in range(M):
+            total = 0
+            for i in range(N):
+                total += state[i]
+            out[s, p] = total * inv_N
+            if op_types[s, p] == -1:
+                state[op_sites[s, p]] ^= 1
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _mz_asym_kernel(op_types, op_sites, M, N):
+    """Staggered magnetization at each forward-sweep slice (batch)."""
+    n_samples = op_types.shape[0]
+    out = np.empty((n_samples, M), dtype=np.float64)
+    inv_N = 1.0 / N
+    for s in prange(n_samples):
+        state = np.zeros(N, dtype=np.int32)
+        for p in range(M):
+            mz = 0.0
+            for i in range(N):
+                phase = 1.0 if (i % 2 == 0) else -1.0
+                mz += phase * (state[i] - 0.5)
+            out[s, p] = mz * inv_N
+            if op_types[s, p] == -1:
+                state[op_sites[s, p]] ^= 1
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _density_sym_kernel(op_types, op_sites, M, N):
+    """Scalar density at symmetric midpoint p = M for all samples."""
+    n_samples = op_types.shape[0]
+    out = np.empty(n_samples, dtype=np.float64)
+    inv_N = 1.0 / N
+    for s in prange(n_samples):
+        state = np.zeros(N, dtype=np.int32)
+        for t in range(M):
+            if op_types[s, t] == -1:
+                state[op_sites[s, t]] ^= 1
+        total = 0
+        for i in range(N):
+            total += state[i]
+        out[s] = total * inv_N
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _mz_sym_kernel(op_types, op_sites, M, N):
+    """Staggered magnetization at symmetric midpoint (batch)."""
+    n_samples = op_types.shape[0]
+    out = np.empty(n_samples, dtype=np.float64)
+    inv_N = 1.0 / N
+    for s in prange(n_samples):
+        state = np.zeros(N, dtype=np.int32)
+        for t in range(M):
+            if op_types[s, t] == -1:
+                state[op_sites[s, t]] ^= 1
+        mz = 0.0
+        for i in range(N):
+            phase = 1.0 if (i % 2 == 0) else -1.0
+            mz += phase * (state[i] - 0.5)
+        out[s] = mz * inv_N
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _nn_corr_asym_kernel(op_types, op_sites, M, N, site_i, site_j):
+    """⟨n_i n_j⟩ at each forward-sweep slice (batch)."""
+    n_samples = op_types.shape[0]
+    out = np.empty((n_samples, M), dtype=np.float64)
+    for s in prange(n_samples):
+        state = np.zeros(N, dtype=np.int32)
+        for p in range(M):
+            out[s, p] = float(state[site_i] * state[site_j])
+            if op_types[s, p] == -1:
+                state[op_sites[s, p]] ^= 1
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _string_op_asym_kernel(op_types, op_sites, M, N, site_i, site_j):
+    """String operator ∏_{k=i}^{j} (1-2n_k) at each slice (batch)."""
+    n_samples = op_types.shape[0]
+    out = np.empty((n_samples, M), dtype=np.float64)
+    for s in prange(n_samples):
+        state = np.zeros(N, dtype=np.int32)
+        for p in range(M):
+            prod = 1.0
+            for k in range(site_i, site_j + 1):
+                prod *= (1 - 2 * state[k])
+            out[s, p] = prod
+            if op_types[s, p] == -1:
+                state[op_sites[s, p]] ^= 1
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _loop_string_kernel(op_types, op_sites, M, N, loop_sites):
+    """Loop string operator over arbitrary sites (batch)."""
+    n_samples = op_types.shape[0]
+    n_loop = len(loop_sites)
+    out = np.empty((n_samples, M), dtype=np.float64)
+    for s in prange(n_samples):
+        state = np.zeros(N, dtype=np.int32)
+        for p in range(M):
+            prod = 1.0
+            for k in range(n_loop):
+                prod *= (1 - 2 * state[loop_sites[k]])
+            out[s, p] = prod
+            if op_types[s, p] == -1:
+                state[op_sites[s, p]] ^= 1
+    return out
+
+
+@njit(cache=True, parallel=True)
+def _rebuild_state_batch(op_types, op_sites, N, p_target):
+    """Reconstruct spin state at slice p_target for all samples (batch)."""
+    n_samples = op_types.shape[0]
+    states = np.zeros((n_samples, N), dtype=np.int32)
+    for s in prange(n_samples):
+        for t in range(p_target):
+            if op_types[s, t] == -1:
+                states[s, op_sites[s, t]] ^= 1
+    return states
+
+
 # ── Helper: rebuild spin state at slice p ────────────────────────────────────
 
 def rebuild_state_at(op_types: np.ndarray, op_sites: np.ndarray,
                      N: int, p: int) -> np.ndarray:
     """
-    Reconstruct the spin configuration at imaginary-time slice p
-    by walking forward from |00...0⟩.
-
-    Parameters
-    ----------
-    op_types, op_sites : one sample's operator arrays (length 2M)
-    N                  : number of sites
-    p                  : target slice index ∈ [0, 2M]
-
-    Returns
-    -------
-    state : (N,) int32 array, values in {0, 1}
+    Reconstruct the spin configuration at imaginary-time slice p.
+    Supports both single-sample (1D) and batch (2D) inputs.
     """
-    state = np.zeros(N, dtype=np.int32)
-    for t in range(p):
-        if op_types[t] == -1:          # off-diagonal (flip) operator
-            state[op_sites[t]] ^= 1
-    return state
+    if op_types.ndim == 1:
+        state = np.zeros(N, dtype=np.int32)
+        for t in range(p):
+            if op_types[t] == -1:
+                state[op_sites[t]] ^= 1
+        return state
+    else:
+        return _rebuild_state_batch(op_types, op_sites, N, p)
 
 
 # ── Built-in observable functions ─────────────────────────────────────────────
-# Each has signature: fn(op_types, op_sites, arc) → value
-# Pass them directly to arc.compute(...)
+# Batch API: fn(all_op_types, all_op_sites, arc) → (n_samples, ...) array
 
 def obs_density_asym(op_types, op_sites, arc):
     """Rydberg density ⟨n⟩ at each asymmetric time slice p ∈ [0, M)."""
-    M, N = arc.M, arc.N
-    out = np.empty(M, dtype=np.float64)
-    state = np.zeros(N, dtype=np.int32)
-    for p in range(M):
-        out[p] = state.sum() / N
-        if op_types[p] == -1:
-            state[op_sites[p]] ^= 1
-    return out
+    return _density_asym_kernel(op_types, op_sites, arc.M, arc.N)
 
 
 def obs_mz_asym(op_types, op_sites, arc):
     """Staggered magnetization m_z at each asymmetric slice."""
-    M, N = arc.M, arc.N
-    out = np.empty(M, dtype=np.float64)
-    state = np.zeros(N, dtype=np.int32)
-    phases = np.array([1.0 if i % 2 == 0 else -1.0 for i in range(N)])
-    for p in range(M):
-        out[p] = np.dot(phases, state - 0.5) / N
-        if op_types[p] == -1:
-            state[op_sites[p]] ^= 1
-    return out
+    return _mz_asym_kernel(op_types, op_sites, arc.M, arc.N)
 
 
 def obs_density_sym(op_types, op_sites, arc):
     """Scalar Rydberg density at the symmetric midpoint slice p = M."""
-    state = rebuild_state_at(op_types, op_sites, arc.N, arc.M)
-    return float(state.sum() / arc.N)
+    return _density_sym_kernel(op_types, op_sites, arc.M, arc.N)
 
 
 def obs_mz_sym(op_types, op_sites, arc):
     """Staggered magnetization at the symmetric midpoint."""
-    state = rebuild_state_at(op_types, op_sites, arc.N, arc.M)
-    N = arc.N
-    m = sum(((1 if i % 2 == 0 else -1) * (state[i] - 0.5)) for i in range(N))
-    return float(m / N)
+    return _mz_sym_kernel(op_types, op_sites, arc.M, arc.N)
 
 
 def obs_nn_corr_asym(i: int, j: int):
@@ -242,34 +320,16 @@ def obs_nn_corr_asym(i: int, j: int):
     Usage: arc.compute(obs_nn_corr_asym(0, 2))
     """
     def _fn(op_types, op_sites, arc):
-        M, N = arc.M, arc.N
-        out = np.empty(M, dtype=np.float64)
-        state = np.zeros(N, dtype=np.int32)
-        for p in range(M):
-            out[p] = float(state[i] * state[j])
-            if op_types[p] == -1:
-                state[op_sites[p]] ^= 1
-        return out
+        return _nn_corr_asym_kernel(op_types, op_sites, arc.M, arc.N, i, j)
     return _fn
 
 
 def obs_string_op_asym(i: int, j: int):
     """
     Factory: string operator ∏_{k=i}^{j} (1 - 2n_k) along the sweep.
-    Equivalent to (-1)^{number of excitations between i and j}.
     """
     def _fn(op_types, op_sites, arc):
-        M, N = arc.M, arc.N
-        out = np.empty(M, dtype=np.float64)
-        state = np.zeros(N, dtype=np.int32)
-        for p in range(M):
-            prod = 1.0
-            for k in range(i, j + 1):
-                prod *= (1 - 2 * state[k])
-            out[p] = prod
-            if op_types[p] == -1:
-                state[op_sites[p]] ^= 1
-        return out
+        return _string_op_asym_kernel(op_types, op_sites, arc.M, arc.N, i, j)
     return _fn
 
 
@@ -280,52 +340,20 @@ def obs_loop_string_op(loop_sites):
 
         W_loop = ∏_{k ∈ loop_sites} (1 - 2 n_k)
 
-    This is the natural observable for detecting Z₂ topological order or
-    Rydberg blockade order on a Ruby / Kagome lattice.  The sites do **not**
-    need to form a geometrically straight path—pass any ordered list of site
-    indices that trace your closed contour.
-
     Parameters
     ----------
     loop_sites : list[int]
-        Ordered site indices forming the loop, e.g. a hexagonal plaquette on
-        the Ruby lattice.  The product is over exactly these sites.
+        Ordered site indices forming the loop.
 
     Returns
     -------
     callable
-        Observable function with signature fn(op_types, op_sites, arc) → (M,)
-
-    Example — hexagonal plaquette on a 1×1 Ruby lattice (6 atoms, sites 0-5)
-    -------------------------------------------------------------------------
-        from src.lattices import generate_ruby_lattice
-        pos = generate_ruby_lattice(nx=1, ny=1)
-        # The six sites of the unit cell already form the elementary hexagon
-        hex_loop = [0, 1, 2, 3, 4, 5]
-        arc.compute(obs_loop_string_op(hex_loop))
-
-    Example — custom plaquette by spatial proximity
-    ------------------------------------------------
-        import numpy as np
-        center = pos.mean(axis=0)
-        dists  = np.linalg.norm(pos - center, axis=1)
-        hex_loop = list(np.argsort(dists)[:6])   # 6 nearest to centre
-        arc.compute(obs_loop_string_op(hex_loop))
+        Observable function with signature fn(op_types, op_sites, arc) → (n, M)
     """
-    sites_arr = list(loop_sites)   # freeze at factory call time
+    sites_arr = np.array(loop_sites, dtype=np.int32)
 
     def _fn(op_types, op_sites, arc):
-        M, N = arc.M, arc.N
-        out = np.empty(M, dtype=np.float64)
-        state = np.zeros(N, dtype=np.int32)
-        for p in range(M):
-            prod = 1.0
-            for k in sites_arr:
-                prod *= (1 - 2 * int(state[k]))
-            out[p] = prod
-            if op_types[p] == -1:
-                state[op_sites[p]] ^= 1
-        return out
+        return _loop_string_kernel(op_types, op_sites, arc.M, arc.N, sites_arr)
 
-    _fn.__doc__ = f"Loop string op over sites {sites_arr}"
+    _fn.__doc__ = f"Loop string op over sites {list(loop_sites)}"
     return _fn

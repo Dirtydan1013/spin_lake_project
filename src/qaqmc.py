@@ -111,14 +111,14 @@ def _run_and_save_worker(kwargs, seed, n_equil, n_samples, worker_id, verbose):
         
     M2 = instance.M_total
     types_arr = np.empty((n_samples, M2), dtype=np.int8)
-    sites_arr = np.empty((n_samples, M2), dtype=np.int16)
+    sites_arr = np.empty((n_samples, M2), dtype=np.int32)
     
     t0_sample = time.perf_counter()
     measure_iter = trange(n_samples, desc="Samp  (W0)", leave=False) if use_tqdm else range(n_samples)
     for i in measure_iter:
         instance.mc_step()
         types_arr[i] = instance.op_types[:M2].astype(np.int8)
-        sites_arr[i] = instance.op_sites[:M2].astype(np.int16)
+        sites_arr[i] = instance.op_sites[:M2].astype(np.int32)
     t_sample = time.perf_counter() - t0_sample
         
     return types_arr, sites_arr, t_equil, t_sample
@@ -131,12 +131,16 @@ class QAQMC_Rydberg:
                  Rb: float = 1.2, delta_min: float = 0.0, delta_max: float = 1.0,
                  pos: np.ndarray = None, epsilon: float = 0.01, seed: int = 42,
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
-                 use_cpp: bool = True, omp_threads: int = 0):
+                 use_cpp: bool = True, omp_threads: int = 0,
+                 neighbor_cutoff: int = None, precompute: bool = True,
+                 chunk_slices: int = 0):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
             'verbose': False, 'n_jobs': 1, 'backend': "thread",
             'use_cpp': use_cpp, 'omp_threads': omp_threads,
+            'neighbor_cutoff': neighbor_cutoff, 'precompute': precompute,
+            'chunk_slices': chunk_slices,
         }
         
         # Set OpenMP threads environment variable before C++ engine usage
@@ -161,26 +165,31 @@ class QAQMC_Rydberg:
 
         # ── Try C++ backend ──────────────────────────────────────────────
         self._cpp_engine = None
+        nc = neighbor_cutoff if neighbor_cutoff is not None else -1
         if use_cpp and HAS_CPP:
             pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
             self._cpp_engine = qaqmc_cpp.QAQMCEngine(
-                N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr
+                N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
+                neighbor_cutoff=nc, precompute=precompute, chunk_slices=chunk_slices
             )
             # Mirror key attributes for compatibility
             self.bond_sites = np.array(self._cpp_engine.bond_sites, dtype=np.int32)
             self.op_types = np.array(self._cpp_engine.op_types, dtype=np.int32)
             self.op_sites = np.array(self._cpp_engine.op_sites, dtype=np.int32)
             if verbose:
-                print(f"[QAQMC] Using C++ backend (N={N}, M={M})")
+                n_bonds = len(self.bond_sites)
+                mode = "precomputed" if precompute else "on-the-fly"
+                print(f"[QAQMC] Using C++ backend (N={N}, M={M}, bonds={n_bonds}, mode={mode})")
             return
 
         # ── Fallback: Python/Numba path ──────────────────────────────────
         np.random.seed(seed)
         if verbose:
             print("[QAQMC] Building V_ij (Python fallback)...")
-        _, bonds_i, bonds_j, vij_list, self.bond_sites = build_rydberg_vij(
+        _, bonds_i, bonds_j, vij_list, self.bond_sites, self.coord_number = build_rydberg_vij(
             N, Omega, Rb, pos=self.pos, verbose=verbose, 
-            n_jobs=n_jobs, backend=backend
+            n_jobs=n_jobs, backend=backend,
+            neighbor_cutoff=neighbor_cutoff
         )
         
         n_bonds = len(bonds_i)
@@ -192,7 +201,10 @@ class QAQMC_Rydberg:
         for p in range(self.M, self.M_total):
             delta_sched[p] = delta_max - (delta_max - delta_min) * ((p - self.M) / self.M)
             
-        res = build_qaqmc_alias_tables(self.M_total, N, n_bonds, Omega, delta_sched, vij_list, epsilon)
+        res = build_qaqmc_alias_tables(
+            self.M_total, N, n_bonds, Omega, delta_sched, vij_list,
+            self.bond_sites[:, 0], self.bond_sites[:, 1], self.coord_number, epsilon
+        )
         self.bond_W_all = res[0]
         self.bond_W_max_all = res[1]
         self.n_alias_all = res[2]
@@ -238,7 +250,8 @@ class QAQMC_Rydberg:
                      n_samples: int = 10000, verbose: bool = True,
                      compression: str = 'gzip', compression_opts: int = 4,
                      n_jobs: int = 1, backend: str = "thread",
-                     chunk_samples: int = 1024):
+                     chunk_samples: int = 1024,
+                     checkpoint_every: int = 0):
         """
         Run QAQMC and save every operator-sequence snapshot to an HDF5 file.
 
@@ -255,7 +268,7 @@ class QAQMC_Rydberg:
             delta_schedule (2M,) float64 – δ(p) for each imaginary-time slice
         samples/
             op_types       (n_samples, 2M) int8  – operator type per slice
-            op_sites       (n_samples, 2M) int16 – site/bond index per slice
+            op_sites       (n_samples, 2M) int32 – site/bond index per slice
 
         Parameters
         ----------
@@ -267,6 +280,9 @@ class QAQMC_Rydberg:
         compression_opts: gzip compression level (1=fast … 9=small)
         n_jobs         : Number of parallel workers
         backend        : "thread" or "process" backend for concurrent.futures
+        chunk_samples  : Write chunk size for streaming mode
+        checkpoint_every: Save checkpoint every N samples (0 = disabled).
+                         Only works with n_jobs=1 and C++ backend.
         """
         # Warm-up JIT in main thread
         self.mc_step()
@@ -279,41 +295,77 @@ class QAQMC_Rydberg:
              if compression else {}
 
         kw_i8  = dict(**kw, dtype='int8')
-        kw_i16 = dict(**kw, dtype='int16')
+        kw_i32 = dict(**kw, dtype='int32')
 
-        with h5py.File(filepath, 'w') as f:
+        # ── Check for existing checkpoint ─────────────────────────────────
+        resume_from = 0
+        resume_equil_done = False
+        rng_state_restore = None
 
-            # ── metadata ─────────────────────────────────────────────────────
-            pg = f.create_group('params')
-            for k, v in self.init_kwargs.items():
-                if k != 'pos' and v is not None:
-                    pg.attrs[k] = v
-            pg.attrs['n_equil']        = n_equil
-            pg.attrs['n_samples']       = n_samples
-            pg.attrs['timestamp']       = datetime.datetime.utcnow().isoformat()
-            pg.attrs['equil_time_s']    = 0.0
+        if checkpoint_every > 0 and os.path.exists(filepath):
+            try:
+                with h5py.File(filepath, 'r') as f:
+                    if 'checkpoint' in f:
+                        ckpt = f['checkpoint']
+                        resume_from = int(ckpt.attrs['n_samples_done'])
+                        n_equil_done = int(ckpt.attrs['n_equil_done'])
+                        resume_equil_done = (n_equil_done >= n_equil)
+                        rng_state_restore = ckpt.attrs['rng_state']
+                        ckpt_types = ckpt['op_types'][:]
+                        ckpt_sites = ckpt['op_sites'][:]
+                        if self._cpp_engine is not None:
+                            self._cpp_engine.set_op_string(
+                                ckpt_types.astype(np.int32),
+                                ckpt_sites.astype(np.int32))
+                            self._cpp_engine.set_rng_state(rng_state_restore)
+                        if verbose:
+                            print(f"[Checkpoint] Resuming from sample {resume_from}/{n_samples}")
+            except Exception as e:
+                if verbose:
+                    print(f"[Checkpoint] Failed to load checkpoint: {e}, starting fresh")
+                resume_from = 0
+                resume_equil_done = False
 
-            # ── geometry ─────────────────────────────────────────────────────
-            gg = f.create_group('geometry')
-            pos_stored = self.pos if self.pos is not None \
-                         else np.arange(self.N).reshape(-1, 1).astype(np.float64)
-            gg.create_dataset('pos', data=pos_stored.astype(np.float64))
+        # ── Open/create HDF5 file ─────────────────────────────────────────
+        file_mode = 'r+' if (resume_from > 0 and os.path.exists(filepath)) else 'w'
+        with h5py.File(filepath, file_mode) as f:
 
-            # ── δ schedule ───────────────────────────────────────────────────
-            sg = f.create_group('schedule')
-            delta_sched = np.empty(M2, dtype=np.float64)
-            for p in range(self.M):
-                delta_sched[p] = (self.delta_min
-                                  + (self.delta_max - self.delta_min) * (p / self.M))
-            for p in range(self.M, M2):
-                delta_sched[p] = (self.delta_max
-                                  - (self.delta_max - self.delta_min) * ((p - self.M) / self.M))
-            sg.create_dataset('delta_schedule', data=delta_sched)
+            if file_mode == 'w':
+                # ── metadata ──────────────────────────────────────────────
+                pg = f.create_group('params')
+                for k, v in self.init_kwargs.items():
+                    if k != 'pos' and v is not None:
+                        pg.attrs[k] = v
+                pg.attrs['n_equil']        = n_equil
+                pg.attrs['n_samples']       = n_samples
+                pg.attrs['timestamp']       = datetime.datetime.utcnow().isoformat()
+                pg.attrs['equil_time_s']    = 0.0
 
-            # ── sample datasets (streamed write in single-worker mode) ──────
-            smg = f.create_group('samples')
-            ds_types = smg.create_dataset('op_types', shape=(n_samples, M2), **kw_i8)
-            ds_sites = smg.create_dataset('op_sites', shape=(n_samples, M2), **kw_i16)
+                # ── geometry ──────────────────────────────────────────────
+                gg = f.create_group('geometry')
+                pos_stored = self.pos if self.pos is not None \
+                             else np.arange(self.N).reshape(-1, 1).astype(np.float64)
+                gg.create_dataset('pos', data=pos_stored.astype(np.float64))
+
+                # ── δ schedule ────────────────────────────────────────────
+                sg = f.create_group('schedule')
+                delta_sched = np.empty(M2, dtype=np.float64)
+                for p in range(self.M):
+                    delta_sched[p] = (self.delta_min
+                                      + (self.delta_max - self.delta_min) * (p / self.M))
+                for p in range(self.M, M2):
+                    delta_sched[p] = (self.delta_max
+                                      - (self.delta_max - self.delta_min) * ((p - self.M) / self.M))
+                sg.create_dataset('delta_schedule', data=delta_sched)
+
+                # ── sample datasets ───────────────────────────────────────
+                smg = f.create_group('samples')
+                ds_types = smg.create_dataset('op_types', shape=(n_samples, M2), **kw_i8)
+                ds_sites = smg.create_dataset('op_sites', shape=(n_samples, M2), **kw_i32)
+            else:
+                pg = f['params']
+                ds_types = f['samples/op_types']
+                ds_sites = f['samples/op_sites']
 
             if n_jobs > 1:
                 # Keep original multi-worker behavior for compatibility.
@@ -344,40 +396,40 @@ class QAQMC_Rydberg:
                 t_sample = 0.0
 
                 if self._cpp_engine is not None:
-                    # Equilibration first (no data write)
                     use_tqdm = HAS_TQDM and verbose
-                    t0_eq = time.perf_counter()
-                    if use_tqdm:
-                        eq_bar = trange(n_equil, desc="Equil (W0)", leave=False)
-                        last_eq = 0
 
-                        def _eq_cb(done, total, phase):
-                            nonlocal last_eq
-                            if phase == "equil":
-                                delta = int(done) - last_eq
-                                if delta > 0:
-                                    eq_bar.update(delta)
-                                    last_eq = int(done)
+                    # Equilibration (skip if resuming from checkpoint)
+                    if not resume_equil_done:
+                        t0_eq = time.perf_counter()
+                        if use_tqdm:
+                            eq_bar = trange(n_equil, desc="Equil (W0)", leave=False)
+                            last_eq = 0
 
-                        try:
-                            self._cpp_engine.run(n_equil, 0, _eq_cb, max(1, n_equil // 200))
-                        except TypeError:
-                            # Old extension ABI: no callback support.
-                            self._cpp_engine.run(n_equil, 0)
-                            eq_bar.update(n_equil - last_eq)
-                        finally:
-                            eq_bar.close()
-                    else:
-                        try:
-                            self._cpp_engine.run(n_equil, 0, None, 1)
-                        except TypeError:
-                            self._cpp_engine.run(n_equil, 0)
-                    t_equil = time.perf_counter() - t0_eq
+                            def _eq_cb(done, total, phase):
+                                nonlocal last_eq
+                                if phase == "equil":
+                                    delta = int(done) - last_eq
+                                    if delta > 0:
+                                        eq_bar.update(delta)
+                                        last_eq = int(done)
 
-                    # Sampling in chunks
-                    use_tqdm = HAS_TQDM and verbose
-                    samp_bar = trange(n_samples, desc="Samp  (W0)", leave=False) if use_tqdm else None
-                    written = 0
+                            try:
+                                self._cpp_engine.run(n_equil, 0, _eq_cb, max(1, n_equil // 200))
+                            except TypeError:
+                                self._cpp_engine.run(n_equil, 0)
+                                eq_bar.update(n_equil - last_eq)
+                            finally:
+                                eq_bar.close()
+                        else:
+                            try:
+                                self._cpp_engine.run(n_equil, 0, None, 1)
+                            except TypeError:
+                                self._cpp_engine.run(n_equil, 0)
+                        t_equil = time.perf_counter() - t0_eq
+
+                    # Sampling in chunks (resume-aware)
+                    samp_bar = trange(n_samples, desc="Samp  (W0)", leave=False, initial=resume_from) if use_tqdm else None
+                    written = resume_from
                     t0_sa = time.perf_counter()
                     while written < n_samples:
                         cur = min(chunk_samples, n_samples - written)
@@ -390,6 +442,19 @@ class QAQMC_Rydberg:
                         written += cur
                         if samp_bar is not None:
                             samp_bar.update(cur)
+
+                        # Save checkpoint periodically
+                        if checkpoint_every > 0 and written < n_samples and written % checkpoint_every < cur:
+                            if 'checkpoint' in f:
+                                del f['checkpoint']
+                            cg = f.create_group('checkpoint')
+                            cg.create_dataset('op_types', data=np.array(self._cpp_engine.op_types, dtype=np.int32))
+                            cg.create_dataset('op_sites', data=np.array(self._cpp_engine.op_sites, dtype=np.int32))
+                            cg.attrs['rng_state'] = self._cpp_engine.get_rng_state()
+                            cg.attrs['n_samples_done'] = written
+                            cg.attrs['n_equil_done'] = n_equil
+                            f.flush()
+
                     if samp_bar is not None:
                         samp_bar.close()
                     t_sample = time.perf_counter() - t0_sa
@@ -408,11 +473,11 @@ class QAQMC_Rydberg:
                     while written < n_samples:
                         cur = min(chunk_samples, n_samples - written)
                         t_arr = np.empty((cur, M2), dtype=np.int8)
-                        s_arr = np.empty((cur, M2), dtype=np.int16)
+                        s_arr = np.empty((cur, M2), dtype=np.int32)
                         for i in range(cur):
                             self.mc_step()
                             t_arr[i] = self.op_types[:M2].astype(np.int8)
-                            s_arr[i] = self.op_sites[:M2].astype(np.int16)
+                            s_arr[i] = self.op_sites[:M2].astype(np.int32)
                         ds_types[written:written + cur] = t_arr
                         ds_sites[written:written + cur] = s_arr
                         written += cur
@@ -425,6 +490,10 @@ class QAQMC_Rydberg:
             pg.attrs['equil_time_s'] = t_equil
             pg.attrs['sample_time_s'] = t_sample
             pg.attrs['total_time_s']  = t_equil + t_sample
+
+            # Clean finish: remove checkpoint
+            if 'checkpoint' in f:
+                del f['checkpoint']
 
         if verbose:
             total = time.perf_counter() - t0_overall

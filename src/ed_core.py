@@ -13,7 +13,7 @@ def build_rydberg_hamiltonian(N: int, Omega: float, delta: float, Rb: float, pos
     dim = 1 << N
     H = np.zeros((dim, dim), dtype=np.float64)
 
-    V, _, _, _, _ = build_rydberg_vij(N, Omega, Rb, pos)
+    V, _, _, _, _, _ = build_rydberg_vij(N, Omega, Rb, pos)
 
     for s in range(dim):
         diag = 0.0
@@ -131,7 +131,7 @@ def qaqmc_exact_asymmetric_observables(
             raise ValueError("psi0 must have non-zero norm.")
         psi /= n0
 
-    V, _, _, vij_list, _ = build_rydberg_vij(N, Omega, Rb, pos)
+    V, _, _, vij_list, _, _ = build_rydberg_vij(N, Omega, Rb, pos)
     n_tot, dens_val, _mz_val, v_diag = _build_diag_terms_numba(N, dim, V)
 
     M_total = 2 * M
