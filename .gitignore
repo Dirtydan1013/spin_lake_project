@@ -36,3 +36,13 @@ figure/
 
 # Project specific old code (optional, you can remove this if you want to track it)
 old_code/
+
+*.so
+
+logs/
+
+scripts/
+
+task/
+
+.claude/

@@ -133,14 +133,14 @@ class QAQMC_Rydberg:
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
                  use_cpp: bool = True, omp_threads: int = 0,
                  neighbor_cutoff: int = None, precompute: bool = True,
-                 chunk_slices: int = 0):
+                 chunk_slices: int = 0, delta_groups: int = 0):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
             'verbose': False, 'n_jobs': 1, 'backend': "thread",
             'use_cpp': use_cpp, 'omp_threads': omp_threads,
             'neighbor_cutoff': neighbor_cutoff, 'precompute': precompute,
-            'chunk_slices': chunk_slices,
+            'chunk_slices': chunk_slices, 'delta_groups': delta_groups,
         }
         
         # Set OpenMP threads environment variable before C++ engine usage
@@ -170,7 +170,8 @@ class QAQMC_Rydberg:
             pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
             self._cpp_engine = qaqmc_cpp.QAQMCEngine(
                 N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
-                neighbor_cutoff=nc, precompute=precompute, chunk_slices=chunk_slices
+                neighbor_cutoff=nc, precompute=precompute, chunk_slices=chunk_slices,
+                delta_groups=delta_groups
             )
             # Mirror key attributes for compatibility
             self.bond_sites = np.array(self._cpp_engine.bond_sites, dtype=np.int32)

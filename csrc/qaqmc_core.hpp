@@ -57,7 +57,7 @@ public:
                 double Rb, int M, double epsilon, uint64_t seed,
                 const double* pos, int pos_dim,
                 int neighbor_cutoff = -1, bool precompute = true,
-                int chunk_slices = 0);
+                int chunk_slices = 0, int delta_groups = 0);
 
     void mc_step();
 
@@ -95,8 +95,10 @@ public:
         double raw3 = -vij + delta_i + delta_j;  // |11>: both excited
         // C_ij: shift to make all W >= 0, plus safety margin
         double m_min = std::min({raw0, raw1, raw2, raw3});
-        double m_abs = std::min({std::abs(raw0), std::abs(raw1),
-                                 std::abs(raw2), std::abs(raw3)});
+        // Exclude |raw0| (== 0 always) so epsilon*m_abs is non-trivial.
+        // This matches the SSE C++ convention and keeps W[|11>] > 0.
+        double m_abs = std::min({std::abs(raw1), std::abs(raw2),
+                                 std::abs(raw3)});
         double cij = (m_min < 0.0 ? -m_min : 0.0) + epsilon * m_abs;
         W[0] = raw0 + cij;
         W[1] = raw1 + cij;
@@ -112,6 +114,7 @@ private:
     double epsilon_;
     bool precompute_;
     int chunk_slices_;  // 0 = full precompute, >0 = chunked
+    int delta_groups_;  // 0 = no grouping, >0 = # groups for shared alias tables
 
     double time_diag_{0.0};
     double time_clus_{0.0};
@@ -123,10 +126,40 @@ private:
     AliasTable alias_;
     std::vector<double> delta_sched_;
 
+    // ── Grouped alias tables for O(G) diagonal update ─────────────────────
+    struct GroupedAlias {
+        int n_groups;
+        std::vector<int> slice_to_group;      // [M_total] -> group index
+        // Per-group alias table (same layout as AliasTable but indexed by group)
+        int max_alias;
+        int n_bonds_pad;
+        std::vector<double>  bond_W_max_all;  // [n_groups * n_bonds_pad]
+        std::vector<int>     n_alias_all;     // [n_groups]
+        std::vector<double>  alias_prob_all;  // [n_groups * max_alias]
+        std::vector<int64_t> alias_idx_all;   // [n_groups * max_alias]
+        std::vector<int>     op_map_kind_all; // [n_groups * max_alias]
+        std::vector<int>     op_map_loc_all;  // [n_groups * max_alias]
+    };
+    GroupedAlias grp_alias_;
+
     std::vector<int32_t> op_types_;
     std::vector<int32_t> op_sites_;
+
+    // ── Vertex lists for O(M) cluster update ──────────────────────────────
+    std::vector<int32_t> site_op_count_;
+    std::vector<int32_t> site_op_head_;
+    std::vector<int32_t> site_op_list_;
+
+    std::vector<int32_t> site_bond_count_;
+    std::vector<int32_t> site_bond_head_;
+    std::vector<int32_t> site_bond_list_;
+
+    std::vector<int32_t> bond_spin_;
+    std::vector<int32_t> spin_now_;
+    std::vector<int8_t>  seg_flipped_;
 
     // Internal update functions
     void diagonal_update();
     void cluster_update();
+    void build_vertex_lists();
 };

@@ -357,3 +357,117 @@ def obs_loop_string_op(loop_sites):
 
     _fn.__doc__ = f"Loop string op over sites {list(loop_sites)}"
     return _fn
+
+
+# ── SSE archive ───────────────────────────────────────────────────────────────
+
+class SSEArchive:
+    """
+    Read-only view of an SSE HDF5 archive produced by ``SSE_Rydberg.run_and_save``.
+
+    Attributes
+    ----------
+    params    : dict   – all simulation parameters
+    pos       : ndarray (N, d) – atom coordinates
+    energies  : ndarray (n_samples,) float64
+    densities : ndarray (n_samples,) float64
+    mz        : ndarray (n_samples,) float64
+    n_ops     : ndarray (n_samples,) int32
+    N, beta, n_samples, M_final, backend : scalars
+    """
+
+    def __init__(self, filepath: str):
+        self.filepath = Path(filepath)
+        if not self.filepath.exists():
+            raise FileNotFoundError(filepath)
+
+        with h5py.File(filepath, 'r') as f:
+            self.params     = dict(f['params'].attrs)
+            self.N          = int(self.params['N'])
+            self.beta       = float(self.params['beta'])
+            self.n_samples  = int(self.params['n_samples'])
+            self.M_final    = int(self.params['M_final'])
+            self.backend    = str(self.params['backend'])
+
+            self.pos       = f['geometry/pos'][:]
+            self.energies  = f['samples/energies'][:]
+            self.densities = f['samples/densities'][:]
+            self.mz        = f['samples/mz'][:]
+            self.n_ops     = f['samples/n_ops'][:]
+
+    def compute_stats(self, n_bins: int = 50) -> dict:
+        """
+        Compute binned-block mean ± stderr for energy, density, mz,
+        staggered susceptibility (chi), and Binder cumulant.
+
+        Returns
+        -------
+        dict with keys: energy_mean/err, density_mean/err,
+                        mz_mean/err, chi_mean/err, binder_mean/err,
+                        m_z_sq_mean, M, backend
+        """
+        n   = len(self.energies)
+        bs  = max(1, n // n_bins)
+
+        mz_sq  = self.mz ** 2
+        mz_abs = np.abs(self.mz)
+
+        e_bins  = np.array([self.energies[i*bs:(i+1)*bs].mean()  for i in range(n_bins)])
+        d_bins  = np.array([self.densities[i*bs:(i+1)*bs].mean() for i in range(n_bins)])
+        mz_bins = np.array([self.mz[i*bs:(i+1)*bs].mean()       for i in range(n_bins)])
+
+        chi_bins = np.array([
+            mz_sq[i*bs:(i+1)*bs].mean() - mz_abs[i*bs:(i+1)*bs].mean() ** 2
+            for i in range(n_bins)
+        ]) * n / n_bins
+
+        binder_bins = np.array([
+            1.5 * (1.0 - mz_sq[i*bs:(i+1)*bs].mean() ** 2
+                   / (3.0 * (mz_sq[i*bs:(i+1)*bs].mean() ** 2) + 1e-12))
+            for i in range(n_bins)
+        ])
+
+        return {
+            'energy_mean':  float(e_bins.mean()),
+            'energy_err':   float(e_bins.std()  / np.sqrt(n_bins)),
+            'density_mean': float(d_bins.mean()),
+            'density_err':  float(d_bins.std()  / np.sqrt(n_bins)),
+            'mz_mean':      float(mz_bins.mean()),
+            'mz_err':       float(mz_bins.std()  / np.sqrt(n_bins)),
+            'chi_mean':     float(chi_bins.mean()),
+            'chi_err':      float(chi_bins.std()  / np.sqrt(n_bins)),
+            'binder_mean':  float(binder_bins.mean()),
+            'binder_err':   float(binder_bins.std() / np.sqrt(n_bins)),
+            'm_z_sq_mean':  float(mz_sq.mean()),
+            'M':            self.M_final,
+            'backend':      self.backend,
+        }
+
+    def compute(self, observable_fn, n_bins: int = 50) -> dict:
+        """
+        Apply a custom observable function to the raw time series.
+
+        Parameters
+        ----------
+        observable_fn : callable
+            Signature: fn(energies, densities, mz, n_ops, arc) → (n_samples,) array
+        n_bins : int
+
+        Returns
+        -------
+        dict with keys 'mean', 'err', 'bins'
+        """
+        values   = observable_fn(self.energies, self.densities, self.mz, self.n_ops, self)
+        n        = len(values)
+        bs       = max(1, n // n_bins)
+        bins_arr = np.array([values[i*bs:(i+1)*bs].mean(axis=0) for i in range(n_bins)])
+        return {
+            'mean': float(np.mean(bins_arr, axis=0)),
+            'err':  float(np.std(bins_arr,  axis=0) / np.sqrt(n_bins)),
+            'bins': bins_arr,
+        }
+
+    def __repr__(self):
+        return (f"SSEArchive('{self.filepath.name}', "
+                f"N={self.N}, beta={self.beta}, n_samples={self.n_samples}, "
+                f"backend={self.backend!r})")

@@ -22,13 +22,33 @@ try:
 except ImportError:
     raise ImportError("mpi4py is required for MPI mode. Install with: pip install mpi4py")
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
 from src.qaqmc import QAQMC_Rydberg
+
+
+def _make_tqdm_callback(total, desc):
+    """Create a progress callback compatible with C++ run(..., callback, ...)."""
+    if not HAS_TQDM:
+        return None, None
+
+    bar = tqdm(total=total, desc=desc, unit='step', leave=True)
+
+    def _cb(i_done, _n_total, _stage):
+        # C++ callback reports cumulative completed steps.
+        bar.update(max(0, int(i_done) - bar.n))
+
+    return _cb, bar
 
 
 def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             pos=None, epsilon=0.01, seed=42, n_equil=5000, n_samples=10000,
             filepath='data/qaqmc_mpi.h5', neighbor_cutoff=None,
-            precompute=True, chunk_slices=0, omp_threads=0,
+            precompute=True, chunk_slices=0, delta_groups=0, omp_threads=0,
             compression='gzip', compression_opts=4,
             checkpoint_every=0, verbose=True):
     """
@@ -85,7 +105,7 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         pos=pos, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
         neighbor_cutoff=neighbor_cutoff, precompute=precompute,
-        chunk_slices=chunk_slices,
+        chunk_slices=chunk_slices, delta_groups=delta_groups,
     )
 
     M2 = engine.M_total
@@ -93,15 +113,24 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     # Equilibration
     comm.Barrier()
     t0 = time.perf_counter()
+    eq_cb = None
+    eq_bar = None
+    if verbose and rank == 0 and n_equil > 0:
+        eq_cb, eq_bar = _make_tqdm_callback(n_equil, "[MPI] Equilibration (rank0)")
 
     if engine._cpp_engine is not None:
         try:
-            engine._cpp_engine.run(n_equil, 0, None, 1)
+            engine._cpp_engine.run(n_equil, 0, eq_cb, 1000 if eq_cb is not None else 1)
         except TypeError:
             engine._cpp_engine.run(n_equil, 0)
     else:
-        for _ in range(n_equil):
+        it = range(n_equil)
+        if verbose and rank == 0 and HAS_TQDM and n_equil > 0:
+            it = tqdm(it, total=n_equil, desc="[MPI] Equilibration (rank0)", unit='step', leave=True)
+        for _ in it:
             engine.mc_step()
+    if eq_bar is not None:
+        eq_bar.close()
 
     t_equil = time.perf_counter() - t0
     comm.Barrier()
@@ -114,19 +143,28 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
     # Sampling
     t0 = time.perf_counter()
+    sa_cb = None
+    sa_bar = None
+    if verbose and rank == 0 and my_n_samples > 0:
+        sa_cb, sa_bar = _make_tqdm_callback(my_n_samples, "[MPI] Sampling (rank0)")
 
     if engine._cpp_engine is not None:
         try:
-            my_types, my_sites = engine._cpp_engine.run(0, my_n_samples, None, 1)
+            my_types, my_sites = engine._cpp_engine.run(0, my_n_samples, sa_cb, 1000 if sa_cb is not None else 1)
         except TypeError:
             my_types, my_sites = engine._cpp_engine.run(0, my_n_samples)
     else:
         my_types = np.empty((my_n_samples, M2), dtype=np.int8)
         my_sites = np.empty((my_n_samples, M2), dtype=np.int32)
-        for i in range(my_n_samples):
+        it = range(my_n_samples)
+        if verbose and rank == 0 and HAS_TQDM and my_n_samples > 0:
+            it = tqdm(it, total=my_n_samples, desc="[MPI] Sampling (rank0)", unit='sample', leave=True)
+        for i in it:
             engine.mc_step()
             my_types[i] = engine.op_types[:M2].astype(np.int8)
             my_sites[i] = engine.op_sites[:M2].astype(np.int32)
+    if sa_bar is not None:
+        sa_bar.close()
 
     t_sample = time.perf_counter() - t0
     comm.Barrier()
@@ -228,6 +266,8 @@ def main():
     parser.add_argument('--neighbor_cutoff', type=int, default=None)
     parser.add_argument('--precompute', action='store_true', default=True)
     parser.add_argument('--chunk_slices', type=int, default=0)
+    parser.add_argument('--delta_groups', type=int, default=0,
+                        help='Number of delta groups for shared alias tables (0=disabled)')
     parser.add_argument('--omp_threads', type=int, default=1)
     parser.add_argument('--filepath', type=str, default='data/qaqmc_mpi.h5')
     parser.add_argument('--lattice', type=str, default='kagome_bond',
@@ -264,6 +304,7 @@ def main():
         neighbor_cutoff=config.get('neighbor_cutoff'),
         precompute=config.get('precompute', True),
         chunk_slices=config.get('chunk_slices', 0),
+        delta_groups=config.get('delta_groups', 0),
         omp_threads=config.get('omp_threads', 1),
     )
 
