@@ -248,7 +248,7 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
     // - precompute && chunk_slices==0: full precompute (original)
     // - precompute && chunk_slices>0:  chunked, built on demand in diagonal_update
     // - !precompute:                   on-the-fly (no table)
-    if (precompute_ && chunk_slices_ <= 0) {
+    if (precompute_ && chunk_slices_ <= 0 && delta_groups_ == 0) {
         alias_ = build_qaqmc_alias_tables(M_total_, N_, vij_.n_bonds, Omega_,
                                            delta_sched_.data(), vij_.vij_list.data(),
                                            vij_.bonds_i.data(), vij_.bonds_j.data(),
@@ -386,6 +386,9 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
     op_types_.assign(M_total_, 1);
     op_sites_.assign(M_total_, 0);
 
+    // State at midpoint for on-the-fly observables
+    state_at_M_.assign(N_, 0);
+
     // Vertex-list scratch arrays
     site_op_count_.resize(N_, 0);
     site_op_head_.resize(N_, 0);
@@ -414,6 +417,107 @@ void QAQMCEngine::set_op_string(const int32_t* types, const int32_t* sites, int 
     std::memcpy(op_sites_.data(), sites, len * sizeof(int32_t));
 }
 
+// ─── On-the-fly observable helpers ───────────────────────────────────────────
+
+void QAQMCEngine::set_observable_sites(
+        const std::vector<std::vector<int>>& loop_sets,
+        const std::vector<std::vector<int>>& string_sets) {
+    loop_site_sets_ = loop_sets;
+    string_site_sets_ = string_sets;
+}
+
+void QAQMCEngine::set_bulk_sites(const std::vector<int>& bulk_sites) {
+    bulk_sites_ = bulk_sites;
+}
+
+QAQMCEngine::MidpointObservables QAQMCEngine::measure_at_midpoint() const {
+    MidpointObservables obs;
+
+    // Density: average n_i over bulk sites (or all sites if bulk not set)
+    if (!bulk_sites_.empty()) {
+        int total = 0;
+        for (int s : bulk_sites_) total += state_at_M_[s];
+        obs.density = (double)total / (double)bulk_sites_.size();
+    } else {
+        int total = 0;
+        for (int i = 0; i < N_; ++i) total += state_at_M_[i];
+        obs.density = (double)total / N_;
+    }
+
+    // Z(l): per-copy signed products — do NOT pre-average; caller averages then |·|
+    obs.Z_l_copies.resize(loop_site_sets_.size());
+    for (size_t k = 0; k < loop_site_sets_.size(); ++k) {
+        double prod = 1.0;
+        for (int s : loop_site_sets_[k]) prod *= (1 - 2 * state_at_M_[s]);
+        obs.Z_l_copies[k] = prod;
+    }
+
+    // C_m(l): per-copy signed products
+    obs.C_m_l_copies.resize(string_site_sets_.size());
+    for (size_t k = 0; k < string_site_sets_.size(); ++k) {
+        double prod = 1.0;
+        for (int s : string_site_sets_[k]) prod *= (1 - 2 * state_at_M_[s]);
+        obs.C_m_l_copies[k] = prod;
+    }
+
+    return obs;
+}
+
+// ─── Asymmetric profile measurement ──────────────────────────────────────────
+
+QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) const {
+    if (profile_step <= 0) profile_step = 1;
+    int n_points = M_total_ / profile_step;
+
+    ProfileObservables prof;
+    prof.n_points = n_points;
+    prof.density.resize(n_points, 0.0);
+    prof.Z_l_copies.assign(loop_site_sets_.size(),
+                           std::vector<double>(n_points, 0.0));
+    prof.C_m_l_copies.assign(string_site_sets_.size(),
+                             std::vector<double>(n_points, 0.0));
+
+    // Propagate state from left boundary |0...0>
+    std::vector<int32_t> state(N_, 0);
+    int out_idx = 0;
+
+    for (int p = 0; p < M_total_ && out_idx < n_points; ++p) {
+        // Off-diagonal operator: flip the site
+        if (op_types_[p] == -1) state[op_sites_[p]] ^= 1;
+
+        if ((p + 1) % profile_step == 0) {
+            // Density (bulk if set, else all sites)
+            if (!bulk_sites_.empty()) {
+                double s = 0.0;
+                for (int si : bulk_sites_) s += state[si];
+                prof.density[out_idx] = s / (double)bulk_sites_.size();
+            } else {
+                double s = 0.0;
+                for (int i = 0; i < N_; ++i) s += state[i];
+                prof.density[out_idx] = s / N_;
+            }
+
+            // Z_l: per-copy signed products
+            for (size_t k = 0; k < loop_site_sets_.size(); ++k) {
+                double prod = 1.0;
+                for (int s : loop_site_sets_[k]) prod *= (1 - 2 * state[s]);
+                prof.Z_l_copies[k][out_idx] = prod;
+            }
+
+            // C_m_l: per-copy signed products
+            for (size_t k = 0; k < string_site_sets_.size(); ++k) {
+                double prod = 1.0;
+                for (int s : string_site_sets_[k]) prod *= (1 - 2 * state[s]);
+                prof.C_m_l_copies[k][out_idx] = prod;
+            }
+
+            ++out_idx;
+        }
+    }
+
+    return prof;
+}
+
 // ─── Diagonal Update ─────────────────────────────────────────────────────────
 
 void QAQMCEngine::diagonal_update() {
@@ -428,6 +532,9 @@ void QAQMCEngine::diagonal_update() {
         int n_bonds_pad = grp_alias_.n_bonds_pad;
 
         for (int p = 0; p < M_total_; ++p) {
+            // Capture state at symmetry point
+            if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
+
             int ot = op_types_[p];
             if (ot == -1) {
                 state[op_sites_[p]] ^= 1;
@@ -483,6 +590,8 @@ void QAQMCEngine::diagonal_update() {
         int max_alias = alias_.max_alias;
 
         for (int p = 0; p < M_total_; ++p) {
+            if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
+
             int ot = op_types_[p];
             if (ot == -1) {
                 state[op_sites_[p]] ^= 1;
@@ -538,6 +647,8 @@ void QAQMCEngine::diagonal_update() {
             int max_alias = chunk_alias.max_alias;
 
             for (int p = chunk_start; p < chunk_end; ++p) {
+                if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
+
                 int pi = p - chunk_start;  // local index into chunk_alias
                 int ot = op_types_[p];
                 if (ot == -1) {
@@ -583,6 +694,8 @@ void QAQMCEngine::diagonal_update() {
         std::vector<double> cum_weights(N_ + n_bonds);
 
         for (int p = 0; p < M_total_; ++p) {
+            if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
+
             int ot = op_types_[p];
             if (ot == -1) {
                 state[op_sites_[p]] ^= 1;
@@ -739,7 +852,7 @@ void QAQMCEngine::cluster_update() {
             int ni = w_idx >> 1, nj = w_idx & 1;
 
             double w_old, w_new;
-            if (precompute_ && chunk_slices_ <= 0) {
+            if (precompute_ && chunk_slices_ <= 0 && delta_groups_ == 0) {
                 int n_bonds_pad = alias_.n_bonds_pad;
                 w_old = alias_.bond_W_all[(p * n_bonds_pad + b) * 4 + w_idx];
                 if (si == site_i)

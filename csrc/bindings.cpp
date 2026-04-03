@@ -44,8 +44,10 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
              "Run one diagonal update + cluster update")
 
         .def("run", [](QAQMCEngine& self, int n_equil, int n_samples,
-                       py::object progress_callback, int progress_every) {
+                       py::object progress_callback, int progress_every,
+                       int measure_every) {
             if (progress_every <= 0) progress_every = 1;
+            if (measure_every <= 0) measure_every = 1;
             const bool has_cb = !progress_callback.is_none();
 
             // Equilibration
@@ -56,6 +58,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             }
 
             int M2 = self.get_M_total();
+            int total_steps = n_samples * measure_every;
 
             // Allocate output numpy arrays
             py::array_t<int8_t> types_out({n_samples, M2});
@@ -63,27 +66,35 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             auto t_buf = types_out.mutable_unchecked<2>();
             auto s_buf = sites_out.mutable_unchecked<2>();
 
-            for (int i = 0; i < n_samples; ++i) {
+            int sample_idx = 0;
+            for (int i = 0; i < total_steps; ++i) {
                 self.mc_step();
-                const auto& ot = self.get_op_types();
-                const auto& os = self.get_op_sites();
-                for (int p = 0; p < M2; ++p) {
-                    t_buf(i, p) = static_cast<int8_t>(ot[p]);
-                    s_buf(i, p) = static_cast<int32_t>(os[p]);
+                if ((i + 1) % measure_every == 0) {
+                    const auto& ot = self.get_op_types();
+                    const auto& os = self.get_op_sites();
+                    for (int p = 0; p < M2; ++p) {
+                        t_buf(sample_idx, p) = static_cast<int8_t>(ot[p]);
+                        s_buf(sample_idx, p) = static_cast<int32_t>(os[p]);
+                    }
+                    ++sample_idx;
+                    if (has_cb && ((sample_idx % progress_every) == 0 || sample_idx == n_samples))
+                        progress_callback(sample_idx, n_samples, "sample");
                 }
-                if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_samples))
-                    progress_callback(i + 1, n_samples, "sample");
             }
             return py::make_tuple(types_out, sites_out);
         },
         py::arg("n_equil"), py::arg("n_samples"),
         py::arg("progress_callback") = py::none(),
         py::arg("progress_every") = 1000,
-        "Run equilibration + sampling, returns (op_types, op_sites) numpy arrays")
+        py::arg("measure_every") = 1,
+        "Run equilibration + sampling, returns (op_types, op_sites) numpy arrays.\n"
+        "measure_every: record one sample every this many MC steps (default 1).")
 
         .def_property_readonly("N", &QAQMCEngine::get_N)
         .def_property_readonly("M", &QAQMCEngine::get_M)
         .def_property_readonly("M_total", &QAQMCEngine::get_M_total)
+        .def_property_readonly("n_loops",   &QAQMCEngine::get_n_loops)
+        .def_property_readonly("n_strings", &QAQMCEngine::get_n_strings)
 
         .def_property_readonly("op_types", [](const QAQMCEngine& self) {
             const auto& v = self.get_op_types();
@@ -115,6 +126,269 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                                static_cast<const int32_t*>(s.ptr),
                                (int)t.shape[0]);
         })
+
+        // ── On-the-fly observable support ─────────────────────────────────────
+        .def("set_bulk_sites", [](QAQMCEngine& self, py::list bulk_py) {
+            std::vector<int> bulk;
+            for (auto& x : bulk_py) bulk.push_back(x.cast<int>());
+            self.set_bulk_sites(bulk);
+        },
+        py::arg("bulk_sites"),
+        "Set interior (bulk) site indices for density computation; "
+        "if empty, all sites are used")
+
+        .def("set_observable_sites", [](QAQMCEngine& self,
+                                        py::list loop_sets_py,
+                                        py::list string_sets_py) {
+            std::vector<std::vector<int>> loop_sets, string_sets;
+            for (auto& item : loop_sets_py) {
+                auto arr = item.cast<py::list>();
+                std::vector<int> v;
+                for (auto& x : arr) v.push_back(x.cast<int>());
+                loop_sets.push_back(std::move(v));
+            }
+            for (auto& item : string_sets_py) {
+                auto arr = item.cast<py::list>();
+                std::vector<int> v;
+                for (auto& x : arr) v.push_back(x.cast<int>());
+                string_sets.push_back(std::move(v));
+            }
+            self.set_observable_sites(loop_sets, string_sets);
+        },
+        py::arg("loop_sets"), py::arg("string_sets"),
+        "Set loop and string site index arrays for Z(l)/C_m(l) on-the-fly measurement")
+
+        .def("run_onthefly", [](QAQMCEngine& self, int n_equil, int n_samples,
+                                int me_density, int me_zl, int me_cml,
+                                py::object progress_callback, int progress_every) {
+            if (me_density  <= 0) me_density  = 1;
+            if (me_zl       <= 0) me_zl       = 1;
+            if (me_cml      <= 0) me_cml      = 1;
+            if (progress_every <= 0) progress_every = 1;
+            const bool has_cb = !progress_callback.is_none();
+
+            // Equilibration
+            for (int i = 0; i < n_equil; ++i) {
+                self.mc_step();
+                if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_equil))
+                    progress_callback(i + 1, n_equil, "equil");
+            }
+
+            // n_samples is defined for the finest observable (smallest interval).
+            // Total steps = n_samples * min_interval.
+            int min_me      = std::min({me_density, me_zl, me_cml});
+            int total_steps = n_samples * min_me;
+            int n_density   = total_steps / me_density;
+            int n_zl        = total_steps / me_zl;
+            int n_cml       = total_steps / me_cml;
+
+            py::array_t<double> density_out(n_density);
+            py::array_t<double> z_l_out(n_zl);
+            py::array_t<double> c_m_l_out(n_cml);
+            auto d_buf = density_out.mutable_unchecked<1>();
+            auto z_buf = z_l_out.mutable_unchecked<1>();
+            auto c_buf = c_m_l_out.mutable_unchecked<1>();
+
+            int n_loops   = self.get_n_loops();
+            int n_strings = self.get_n_strings();
+
+            // Reallocate output arrays with per-copy second dimension
+            py::array_t<double> z_l_out2({n_zl,  n_loops});
+            py::array_t<double> c_m_l_out2({n_cml, n_strings});
+            auto z_buf2 = z_l_out2.mutable_unchecked<2>();
+            auto c_buf2 = c_m_l_out2.mutable_unchecked<2>();
+
+            int idx_d = 0, idx_z = 0, idx_c = 0;
+            for (int i = 0; i < total_steps; ++i) {
+                self.mc_step();
+                int step = i + 1;
+                bool need_any = (step % me_density == 0) ||
+                                (step % me_zl      == 0) ||
+                                (step % me_cml     == 0);
+                if (need_any) {
+                    auto obs = self.measure_at_midpoint();
+                    if (step % me_density == 0) d_buf(idx_d++) = obs.density;
+                    if (step % me_zl == 0) {
+                        for (int k = 0; k < n_loops; ++k)
+                            z_buf2(idx_z, k) = obs.Z_l_copies[k];
+                        ++idx_z;
+                    }
+                    if (step % me_cml == 0) {
+                        for (int k = 0; k < n_strings; ++k)
+                            c_buf2(idx_c, k) = obs.C_m_l_copies[k];
+                        ++idx_c;
+                    }
+                }
+                if (has_cb) {
+                    int finest_done = step / min_me;
+                    if ((step % min_me == 0) &&
+                        (finest_done % progress_every == 0 || finest_done == n_samples))
+                        progress_callback(finest_done, n_samples, "sample");
+                }
+            }
+
+            py::dict result;
+            result["density"] = density_out;
+            result["Z_l"]     = z_l_out2;   // (n_zl, n_loops)
+            result["C_m_l"]   = c_m_l_out2; // (n_cml, n_strings)
+            return result;
+        },
+        py::arg("n_equil"), py::arg("n_samples"),
+        py::arg("me_density") = 1,
+        py::arg("me_zl")      = 1,
+        py::arg("me_cml")     = 1,
+        py::arg("progress_callback") = py::none(),
+        py::arg("progress_every") = 1000,
+        "On-the-fly symmetry-point sampling with per-observable measure intervals.\n"
+        "n_samples refers to the finest (smallest) interval. Others get proportionally fewer.\n"
+        "Returns dict: density (n_density,), Z_l (n_zl, n_loops), C_m_l (n_cml, n_strings).\n"
+        "To compute |<Z(l)>|: np.abs(arr.mean(axis=0)).mean() — mean per copy, then |·|, then avg.")
+
+        .def("run_profile", [](QAQMCEngine& self, int n_equil, int n_samples,
+                               int me_density, int me_zl, int me_cml,
+                               int profile_step, int batch_size,
+                               py::object progress_callback, int progress_every) {
+            if (me_density  <= 0) me_density  = 1;
+            if (me_zl       <= 0) me_zl       = 1;
+            if (me_cml      <= 0) me_cml      = 1;
+            if (profile_step   <= 0) profile_step   = 10000;
+            if (batch_size     <= 0) batch_size     = 1000;
+            if (progress_every <= 0) progress_every = 1;
+            const bool has_cb = !progress_callback.is_none();
+
+            // Equilibration
+            for (int i = 0; i < n_equil; ++i) {
+                self.mc_step();
+                if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_equil))
+                    progress_callback(i + 1, n_equil, "equil");
+            }
+
+            int M_total   = self.get_M_total();
+            int n_points  = M_total / profile_step;
+            int n_loops   = self.get_n_loops();
+            int n_strings = self.get_n_strings();
+            int min_me    = std::min({me_density, me_zl, me_cml});
+
+            // n_samples is defined for the finest observable.
+            // We group samples into batches; each batch stores the mean per copy per point.
+            int total_steps = n_samples * min_me;
+            int n_density   = total_steps / me_density;  // total density samples
+            int n_batches_z = (total_steps / me_zl)  / batch_size;
+            int n_batches_c = (total_steps / me_cml) / batch_size;
+            if (n_batches_z < 1) n_batches_z = 1;
+            if (n_batches_c < 1) n_batches_c = 1;
+
+            // density: still per-sample (n_density, n_points)
+            py::array_t<double> density_out({n_density, n_points});
+            auto d_buf = density_out.mutable_unchecked<2>();
+
+            // Z_l, C_m_l: batched per-copy  (n_batches, n_points, n_copies)
+            py::array_t<double> z_l_out  ({n_batches_z, n_points, n_loops});
+            py::array_t<double> c_m_l_out({n_batches_c, n_points, n_strings});
+            auto z_buf = z_l_out.mutable_unchecked<3>();
+            auto c_buf = c_m_l_out.mutable_unchecked<3>();
+
+            // Initialize batch accumulators
+            std::vector<std::vector<double>> z_acc(n_loops,   std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> c_acc(n_strings, std::vector<double>(n_points, 0.0));
+            int idx_d = 0;
+            int z_in_batch = 0, c_in_batch = 0;
+            int batch_z = 0, batch_c = 0;
+
+            for (int i = 0; i < total_steps; ++i) {
+                self.mc_step();
+                int step = i + 1;
+                bool need_d = (step % me_density == 0);
+                bool need_z = (step % me_zl      == 0);
+                bool need_c = (step % me_cml     == 0);
+
+                if (need_d || need_z || need_c) {
+                    auto prof = self.measure_profile(profile_step);
+                    if (need_d && idx_d < n_density) {
+                        for (int k = 0; k < n_points; ++k) d_buf(idx_d, k) = prof.density[k];
+                        ++idx_d;
+                    }
+                    if (need_z) {
+                        for (int k = 0; k < n_loops; ++k)
+                            for (int pt = 0; pt < n_points; ++pt)
+                                z_acc[k][pt] += prof.Z_l_copies[k][pt];
+                        ++z_in_batch;
+                        if (z_in_batch >= batch_size && batch_z < n_batches_z) {
+                            double inv = 1.0 / z_in_batch;
+                            for (int k = 0; k < n_loops; ++k)
+                                for (int pt = 0; pt < n_points; ++pt) {
+                                    z_buf(batch_z, pt, k) = z_acc[k][pt] * inv;
+                                    z_acc[k][pt] = 0.0;
+                                }
+                            ++batch_z;
+                            z_in_batch = 0;
+                        }
+                    }
+                    if (need_c) {
+                        for (int k = 0; k < n_strings; ++k)
+                            for (int pt = 0; pt < n_points; ++pt)
+                                c_acc[k][pt] += prof.C_m_l_copies[k][pt];
+                        ++c_in_batch;
+                        if (c_in_batch >= batch_size && batch_c < n_batches_c) {
+                            double inv = 1.0 / c_in_batch;
+                            for (int k = 0; k < n_strings; ++k)
+                                for (int pt = 0; pt < n_points; ++pt) {
+                                    c_buf(batch_c, pt, k) = c_acc[k][pt] * inv;
+                                    c_acc[k][pt] = 0.0;
+                                }
+                            ++batch_c;
+                            c_in_batch = 0;
+                        }
+                    }
+                }
+                if (has_cb) {
+                    int finest_done = step / min_me;
+                    if ((step % min_me == 0) &&
+                        (finest_done % progress_every == 0 || finest_done == n_samples))
+                        progress_callback(finest_done, n_samples, "sample");
+                }
+            }
+            // Flush remaining partial batch
+            if (z_in_batch > 0 && batch_z < n_batches_z) {
+                double inv = 1.0 / z_in_batch;
+                for (int k = 0; k < n_loops; ++k)
+                    for (int pt = 0; pt < n_points; ++pt)
+                        z_buf(batch_z, pt, k) = z_acc[k][pt] * inv;
+            }
+            if (c_in_batch > 0 && batch_c < n_batches_c) {
+                double inv = 1.0 / c_in_batch;
+                for (int k = 0; k < n_strings; ++k)
+                    for (int pt = 0; pt < n_points; ++pt)
+                        c_buf(batch_c, pt, k) = c_acc[k][pt] * inv;
+            }
+
+            // p-index array
+            py::array_t<int> p_indices(n_points);
+            auto p_buf = p_indices.mutable_unchecked<1>();
+            for (int k = 0; k < n_points; ++k)
+                p_buf(k) = (k + 1) * profile_step - 1;
+
+            py::dict result;
+            result["density"]    = density_out;  // (n_density, n_points)
+            result["Z_l"]        = z_l_out;       // (n_batches_z, n_points, n_loops)
+            result["C_m_l"]      = c_m_l_out;     // (n_batches_c, n_points, n_strings)
+            result["p_indices"]  = p_indices;
+            result["batch_size"] = py::int_(batch_size);
+            return result;
+        },
+        py::arg("n_equil"), py::arg("n_samples"),
+        py::arg("me_density") = 1,
+        py::arg("me_zl")      = 1,
+        py::arg("me_cml")     = 1,
+        py::arg("profile_step")  = 10000,
+        py::arg("batch_size")    = 1000,
+        py::arg("progress_callback") = py::none(),
+        py::arg("progress_every") = 1000,
+        "Asymmetric profile with batched per-copy storage.\n"
+        "density: (n_density, n_points) per-sample.\n"
+        "Z_l:     (n_batches, n_points, n_loops)   — batch means of per-copy signed products.\n"
+        "C_m_l:   (n_batches, n_points, n_strings) — batch means of per-copy signed products.\n"
+        "To get |<Z(l)>|(δ): np.abs(arr.mean(axis=0)).mean(axis=-1)  [mean over batches, then |·|, then avg copies].")
 
         // Profiling
         .def_property_readonly("time_diag", &QAQMCEngine::get_time_diag)

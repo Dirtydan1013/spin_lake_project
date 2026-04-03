@@ -70,6 +70,39 @@ public:
     const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
     const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
 
+    // ── On-the-fly observable support ─────────────────────────────────────
+    // Set loop/string site index arrays for Z(l) and C_m(l) measurement.
+    // Each inner vector is a list of site indices forming one translated copy.
+    void set_observable_sites(const std::vector<std::vector<int>>& loop_sets,
+                              const std::vector<std::vector<int>>& string_sets);
+    void set_bulk_sites(const std::vector<int>& bulk_sites);
+
+    // Number of registered loop / string translation copies.
+    int get_n_loops()   const { return (int)loop_site_sets_.size(); }
+    int get_n_strings() const { return (int)string_site_sets_.size(); }
+
+    // Measure diagonal observables using the captured state at the midpoint (p=M).
+    // Z_l_copies[k]   = signed product Π(1-2nᵢ) for loop copy k
+    // C_m_l_copies[k] = signed product Π(1-2nᵢ) for string copy k
+    // To get |<Z(l)>|: average each copy over samples, then take |·|, then average over copies.
+    struct MidpointObservables {
+        double density;
+        std::vector<double> Z_l_copies;    // [n_loops]   per-copy signed products
+        std::vector<double> C_m_l_copies;  // [n_strings] per-copy signed products
+    };
+    MidpointObservables measure_at_midpoint() const;
+
+    // Asymmetric profile: measure density/Z_l/C_m_l at every profile_step slices.
+    // Z_l_copies[k][pt]   = signed product for loop copy k at profile point pt
+    // C_m_l_copies[k][pt] = signed product for string copy k at profile point pt
+    struct ProfileObservables {
+        std::vector<double> density;                    // [n_points]
+        std::vector<std::vector<double>> Z_l_copies;    // [n_loops][n_points]
+        std::vector<std::vector<double>> C_m_l_copies;  // [n_strings][n_points]
+        int n_points;
+    };
+    ProfileObservables measure_profile(int profile_step) const;
+
     // Profiling
     double get_time_diag() const { return time_diag_; }
     double get_time_clus() const { return time_clus_; }
@@ -144,6 +177,12 @@ private:
 
     std::vector<int32_t> op_types_;
     std::vector<int32_t> op_sites_;
+
+    // ── On-the-fly observable data ──────────────────────────────────────
+    std::vector<int32_t> state_at_M_;          // spin config at symmetry point
+    std::vector<std::vector<int>> loop_site_sets_;
+    std::vector<std::vector<int>> string_site_sets_;
+    std::vector<int> bulk_sites_;              // interior sites for density (empty = all sites)
 
     // ── Vertex lists for O(M) cluster update ──────────────────────────────
     std::vector<int32_t> site_op_count_;
