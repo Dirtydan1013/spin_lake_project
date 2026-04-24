@@ -73,7 +73,7 @@ def build_kp_ratio_manifest(
     ny: int,
     m: int,
     a: float = 1.0,
-    preferred_center_label: str = "C35",
+    preferred_center_label: str | None = None,
     output_dir: str | Path,
 ) -> dict:
     out_dir = Path(output_dir)
@@ -264,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--ny", type=int, required=True)
     p_build.add_argument("--m", type=int, required=True)
     p_build.add_argument("--a", type=float, default=1.0)
-    p_build.add_argument("--preferred_center_label", type=str, default="C35")
+    p_build.add_argument("--preferred_center_label", type=str, default="auto")
     p_build.add_argument("--output_dir", type=str, required=True)
 
     p_count = sub.add_parser("count-jobs")

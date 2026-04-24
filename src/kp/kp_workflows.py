@@ -48,7 +48,7 @@ class KagomeKPRatioWorkflow:
         n_therm: int,
         n_measure: int,
         a: float = 1.0,
-        preferred_center_label: str = "C35",
+        preferred_center_label: str | None = None,
         measure_stride: int = 1,
         block_size: int | None = None,
     ) -> KagomeKPRatioResult:
@@ -87,7 +87,7 @@ class KagomeKPExpandedWorkflow:
         m: int,
         bond_sites,
         a: float = 1.0,
-        preferred_center_label: str = "C35",
+        preferred_center_label: str | None = None,
         autotune_steps_per_iter: int | None = None,
         autotune_max_iters: int = 10,
         autotune_tol: float = 0.3,

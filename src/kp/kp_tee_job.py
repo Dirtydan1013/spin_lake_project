@@ -318,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--neighbor_cutoff", type=int, default=-1)
-    parser.add_argument("--preferred_center_label", type=str, default="C35")
+    parser.add_argument("--preferred_center_label", type=str, default="auto")
     parser.add_argument("--output_dir", type=str, required=True)
 
     parser.add_argument("--n_therm", type=int, default=2000)

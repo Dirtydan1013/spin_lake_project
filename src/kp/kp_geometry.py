@@ -78,7 +78,15 @@ def _center_label(nx: int, ij: tuple[int, int]) -> str:
     return f"C{j * nx + i}"
 
 
-def _choose_center_ij(nx: int, ny: int, m: int, preferred: tuple[int, int]) -> tuple[int, int]:
+def _choose_center_ij(nx: int, ny: int, m: int,
+                      preferred: tuple[int, int] | None) -> tuple[int, int]:
+    """Pick a valid (i, j) void-index satisfying the one-cell safety margin.
+
+    If ``preferred`` is ``None`` the geometric centre ``((nx-1)/2, (ny-1)/2)`` is
+    used as the target. Otherwise the nearest valid position to ``preferred`` is
+    returned; the exact ``preferred`` is kept when it is itself valid.
+    Ties are broken lexicographically by ``(i, j)`` for reproducibility.
+    """
     valid = []
     for j in range(ny):
         for i in range(nx):
@@ -88,10 +96,32 @@ def _choose_center_ij(nx: int, ny: int, m: int, preferred: tuple[int, int]) -> t
         raise ValueError(
             f"No valid center for m={m} inside {nx}x{ny} lattice under the one-cell safety margin rule"
         )
-    if preferred in valid:
+    if preferred is not None and preferred in valid:
         return preferred
-    px, py = preferred
-    return min(valid, key=lambda ij: (ij[0] - px) ** 2 + (ij[1] - py) ** 2)
+    if preferred is None:
+        target_i = (nx - 1) / 2.0
+        target_j = (ny - 1) / 2.0
+    else:
+        target_i, target_j = preferred
+    return min(
+        valid,
+        key=lambda ij: (
+            (ij[0] - target_i) ** 2 + (ij[1] - target_j) ** 2,
+            ij[0],
+            ij[1],
+        ),
+    )
+
+
+def _parse_preferred_center(preferred_center_label, nx: int) -> tuple[int, int] | None:
+    """Return ``None`` for the auto sentinel or parse a ``"Cxx"`` label into (i, j)."""
+    if preferred_center_label is None:
+        return None
+    if isinstance(preferred_center_label, str):
+        normalised = preferred_center_label.strip()
+        if normalised == "" or normalised.lower() in {"auto", "none"}:
+            return None
+    return _center_label_to_ij(preferred_center_label, nx)
 
 
 def _center_coords_to_label_map(arr: np.ndarray, prefix: str) -> dict[tuple[float, float], str]:
@@ -138,7 +168,7 @@ def build_kp_paths(
     ny: int,
     *,
     m: int,
-    preferred_center_label: str = "C35",
+    preferred_center_label: str | None = None,
     a: float = 1.0,
 ) -> tuple[list[list[str]], list[list[str]], str]:
     if m <= 0:
@@ -147,7 +177,7 @@ def build_kp_paths(
     kagome = generate_kagome_lattice(nx, ny, a)
     centers = kagome_hex_centers(nx, ny, a)
     k_tree = KDTree(kagome)
-    preferred_ij = _center_label_to_ij(preferred_center_label, nx)
+    preferred_ij = _parse_preferred_center(preferred_center_label, nx)
     ci, cj = _choose_center_ij(nx, ny, int(m), preferred_ij)
     center_label = _center_label(nx, (ci, cj))
 
@@ -207,7 +237,7 @@ def build_kp_region_masks(
     *,
     m: int,
     a: float = 1.0,
-    preferred_center_label: str = "C35",
+    preferred_center_label: str | None = None,
 ) -> KPRegionSpec:
     kagome = generate_kagome_lattice(nx, ny, a)
     centers = kagome_hex_centers(nx, ny, a)
