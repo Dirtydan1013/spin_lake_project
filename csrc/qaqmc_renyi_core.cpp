@@ -78,7 +78,7 @@ int QAQMCRenyiEngine::channel_for_actual(int replica, int site, int p) const {
     return channel_for_actual_with_mask(replica, site, p, A_mask_);
 }
 
-void QAQMCRenyiEngine::set季_A_mask(const uint8_t* mask, int len) {
+void QAQMCRenyiEngine::set_A_mask(const uint8_t* mask, int len) {
     if (len != N_) {
         throw std::runtime_error("A_mask length mismatch");
     }
@@ -87,6 +87,7 @@ void QAQMCRenyiEngine::set季_A_mask(const uint8_t* mask, int len) {
     A_masks_[1] = A_mask_;
     cur_topology_ = 0;
     diff_site_ = -1;
+    mode_ = Mode::PairToggle;
     reset_visit_counts();
     recompute_midpoint_states();
 }
@@ -118,6 +119,7 @@ void QAQMCRenyiEngine::set_topology_pair(const uint8_t* A_k, const uint8_t* A_kp
     diff_site_ = diff_site;
     cur_topology_ = 0;
     A_mask_ = A_masks_[0];
+    mode_ = Mode::PairToggle;
     reset_visit_counts();
     recompute_midpoint_states();
 }
@@ -125,6 +127,193 @@ void QAQMCRenyiEngine::set_topology_pair(const uint8_t* A_k, const uint8_t* A_kp
 void QAQMCRenyiEngine::reset_visit_counts() {
     visit_count_[0] = 0;
     visit_count_[1] = 0;
+}
+
+void QAQMCRenyiEngine::set_ensemble_ladder(const std::vector<std::vector<uint8_t>>& masks,
+                                           const std::vector<std::vector<int>>& neighbors,
+                                           int initial_ensemble) {
+    if (masks.empty()) {
+        throw std::runtime_error("ensemble ladder must contain at least one mask");
+    }
+    if (masks.size() != neighbors.size()) {
+        throw std::runtime_error("masks and neighbors must have the same length");
+    }
+    const int n_ens = static_cast<int>(masks.size());
+    if (initial_ensemble < 0 || initial_ensemble >= n_ens) {
+        throw std::runtime_error("initial_ensemble out of range");
+    }
+    for (const auto& mask : masks) {
+        if (static_cast<int>(mask.size()) != N_) {
+            throw std::runtime_error("each ensemble mask must have length N");
+        }
+    }
+    for (const auto& row : neighbors) {
+        for (int nbr : row) {
+            if (nbr < 0 || nbr >= n_ens) {
+                throw std::runtime_error("ensemble neighbor index out of range");
+            }
+        }
+    }
+
+    ensembles_.clear();
+    ensembles_.reserve(n_ens);
+    for (int l = 0; l < n_ens; ++l) {
+        Ensemble e;
+        e.A_mask = masks[l];
+        e.size = 0;
+        for (uint8_t v : e.A_mask) {
+            if (v) ++e.size;
+        }
+        ensembles_.push_back(std::move(e));
+    }
+    ens_neighbors_ = neighbors;
+
+    cur_ens_ = initial_ensemble;
+    A_mask_ = ensembles_[initial_ensemble].A_mask;
+    A_masks_[0] = A_mask_;
+    A_masks_[1] = A_mask_;
+    diff_site_ = -1;
+    cur_topology_ = 0;
+    mode_ = Mode::Expanded;
+
+    visit_count_ext_.assign(n_ens, 0);
+    transition_count_.assign(static_cast<size_t>(n_ens) * n_ens, 0);
+    collection_count_.assign(static_cast<size_t>(n_ens) * n_ens, 0.0);
+    log_g_.assign(n_ens, 0.0);
+
+    auto occ = build_channel_occupancies();
+    reproject_site_ops_for_current_topology(occ);
+    update_midpoint_from_channels(occ);
+}
+
+void QAQMCRenyiEngine::set_log_g(const std::vector<double>& log_g) {
+    if (ensembles_.empty()) {
+        throw std::runtime_error("set_ensemble_ladder must be called before set_log_g");
+    }
+    if (log_g.size() != ensembles_.size()) {
+        throw std::runtime_error("log_g length mismatch");
+    }
+    log_g_ = log_g;
+}
+
+void QAQMCRenyiEngine::reset_visit_counts_ext() {
+    std::fill(visit_count_ext_.begin(), visit_count_ext_.end(), 0);
+}
+
+void QAQMCRenyiEngine::reset_transition_counts() {
+    std::fill(transition_count_.begin(), transition_count_.end(), 0);
+}
+
+void QAQMCRenyiEngine::reset_collection_counts() {
+    std::fill(collection_count_.begin(), collection_count_.end(), 0.0);
+}
+
+int QAQMCRenyiEngine::diff_site_between_masks(const std::vector<uint8_t>& from_mask,
+                                              const std::vector<uint8_t>& to_mask) const {
+    int diff = -1;
+    int count = 0;
+    for (int s = 0; s < N_; ++s) {
+        if (from_mask[s] != to_mask[s]) {
+            diff = s;
+            ++count;
+        }
+    }
+    return (count == 1) ? diff : -1;
+}
+
+double QAQMCRenyiEngine::log_weight_ratio_between_masks(int site,
+                                                        const std::vector<uint8_t>& from_mask,
+                                                        const std::vector<uint8_t>& to_mask) const {
+    auto occ_from = build_channel_occupancies(from_mask);
+    auto occ_to = build_channel_occupancies(to_mask);
+    double log_from = log_weight_for_site_with_mask(site, from_mask, occ_from);
+    double log_to = log_weight_for_site_with_mask(site, to_mask, occ_to);
+    return log_to - log_from;
+}
+
+void QAQMCRenyiEngine::ensemble_switch() {
+    if (ensembles_.empty()) {
+        return;
+    }
+    const int n_ens = static_cast<int>(ensembles_.size());
+    const int from_ens = cur_ens_;
+    const auto& nbrs = ens_neighbors_[from_ens];
+
+    if (nbrs.empty()) {
+        collection_count_[static_cast<size_t>(from_ens) * n_ens + from_ens] += 1.0;
+        transition_count_[static_cast<size_t>(from_ens) * n_ens + from_ens]++;
+        return;
+    }
+
+    // Pre-compute occ and log weights for the current topology once.
+    auto occ_from = build_channel_occupancies(ensembles_[from_ens].A_mask);
+
+    const double propose_prob = 1.0 / static_cast<double>(nbrs.size());
+    std::vector<double> accept_probs(nbrs.size(), 0.0);
+    double off_diag_weight = 0.0;
+
+    for (size_t i = 0; i < nbrs.size(); ++i) {
+        const int to_ens = nbrs[i];
+        double log_ratio = 0.0;
+        bool feasible = true;
+
+        auto occ_to = build_channel_occupancies(ensembles_[to_ens].A_mask);
+        for (int s = 0; s < N_; ++s) {
+            if (ensembles_[from_ens].A_mask[s] == ensembles_[to_ens].A_mask[s]) {
+                continue;
+            }
+            const double log_from = log_weight_for_site_with_mask(
+                s, ensembles_[from_ens].A_mask, occ_from);
+            const double log_to = log_weight_for_site_with_mask(
+                s, ensembles_[to_ens].A_mask, occ_to);
+            if (log_to <= -1e29) {
+                feasible = false;
+                break;
+            }
+            if (log_from <= -1e29) {
+                log_ratio = 1e30;  // from-weight zero ⇒ from-ensemble unreachable, force accept
+                break;
+            }
+            log_ratio += (log_to - log_from);
+        }
+
+        double a = 0.0;
+        if (feasible) {
+            const double n_from = static_cast<double>(nbrs.size());
+            const double n_to = static_cast<double>(ens_neighbors_[to_ens].size());
+            const double log_prop = (n_to > 0.0) ? std::log(n_from / n_to) : 0.0;
+            const double log_a = log_ratio + log_g_[to_ens] - log_g_[from_ens] + log_prop;
+            if (log_a >= 0.0) {
+                a = 1.0;
+            } else if (log_a <= -700.0) {
+                a = 0.0;
+            } else {
+                a = std::exp(log_a);
+            }
+        }
+        accept_probs[i] = a;
+        collection_count_[static_cast<size_t>(from_ens) * n_ens + to_ens] += propose_prob * a;
+        off_diag_weight += propose_prob * a;
+    }
+    const double self_weight = 1.0 - off_diag_weight;
+    collection_count_[static_cast<size_t>(from_ens) * n_ens + from_ens] +=
+        (self_weight > 0.0 ? self_weight : 0.0);
+
+    const int idx = renyi_randi(rngs_[0], static_cast<int>(nbrs.size()));
+    const int proposed = nbrs[idx];
+    const double a = accept_probs[idx];
+    const bool accept = (a >= 1.0) || (renyi_u01(rngs_[0]) < a);
+
+    int to_ens = from_ens;
+    if (accept) {
+        to_ens = proposed;
+        cur_ens_ = proposed;
+        A_mask_ = ensembles_[proposed].A_mask;
+        auto occ = build_channel_occupancies();
+        reproject_site_ops_for_current_topology(occ);
+        update_midpoint_from_channels(occ);
+    }
+    transition_count_[static_cast<size_t>(from_ens) * n_ens + to_ens]++;
 }
 
 void QAQMCRenyiEngine::set_indicator_site(int site) {
@@ -505,8 +694,15 @@ void QAQMCRenyiEngine::cluster_update() {
 void QAQMCRenyiEngine::mc_step() {
     diagonal_update();
     cluster_update();
-    topology_toggle();
-    visit_count_[cur_topology_]++;
+    if (mode_ == Mode::Expanded) {
+        ensemble_switch();
+        if (!visit_count_ext_.empty()) {
+            visit_count_ext_[cur_ens_]++;
+        }
+    } else {
+        topology_toggle();
+        visit_count_[cur_topology_]++;
+    }
     accumulate_indicator();
 }
 
