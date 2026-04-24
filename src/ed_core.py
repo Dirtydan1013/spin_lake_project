@@ -10,12 +10,19 @@ from scipy.linalg import eigh
 from src.hamiltonian import build_rydberg_vij
 
 
-def build_rydberg_hamiltonian(N: int, Omega: float, delta: float, Rb: float, pos: np.ndarray = None) -> np.ndarray:
+def build_rydberg_hamiltonian(
+    N: int,
+    Omega: float,
+    delta: float,
+    Rb: float,
+    pos: np.ndarray = None,
+    neighbor_cutoff: int | None = None,
+) -> np.ndarray:
     """Build the full 2^N x 2^N Hamiltonian matrix."""
     dim = 1 << N
     H = np.zeros((dim, dim), dtype=np.float64)
 
-    V, _, _, _, _, _ = build_rydberg_vij(N, Omega, Rb, pos)
+    V, _, _, _, _, _ = build_rydberg_vij(N, Omega, Rb, pos, verbose=False, neighbor_cutoff=neighbor_cutoff)
 
     for s in range(dim):
         diag = 0.0
@@ -86,25 +93,73 @@ def _apply_minus_h_inplace_numba(inp: np.ndarray, out: np.ndarray,
 
 
 @njit(cache=True, nogil=True)
-def _qaqmc_slice_offset(delta: float, N: int, vij_list: np.ndarray, epsilon: float) -> float:
+def _qaqmc_slice_offset(
+    delta: float,
+    vij_list: np.ndarray,
+    bond_sites: np.ndarray,
+    coord_number: np.ndarray,
+    epsilon: float,
+) -> float:
     """
     Total per-slice constant offset C for the QAQMC propagator (-H + C).
     Matches alias table construction:
       m1   = min(0, delta_b, 2*delta_b - V_ij)
       m2   = min(delta_b, 2*delta_b - V_ij)
       c_ij = |m1| + epsilon * |m2|
-    and delta_b = delta / (N - 1).
+    and the per-bond detunings are split asymmetrically as
+    delta_i = delta / coord_number[i].
     """
-    if N <= 1:
-        return 0.0
-    delta_b = delta / (N - 1)
     c_total = 0.0
-    for vij in vij_list:
-        two_db_vij = 2.0 * delta_b - vij
-        m1 = min(0.0, delta_b, two_db_vij)
-        m2 = min(delta_b, two_db_vij)
+    for b, vij in enumerate(vij_list):
+        si = bond_sites[b, 0]
+        sj = bond_sites[b, 1]
+        delta_i = delta / coord_number[si] if coord_number[si] > 0 else 0.0
+        delta_j = delta / coord_number[sj] if coord_number[sj] > 0 else 0.0
+        m1 = min(0.0, delta_j, delta_i, delta_i + delta_j - vij)
+        m2 = min(abs(0.0), abs(delta_j), abs(delta_i), abs(delta_i + delta_j - vij))
         c_total += abs(m1) + epsilon * abs(m2)
     return c_total
+
+
+def build_qaqmc_midpoint_state(
+    N: int,
+    Omega: float,
+    delta_min: float,
+    delta_max: float,
+    Rb: float,
+    M: int,
+    pos: np.ndarray = None,
+    epsilon: float = 0.01,
+    neighbor_cutoff: int | None = None,
+):
+    if M <= 0:
+        raise ValueError("M must be positive.")
+
+    dim = 1 << N
+    psi = np.zeros(dim, dtype=np.float64)
+    psi[0] = 1.0
+
+    V, _, _, vij_list, bond_sites, coord_number = build_rydberg_vij(
+        N,
+        Omega,
+        Rb,
+        pos,
+        verbose=False,
+        neighbor_cutoff=neighbor_cutoff,
+    )
+    n_tot, _dens_val, _mz_val, v_diag = _build_diag_terms_numba(N, dim, V)
+
+    for p in range(M):
+        delta = delta_min + (delta_max - delta_min) * (p / M)
+        c_shift = _qaqmc_slice_offset(delta, vij_list, bond_sites, coord_number, epsilon) + N * (Omega / 2.0)
+        out = np.empty(dim, dtype=np.float64)
+        _apply_minus_h_inplace_numba(psi, out, delta, Omega, N, n_tot, v_diag, c_shift)
+        psi = out
+        norm = np.linalg.norm(psi)
+        if norm > 0.0:
+            psi /= norm
+
+    return psi
 
 
 def qaqmc_exact_asymmetric_observables(
@@ -133,7 +188,13 @@ def qaqmc_exact_asymmetric_observables(
             raise ValueError("psi0 must have non-zero norm.")
         psi /= n0
 
-    V, _, _, vij_list, _, _ = build_rydberg_vij(N, Omega, Rb, pos)
+    V, _, _, vij_list, bond_sites, coord_number = build_rydberg_vij(
+        N,
+        Omega,
+        Rb,
+        pos,
+        verbose=False,
+    )
     n_tot, dens_val, _mz_val, v_diag = _build_diag_terms_numba(N, dim, V)
 
     M_total = 2 * M
@@ -146,7 +207,7 @@ def qaqmc_exact_asymmetric_observables(
 
     offsets = np.empty(M_total, dtype=np.float64)
     for t in range(M_total):
-        offsets[t] = _qaqmc_slice_offset(lambdas[t], N, vij_list, epsilon)
+        offsets[t] = _qaqmc_slice_offset(lambdas[t], vij_list, bond_sites, coord_number, epsilon)
 
     # Forward states R_t: right_states[t] == state after t operators
     right_states = np.empty((M_total + 1, dim), dtype=np.float64)

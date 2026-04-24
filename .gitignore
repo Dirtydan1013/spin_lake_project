@@ -46,3 +46,11 @@ scripts/
 task/
 
 .claude/
+
+TEST/
+
+paper/
+
+.codex
+
+CLAUDE.md

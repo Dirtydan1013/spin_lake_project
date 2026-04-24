@@ -110,6 +110,45 @@ def generate_kagome_bond_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray
     return np.array(pos)
 
 
+def generate_kagome_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
+    """Generate the original kagome-lattice vertices for the same void tiling.
+
+    The existing ``generate_kagome_bond_lattice`` places atoms at the midpoints
+    of the edges of the hexagonal voids.  This helper instead returns the
+    unique *vertices* of those hexagonal void outlines, i.e. the intersection
+    points of the grey kagome network in the user's sketches.
+
+    Geometry:
+        - Void centres are tiled on the same triangular Bravais lattice as in
+          ``generate_kagome_bond_lattice``.
+        - Around each void centre, the six kagome vertices lie at radius a/2
+          and angles 0° + 60° * k.
+        - With this convention, the bond-lattice sites are the midpoints of
+          nearest-neighbour kagome edges on the void perimeter.
+        - Shared vertices between neighbouring voids are deduplicated.
+
+    Args:
+        nx: Number of hexagonal voids along v1.
+        ny: Number of hexagonal voids along v2.
+        a:  Triangular Bravais lattice constant.
+
+    Returns:
+        (N, 2) Cartesian coordinate array of unique kagome vertices.
+    """
+    centers = kagome_hex_centers(nx, ny, a)
+    angles = np.radians(np.arange(6) * 60.0)
+    offsets = np.column_stack([
+        (a / 2.0) * np.cos(angles),
+        (a / 2.0) * np.sin(angles),
+    ])
+
+    raw = np.vstack([c + offsets for c in centers])
+    rounded = np.round(raw, 10)
+    _, unique_idx = np.unique(rounded, axis=0, return_index=True)
+    unique_idx.sort()
+    return raw[unique_idx]
+
+
 def kagome_bulk_sites(nx: int, ny: int) -> list:
     """Return site indices for interior atoms of an nx×ny kagome bond lattice.
 
@@ -374,6 +413,4 @@ def kagome_hex_centers(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
         for i in range(nx):
             centers.append(i * v1 + j * v2)
     return np.array(centers)
-
-
 
