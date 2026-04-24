@@ -3,7 +3,7 @@ MPI-parallel SSE: each rank runs an independent Markov chain.
 Rank 0 gathers samples and writes a single HDF5 file.
 
 Usage:
-    mpirun -np 4 python -m src.sse_mpi --N 64 --beta 10 --delta 2.0 ...
+    mpirun -np 4 python -m src.mpi.sse_mpi --N 64 --beta 10 --delta 2.0 ...
 
 Requires: mpi4py, h5py, numpy
 """
@@ -27,7 +27,7 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-from src.sse import SSE_Rydberg
+from src.engines.sse import SSE_Rydberg
 
 
 def _make_tqdm_callback(total, desc):
@@ -261,10 +261,10 @@ def main():
     pos = None
     lattice = config.get('lattice', '1d_chain')
     if lattice == '1d_chain':
-        from src.lattices import generate_1d_chain
+        from src.rydberg.lattices import generate_1d_chain
         pos = generate_1d_chain(config['N'], config.get('a', 1.0))
     elif lattice == 'kagome_bond':
-        from src.lattices import generate_kagome_bond_lattice
+        from src.rydberg.lattices import generate_kagome_bond_lattice
         pos = generate_kagome_bond_lattice(
             nx=config.get('nx', 1), ny=config.get('ny', 1),
             a=config.get('a', 4.0))

@@ -17,10 +17,10 @@ import numpy as np
 try:
     from mpi4py import MPI
 except ImportError as exc:  # pragma: no cover - exercised in environments without mpi4py
-    raise ImportError("mpi4py is required for src.qaqmc_renyi_ratio_mpi") from exc
+    raise ImportError("mpi4py is required for src.mpi.qaqmc_renyi_ratio_mpi") from exc
 
-from src.qaqmc_renyi import QAQMCRenyiRydberg
-from src.qaqmc_renyi_ratio import (
+from src.engines.qaqmc_renyi import QAQMCRenyiRydberg
+from src.tee.qaqmc_renyi_ratio import (
     RatioJobSpec,
     RatioRunner,
     combine_ratio_results,

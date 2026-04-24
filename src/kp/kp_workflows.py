@@ -7,15 +7,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.kp_geometry import (
+from src.kp.kp_geometry import (
     KPRegionSpec,
     RegionLadderSpec,
     attach_kp_site_orders,
     build_kp_ladders,
     build_kp_region_masks,
 )
-from src.qaqmc_renyi_ratio import KPRatioRunner
-from src.reweighting import ExpandedProductionResult, ReweightingDriver
+from src.tee.qaqmc_renyi_ratio import KPRatioRunner
+from src.tee.reweighting import ExpandedProductionResult, ReweightingDriver
 
 
 @dataclass(frozen=True)

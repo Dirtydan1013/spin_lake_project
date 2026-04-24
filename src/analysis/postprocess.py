@@ -8,7 +8,7 @@ Workflow
        qaqmc.run_and_save('data/run.h5', n_equil=5000, n_samples=30000)
 
 2. Load the archive and compute any observable you like:
-       from src.postprocess import QAQMCArchive
+       from src.analysis.postprocess import QAQMCArchive
        arc = QAQMCArchive('data/run.h5')
        density  = arc.compute(obs_density_asym)
        ms2_mean = arc.compute(obs_ms2_sym)

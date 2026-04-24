@@ -13,10 +13,10 @@ import numpy as np
 try:
     from mpi4py import MPI
 except ImportError as exc:  # pragma: no cover - exercised in environments without mpi4py
-    raise ImportError("mpi4py is required for src.reweighting_mpi") from exc
+    raise ImportError("mpi4py is required for src.mpi.reweighting_mpi") from exc
 
-from src.qaqmc_renyi import QAQMCRenyiRydberg
-from src.reweighting import (
+from src.engines.qaqmc_renyi import QAQMCRenyiRydberg
+from src.tee.reweighting import (
     AutoTuneResult,
     ExpandedProductionResult,
     ReweightingDriver,

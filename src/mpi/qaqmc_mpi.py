@@ -3,8 +3,8 @@ MPI-parallel QAQMC: each rank runs an independent Markov chain.
 Rank 0 gathers samples and writes a single HDF5 file.
 
 Usage:
-    mpirun -np 4 python -m src.qaqmc_mpi --config config.json
-    mpirun -np 40 python -m src.qaqmc_mpi --N 384 --M 5000 ...
+    mpirun -np 4 python -m src.mpi.qaqmc_mpi --config config.json
+    mpirun -np 40 python -m src.mpi.qaqmc_mpi --N 384 --M 5000 ...
 
 Requires: mpi4py, h5py, numpy
 """
@@ -28,8 +28,8 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-from src.qaqmc import QAQMC_Rydberg
-from src.lattices import (kagome_loop_string_translations,
+from src.engines.qaqmc import QAQMC_Rydberg
+from src.rydberg.lattices import (kagome_loop_string_translations,
                           kagome_multi_size_translations, kagome_bulk_sites,
                           kagome_vertex_sites)
 
@@ -859,7 +859,7 @@ def main():
     # Generate lattice
     pos = None
     if config.get('lattice') == 'kagome_bond':
-        from src.lattices import generate_kagome_bond_lattice
+        from src.rydberg.lattices import generate_kagome_bond_lattice
         pos = generate_kagome_bond_lattice(
             nx=config.get('nx', 1),
             ny=config.get('ny', 1),

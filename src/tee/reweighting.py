@@ -10,7 +10,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from src.qaqmc_renyi import QAQMCRenyiRydberg
+from src.engines.qaqmc_renyi import QAQMCRenyiRydberg
 
 
 @dataclass

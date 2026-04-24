@@ -10,10 +10,10 @@ from pathlib import Path
 
 import numpy as np
 
-from src.compose_tee import KPResult, aggregate_ratios, compose_kp, save_kp_result_hdf5
-from src.kp_geometry import KP_REGION_NAMES, attach_kp_site_orders, build_kp_region_masks
-from src.lattices import generate_kagome_bond_lattice
-from src.qaqmc_renyi_ratio import (
+from src.tee.compose_tee import KPResult, aggregate_ratios, compose_kp, save_kp_result_hdf5
+from src.kp.kp_geometry import KP_REGION_NAMES, attach_kp_site_orders, build_kp_region_masks
+from src.rydberg.lattices import generate_kagome_bond_lattice
+from src.tee.qaqmc_renyi_ratio import (
     build_ratio_job_specs,
     load_ratio_manifest_hdf5,
     save_ratio_manifest_hdf5,
@@ -174,7 +174,7 @@ def run_manifest_task(
     a = float(params["a"])
     pos = generate_kagome_bond_lattice(nx, ny, a=a)
 
-    from src.qaqmc_renyi_ratio_mpi import run_ratio_job
+    from src.mpi.qaqmc_renyi_ratio_mpi import run_ratio_job
 
     return run_ratio_job(
         job,

@@ -25,8 +25,8 @@ import numpy as np
 from matplotlib.path import Path
 from scipy.spatial import KDTree
 
-from src.ensemble_ladder import build_boundary_first_site_order
-from src.lattices import (
+from src.tee.ensemble_ladder import build_boundary_first_site_order
+from src.rydberg.lattices import (
     generate_kagome_bond_lattice,
     generate_kagome_lattice,
     kagome_hex_centers,

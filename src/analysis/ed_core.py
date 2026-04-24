@@ -7,7 +7,7 @@ Includes real-time dynamics with time-dependent detuning.
 import numpy as np
 from numba import njit
 from scipy.linalg import eigh
-from src.hamiltonian import build_rydberg_vij
+from src.rydberg.hamiltonian import build_rydberg_vij
 
 
 def build_rydberg_hamiltonian(

@@ -10,11 +10,11 @@ from pathlib import Path
 
 import numpy as np
 
-from src.compose_tee import save_kp_result_hdf5
-from src.kp_geometry import KP_REGION_NAMES
-from src.kp_workflows import KagomeKPExpandedWorkflow, KagomeKPRatioWorkflow
-from src.lattices import generate_kagome_bond_lattice
-from src.reweighting import save_expanded_result_hdf5
+from src.tee.compose_tee import save_kp_result_hdf5
+from src.kp.kp_geometry import KP_REGION_NAMES
+from src.kp.kp_workflows import KagomeKPExpandedWorkflow, KagomeKPRatioWorkflow
+from src.rydberg.lattices import generate_kagome_bond_lattice
+from src.tee.reweighting import save_expanded_result_hdf5
 
 
 def _to_attr_value(value):

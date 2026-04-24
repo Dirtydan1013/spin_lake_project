@@ -24,9 +24,9 @@ if multiprocessing.get_start_method(allow_none=True) is None:
     if platform.system() == "Linux":
         multiprocessing.set_start_method("spawn", force=True)
 
-from src.hamiltonian import build_rydberg_vij
-from src.sse_updates import build_alias_table, sse_diagonal_update, sse_cluster_update
-from src.measurement import calc_density, calc_staggered_magnetization
+from src.rydberg.hamiltonian import build_rydberg_vij
+from src.engines.sse_updates import build_alias_table, sse_diagonal_update, sse_cluster_update
+from src.analysis.measurement import calc_density, calc_staggered_magnetization
 
 try:
     import os, shutil

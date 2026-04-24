@@ -10,9 +10,9 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from src.compose_tee import KPResult, RegionEntropySummary, compose_kp, summarize_region
-from src.ensemble_ladder import build_boundary_first_site_order
-from src.qaqmc_renyi import QAQMCRenyiRydberg
+from src.tee.compose_tee import KPResult, RegionEntropySummary, compose_kp, summarize_region
+from src.tee.ensemble_ladder import build_boundary_first_site_order
+from src.engines.qaqmc_renyi import QAQMCRenyiRydberg
 
 
 @dataclass

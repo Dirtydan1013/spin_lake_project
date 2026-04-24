@@ -27,8 +27,8 @@ if multiprocessing.get_start_method(allow_none=True) is None:
         multiprocessing.set_start_method("spawn", force=True)
 
 
-from src.hamiltonian import build_rydberg_vij
-from src.qaqmc_updates import build_qaqmc_alias_tables, qaqmc_diagonal_update, qaqmc_cluster_update
+from src.rydberg.hamiltonian import build_rydberg_vij
+from src.engines.qaqmc_updates import build_qaqmc_alias_tables, qaqmc_diagonal_update, qaqmc_cluster_update
 
 try:
     import os, subprocess, shutil

@@ -24,7 +24,7 @@ try:
         sys.path.insert(0, _build_dir)
     import qaqmc_cpp
 except (ImportError, OSError) as exc:
-    raise ImportError("qaqmc_cpp with QAQMCRenyiEngine is required for src.qaqmc_renyi") from exc
+    raise ImportError("qaqmc_cpp with QAQMCRenyiEngine is required for src.engines.qaqmc_renyi") from exc
 
 
 class QAQMCRenyiRydberg:
