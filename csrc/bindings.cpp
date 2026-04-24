@@ -402,7 +402,8 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
     py::class_<QAQMCRenyiEngine>(m, "QAQMCRenyiEngine")
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
-                         py::array_t<double> pos_arr, int neighbor_cutoff) {
+                         py::array_t<double> pos_arr, int neighbor_cutoff,
+                         int delta_groups) {
             auto buf = pos_arr.request();
             if (buf.ndim != 2)
                 throw std::runtime_error("pos must be a 2D array (N, dim)");
@@ -410,11 +411,11 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             const double* pos_ptr = static_cast<const double*>(buf.ptr);
             return new QAQMCRenyiEngine(
                 N, Omega, delta_min, delta_max, Rb, M, epsilon, seed,
-                pos_ptr, pos_dim, neighbor_cutoff);
+                pos_ptr, pos_dim, neighbor_cutoff, delta_groups);
         }),
         py::arg("N"), py::arg("Omega"), py::arg("delta_min"), py::arg("delta_max"),
         py::arg("Rb"), py::arg("M"), py::arg("epsilon") = 0.01, py::arg("seed") = 42,
-        py::arg("pos"), py::arg("neighbor_cutoff") = -1)
+        py::arg("pos"), py::arg("neighbor_cutoff") = -1, py::arg("delta_groups") = 0)
 
         .def("mc_step", &QAQMCRenyiEngine::mc_step,
              "Run one two-replica QAQMC step in ratio-estimator mode.")
@@ -559,6 +560,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def_property_readonly("current_ensemble", &QAQMCRenyiEngine::get_current_ensemble)
         .def_property_readonly("ensemble_count", &QAQMCRenyiEngine::get_ensemble_count)
         .def_property_readonly("mode", &QAQMCRenyiEngine::get_mode)
+        .def_property_readonly("delta_groups", &QAQMCRenyiEngine::get_delta_groups)
         .def_property_readonly("diff_site", &QAQMCRenyiEngine::get_diff_site);
 
     // ── SSEEngine ─────────────────────────────────────────────────────────────

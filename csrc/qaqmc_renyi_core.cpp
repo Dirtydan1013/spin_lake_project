@@ -22,7 +22,8 @@ inline int renyi_randi(std::mt19937_64& rng, int n) {
 
 QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double delta_max,
                                    double Rb, int M, double epsilon, uint64_t seed,
-                                   const double* pos, int pos_dim, int neighbor_cutoff)
+                                   const double* pos, int pos_dim, int neighbor_cutoff,
+                                   int delta_groups)
     : N_(N),
       M_(M),
       M_total_(2 * M),
@@ -31,7 +32,11 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
       delta_min_(delta_min),
       delta_max_(delta_max),
       epsilon_(epsilon),
+      delta_groups_(delta_groups),
       rngs_{std::mt19937_64(seed), std::mt19937_64(seed + 0x9e3779b97f4a7c15ULL)} {
+    if (delta_groups_ < 0) delta_groups_ = 0;
+    if (M_total_ > 0 && delta_groups_ > M_total_) delta_groups_ = M_total_;
+
     vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff);
 
     delta_sched_.resize(M_total_);
@@ -42,11 +47,19 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
         delta_sched_[p] = delta_max_ - (delta_max_ - delta_min_) * (static_cast<double>(p - M_) / M_);
     }
 
-    alias_ = build_qaqmc_alias_tables(
-        M_total_, N_, vij_.n_bonds, Omega_, delta_sched_.data(), vij_.vij_list.data(),
-        vij_.bonds_i.data(), vij_.bonds_j.data(), vij_.coord_number.data(), epsilon_);
-    n_bonds_pad_ = alias_.n_bonds_pad;
-    max_alias_ = alias_.max_alias;
+    if (delta_groups_ > 0) {
+        alias_.n_bonds_pad = std::max(vij_.n_bonds, 1);
+        alias_.max_alias = N_ + vij_.n_bonds;
+        n_bonds_pad_ = alias_.n_bonds_pad;
+        max_alias_ = alias_.max_alias;
+        build_grouped_alias_tables();
+    } else {
+        alias_ = build_qaqmc_alias_tables(
+            M_total_, N_, vij_.n_bonds, Omega_, delta_sched_.data(), vij_.vij_list.data(),
+            vij_.bonds_i.data(), vij_.bonds_j.data(), vij_.coord_number.data(), epsilon_);
+        n_bonds_pad_ = alias_.n_bonds_pad;
+        max_alias_ = alias_.max_alias;
+    }
 
     for (auto& replica : replicas_) {
         replica.op_types.assign(M_total_, 1);
@@ -56,6 +69,114 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
     A_mask_.assign(N_, 0);
     A_masks_[0] = A_mask_;
     A_masks_[1] = A_mask_;
+}
+
+void QAQMCRenyiEngine::build_grouped_alias_tables() {
+    const int G = delta_groups_;
+    const int n_bonds = vij_.n_bonds;
+    const int n_bonds_pad = std::max(n_bonds, 1);
+    const int max_alias = N_ + n_bonds;
+    const int* bond_si = vij_.bonds_i.data();
+    const int* bond_sj = vij_.bonds_j.data();
+    const int* coord_num = vij_.coord_number.data();
+
+    grp_alias_.n_groups = G;
+    grp_alias_.max_alias = max_alias;
+    grp_alias_.n_bonds_pad = n_bonds_pad;
+    grp_alias_.slice_to_group.resize(M_total_);
+
+    for (int p = 0; p < M_total_; ++p) {
+        int g = static_cast<int>((static_cast<int64_t>(p) * G) / M_total_);
+        if (g >= G) g = G - 1;
+        grp_alias_.slice_to_group[p] = g;
+    }
+
+    grp_alias_.bond_W_max_all.assign(G * n_bonds_pad, 0.0);
+    grp_alias_.n_alias_all.assign(G, 0);
+    grp_alias_.alias_prob_all.assign(G * max_alias, 0.0);
+    grp_alias_.alias_idx_all.assign(G * max_alias, 0);
+    grp_alias_.op_map_kind_all.assign(G * max_alias, 0);
+    grp_alias_.op_map_loc_all.assign(G * max_alias, 0);
+
+#ifdef QAQMC_USE_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int g = 0; g < G; ++g) {
+        int p_lo = static_cast<int>((static_cast<int64_t>(g) * M_total_) / G);
+        int p_hi = static_cast<int>((static_cast<int64_t>(g + 1) * M_total_) / G);
+        if (p_hi > M_total_) p_hi = M_total_;
+
+        std::vector<double> env_W_max(n_bonds, 0.0);
+        for (int p = p_lo; p < p_hi; ++p) {
+            const double delta = delta_sched_[p];
+            for (int b = 0; b < n_bonds; ++b) {
+                const int si = bond_si[b];
+                const int sj = bond_sj[b];
+                const double di = (coord_num[si] > 0) ? delta / coord_num[si] : 0.0;
+                const double dj = (coord_num[sj] > 0) ? delta / coord_num[sj] : 0.0;
+                double W[4], wmax;
+                compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
+                if (wmax > env_W_max[b]) env_W_max[b] = wmax;
+            }
+        }
+
+        for (int b = 0; b < n_bonds; ++b) {
+            grp_alias_.bond_W_max_all[g * n_bonds_pad + b] = env_W_max[b];
+        }
+
+        std::vector<double> weights(max_alias);
+        std::vector<int> op_kind(max_alias);
+        std::vector<int> op_loc(max_alias);
+        int n_a = 0;
+
+        for (int i = 0; i < N_; ++i) {
+            weights[n_a] = Omega_ / 2.0;
+            op_kind[n_a] = 0;
+            op_loc[n_a] = i;
+            ++n_a;
+        }
+        for (int b = 0; b < n_bonds; ++b) {
+            weights[n_a] = env_W_max[b];
+            op_kind[n_a] = 1;
+            op_loc[n_a] = b;
+            ++n_a;
+        }
+
+        grp_alias_.n_alias_all[g] = n_a;
+        for (int i = 0; i < n_a; ++i) {
+            grp_alias_.op_map_kind_all[g * max_alias + i] = op_kind[i];
+            grp_alias_.op_map_loc_all[g * max_alias + i] = op_loc[i];
+        }
+
+        double total = 0.0;
+        for (int i = 0; i < n_a; ++i) total += weights[i];
+
+        std::vector<double> prob_arr(n_a);
+        std::vector<int64_t> alias_arr(n_a);
+        for (int i = 0; i < n_a; ++i) {
+            prob_arr[i] = weights[i] * n_a / total;
+            alias_arr[i] = i;
+        }
+
+        std::vector<int> small_buf, large_buf;
+        for (int i = 0; i < n_a; ++i) {
+            if (prob_arr[i] < 1.0) small_buf.push_back(i);
+            else large_buf.push_back(i);
+        }
+        while (!small_buf.empty() && !large_buf.empty()) {
+            int s = small_buf.back(); small_buf.pop_back();
+            int l = large_buf.back(); large_buf.pop_back();
+            alias_arr[s] = l;
+            prob_arr[l] -= (1.0 - prob_arr[s]);
+            if (prob_arr[l] < 1.0) small_buf.push_back(l);
+            else large_buf.push_back(l);
+        }
+
+        for (int i = 0; i < n_a; ++i) {
+            grp_alias_.alias_prob_all[g * max_alias + i] = prob_arr[i];
+            grp_alias_.alias_idx_all[g * max_alias + i] = alias_arr[i];
+        }
+    }
 }
 
 int QAQMCRenyiEngine::replica_for_with_mask(int channel, int site, int p,
@@ -409,6 +530,22 @@ void QAQMCRenyiEngine::reproject_site_ops_for_current_topology(const std::vector
     }
 }
 
+double QAQMCRenyiEngine::actual_bond_weight(int p, int b, int w_idx) const {
+    if (delta_groups_ <= 0 && !alias_.bond_W_all.empty()) {
+        return alias_.bond_W_all[(p * n_bonds_pad_ + b) * 4 + w_idx];
+    }
+
+    const int* bond_sites = vij_.bond_sites_flat.data();
+    const int si = bond_sites[b * 2 + 0];
+    const int sj = bond_sites[b * 2 + 1];
+    const double delta = delta_sched_[p];
+    const double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
+    const double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
+    double W[4], wmax;
+    compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
+    return W[w_idx];
+}
+
 double QAQMCRenyiEngine::log_weight_for_site_with_mask(int site, const std::vector<uint8_t>& mask,
                                                        const std::vector<int32_t>& occ) const {
     if (site < 0 || site >= N_) {
@@ -444,17 +581,7 @@ double QAQMCRenyiEngine::log_weight_for_site_with_mask(int site, const std::vect
             int n_j = occ[idx(c_j, p, sj)];
             int w_idx = n_i * 2 + n_j;
 
-            double w = 0.0;
-            if (alias_.n_bonds_pad > 0 && !alias_.bond_W_all.empty()) {
-                w = alias_.bond_W_all[(p * n_bonds_pad_ + b) * 4 + w_idx];
-            } else {
-                double delta = delta_sched_[p];
-                double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
-                double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
-                double W[4], wmax;
-                compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
-                w = W[w_idx];
-            }
+            double w = actual_bond_weight(p, b, w_idx);
 
             if (w <= 1e-300) {
                 return -1e30;
@@ -568,14 +695,27 @@ void QAQMCRenyiEngine::diagonal_update() {
 
             bool inserted = false;
             while (!inserted) {
-                int n_alias_p = alias_.n_alias_all[p];
-                int i = renyi_randi(rng, n_alias_p);
-                int idx = (renyi_u01(rng) < alias_.alias_prob_all[p * max_alias_ + i])
-                    ? i
-                    : static_cast<int>(alias_.alias_idx_all[p * max_alias_ + i]);
-
-                int kind = alias_.op_map_kind_all[p * max_alias_ + idx];
-                int loc = alias_.op_map_loc_all[p * max_alias_ + idx];
+                int kind = 0;
+                int loc = 0;
+                int group = -1;
+                if (delta_groups_ > 0) {
+                    group = grp_alias_.slice_to_group[p];
+                    int n_alias_g = grp_alias_.n_alias_all[group];
+                    int i = renyi_randi(rng, n_alias_g);
+                    int idx = (renyi_u01(rng) < grp_alias_.alias_prob_all[group * max_alias_ + i])
+                        ? i
+                        : static_cast<int>(grp_alias_.alias_idx_all[group * max_alias_ + i]);
+                    kind = grp_alias_.op_map_kind_all[group * max_alias_ + idx];
+                    loc = grp_alias_.op_map_loc_all[group * max_alias_ + idx];
+                } else {
+                    int n_alias_p = alias_.n_alias_all[p];
+                    int i = renyi_randi(rng, n_alias_p);
+                    int idx = (renyi_u01(rng) < alias_.alias_prob_all[p * max_alias_ + i])
+                        ? i
+                        : static_cast<int>(alias_.alias_idx_all[p * max_alias_ + i]);
+                    kind = alias_.op_map_kind_all[p * max_alias_ + idx];
+                    loc = alias_.op_map_loc_all[p * max_alias_ + idx];
+                }
 
                 if (kind == 0) {
                     next_types[replica] = 1;
@@ -588,8 +728,10 @@ void QAQMCRenyiEngine::diagonal_update() {
                     int c_i = channel_for_actual(replica, si, p);
                     int c_j = channel_for_actual(replica, sj, p);
                     int w_idx = channel_state[ch_idx(c_i, si)] * 2 + channel_state[ch_idx(c_j, sj)];
-                    double w_actual = alias_.bond_W_all[(p * n_bonds_pad_ + b) * 4 + w_idx];
-                    double w_max = alias_.bond_W_max_all[p * n_bonds_pad_ + b];
+                    double w_actual = actual_bond_weight(p, b, w_idx);
+                    double w_max = (delta_groups_ > 0)
+                        ? grp_alias_.bond_W_max_all[group * n_bonds_pad_ + b]
+                        : alias_.bond_W_max_all[p * n_bonds_pad_ + b];
                     if (w_max > 0.0 && renyi_u01(rng) < w_actual / w_max) {
                         next_types[replica] = 2;
                         next_sites[replica] = b;
@@ -654,13 +796,13 @@ void QAQMCRenyiEngine::cluster_update() {
                     int c_j = channel_for_actual(replica, sj, p);
                     int n_i = occ[occ_idx(c_i, p, si)];
                     int n_j = occ[occ_idx(c_j, p, sj)];
-                    double w_old = alias_.bond_W_all[(p * n_bonds_pad_ + b) * 4 + n_i * 2 + n_j];
+                    double w_old = actual_bond_weight(p, b, n_i * 2 + n_j);
 
                     int new_n_i = n_i;
                     int new_n_j = n_j;
                     if (si == site && c_i == channel) new_n_i ^= 1;
                     if (sj == site && c_j == channel) new_n_j ^= 1;
-                    double w_new = alias_.bond_W_all[(p * n_bonds_pad_ + b) * 4 + new_n_i * 2 + new_n_j];
+                    double w_new = actual_bond_weight(p, b, new_n_i * 2 + new_n_j);
 
                     log_ratio += ((w_new > 1e-300) ? std::log(w_new) : -1e30)
                                - ((w_old > 1e-300) ? std::log(w_old) : -1e30);

@@ -28,7 +28,8 @@ public:
 
     QAQMCRenyiEngine(int N, double Omega, double delta_min, double delta_max,
                      double Rb, int M, double epsilon, uint64_t seed,
-                     const double* pos, int pos_dim, int neighbor_cutoff = -1);
+                     const double* pos, int pos_dim, int neighbor_cutoff = -1,
+                     int delta_groups = 0);
 
     void mc_step();
     void run_steps(int n_steps);
@@ -53,6 +54,7 @@ public:
     int get_ensemble_count() const { return static_cast<int>(ensembles_.size()); }
     int get_diff_site() const { return diff_site_; }
     int get_mode() const { return static_cast<int>(mode_); }
+    int get_delta_groups() const { return delta_groups_; }
 
     void set_A_mask(const uint8_t* mask, int len);
     void set_topology_pair(const uint8_t* A_k, const uint8_t* A_kp1, int len, int diff_site);
@@ -80,10 +82,25 @@ public:
 private:
     int N_, M_, M_total_;
     double Omega_, Rb_, delta_min_, delta_max_, epsilon_;
+    int delta_groups_{0};
 
     RydbergVij vij_;
     AliasTable alias_;
     std::vector<double> delta_sched_;
+
+    struct GroupedAlias {
+        int n_groups{0};
+        std::vector<int> slice_to_group;
+        int max_alias{0};
+        int n_bonds_pad{1};
+        std::vector<double> bond_W_max_all;
+        std::vector<int> n_alias_all;
+        std::vector<double> alias_prob_all;
+        std::vector<int64_t> alias_idx_all;
+        std::vector<int> op_map_kind_all;
+        std::vector<int> op_map_loc_all;
+    };
+    GroupedAlias grp_alias_;
 
     std::array<ReplicaState, 2> replicas_;
     std::array<std::mt19937_64, 2> rngs_;
@@ -131,6 +148,8 @@ private:
                                           const std::vector<uint8_t>& to_mask) const;
     double log_weight_for_site_with_mask(int site, const std::vector<uint8_t>& mask,
                                          const std::vector<int32_t>& occ) const;
+    double actual_bond_weight(int p, int b, int w_idx) const;
+    void build_grouped_alias_tables();
 
     void diagonal_update();
     void cluster_update();

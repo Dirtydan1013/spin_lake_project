@@ -46,6 +46,7 @@ def run_ratio_mpi(*, N: int, M: int, A_mask, next_site: int,
                   delta_min: float = 0.0, delta_max: float = 1.0,
                   pos=None, epsilon: float = 0.01, seed: int = 42,
                   neighbor_cutoff: int | None = None,
+                  delta_groups: int = 0,
                   n_therm: int, n_measure: int, measure_stride: int = 1,
                   block_size: int | None = None,
                   filepath=None, region_name: str = "region", step_index: int = 0,
@@ -68,6 +69,7 @@ def run_ratio_mpi(*, N: int, M: int, A_mask, next_site: int,
                 epsilon=epsilon,
                 seed=_rank_seed(seed, local_rank),
                 neighbor_cutoff=neighbor_cutoff,
+                delta_groups=int(delta_groups),
             )
 
     engine = engine_factory(rank)
@@ -98,6 +100,7 @@ def run_ratio_mpi(*, N: int, M: int, A_mask, next_site: int,
                 "epsilon": float(epsilon),
                 "seed": int(seed),
                 "neighbor_cutoff": -1 if neighbor_cutoff is None else int(neighbor_cutoff),
+                "delta_groups": int(delta_groups),
                 "n_therm_per_rank": int(n_therm),
                 "n_measure_per_rank": int(n_measure),
                 "measure_stride": int(measure_stride),
@@ -175,6 +178,7 @@ def main():
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--neighbor_cutoff", type=int, default=-1)
+    parser.add_argument("--delta_groups", type=int, default=0)
     parser.add_argument("--A_mask", type=str, default="")
     parser.add_argument("--next_site", type=int, required=False, default=0)
     parser.add_argument("--region_name", type=str, default="region")

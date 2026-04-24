@@ -89,6 +89,7 @@ def run_ratio_job(
     seed: int,
     a: float,
     neighbor_cutoff: int | None,
+    delta_groups: int = 0,
     n_therm: int,
     n_measure: int,
     measure_stride: int,
@@ -113,6 +114,7 @@ def run_ratio_job(
             epsilon=float(epsilon),
             seed=int(seed),
             neighbor_cutoff=neighbor_cutoff,
+            delta_groups=int(delta_groups),
         )
 
     run = workflow.run(
@@ -143,6 +145,7 @@ def run_ratio_job(
         "seed": int(seed),
         "a": float(a),
         "neighbor_cutoff": -1 if neighbor_cutoff is None else int(neighbor_cutoff),
+        "delta_groups": int(delta_groups),
         "n_therm": int(n_therm),
         "n_measure": int(n_measure),
         "measure_stride": int(measure_stride),
@@ -174,6 +177,7 @@ def run_expanded_job(
     seed: int,
     a: float,
     neighbor_cutoff: int | None,
+    delta_groups: int = 0,
     regions: list[str],
     preferred_center_label: str,
     output_dir: str | Path,
@@ -207,6 +211,7 @@ def run_expanded_job(
             epsilon=float(epsilon),
             seed=int(seed),
             neighbor_cutoff=neighbor_cutoff,
+            delta_groups=int(delta_groups),
         )
 
     outputs = {}
@@ -226,6 +231,7 @@ def run_expanded_job(
         "seed": int(seed),
         "a": float(a),
         "neighbor_cutoff": -1 if neighbor_cutoff is None else int(neighbor_cutoff),
+        "delta_groups": int(delta_groups),
         "preferred_center_label": str(preferred_center_label),
         "autotune_steps_per_iter": int(autotune_steps_per_iter),
         "autotune_max_iters": int(autotune_max_iters),
@@ -318,6 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--neighbor_cutoff", type=int, default=-1)
+    parser.add_argument("--delta_groups", type=int, default=0)
     parser.add_argument("--preferred_center_label", type=str, default="auto")
     parser.add_argument("--output_dir", type=str, required=True)
 
@@ -362,6 +369,7 @@ def main():
             seed=args.seed,
             a=args.a,
             neighbor_cutoff=neighbor_cutoff,
+            delta_groups=args.delta_groups,
             n_therm=args.n_therm,
             n_measure=args.n_measure,
             measure_stride=args.measure_stride,
@@ -387,6 +395,7 @@ def main():
             seed=args.seed,
             a=args.a,
             neighbor_cutoff=neighbor_cutoff,
+            delta_groups=args.delta_groups,
             regions=_parse_regions(args.regions),
             preferred_center_label=args.preferred_center_label,
             output_dir=args.output_dir,

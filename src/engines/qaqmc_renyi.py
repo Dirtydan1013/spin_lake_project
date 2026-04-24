@@ -18,7 +18,7 @@ try:
     if _gpp and os.name == "nt":
         _mingw_bin = os.path.dirname(os.path.realpath(_gpp))
         os.add_dll_directory(_mingw_bin)
-    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     _build_dir = os.path.join(_repo_root, "build")
     if _build_dir not in sys.path:
         sys.path.insert(0, _build_dir)
@@ -40,6 +40,7 @@ class QAQMCRenyiRydberg:
         epsilon: float = 0.01,
         seed: int = 42,
         neighbor_cutoff: int | None = None,
+        delta_groups: int = 0,
     ):
         if pos is None:
             pos = np.arange(N).reshape(-1, 1).astype(np.float64)
@@ -57,11 +58,13 @@ class QAQMCRenyiRydberg:
             seed=seed,
             pos=pos_arr,
             neighbor_cutoff=nc,
+            delta_groups=int(delta_groups),
         )
         self.N = N
         self.M = M
         self.M_total = 2 * M
         self.pos = pos_arr
+        self.delta_groups = int(self._cpp_engine.delta_groups)
 
     def mc_step(self):
         self._cpp_engine.mc_step()
