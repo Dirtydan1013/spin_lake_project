@@ -12,6 +12,7 @@ import numpy as np
 
 from src.tee.compose_tee import KPResult, aggregate_ratios, compose_kp, save_kp_result_hdf5
 from src.kp.kp_geometry import KP_REGION_NAMES, attach_kp_site_orders, build_kp_region_masks
+from src.kp.kp_geometry import build_kagome_bond_ordering_bonds
 from src.rydberg.lattices import generate_kagome_bond_lattice
 from src.tee.qaqmc_renyi_ratio import (
     build_ratio_job_specs,
@@ -79,9 +80,9 @@ def build_kp_ratio_manifest(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bond_sites = generate_kagome_bond_lattice(nx, ny, a=a)
+    ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
     spec = build_kp_region_masks(nx, ny, m=m, a=a, preferred_center_label=preferred_center_label)
-    spec = attach_kp_site_orders(spec, bond_sites)
+    spec = attach_kp_site_orders(spec, ordering_bonds)
 
     ratio_dir = out_dir / "ratio_steps"
     jobs = []

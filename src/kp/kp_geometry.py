@@ -58,6 +58,53 @@ class RegionLadderSpec:
     target_ensemble: int
 
 
+def build_kagome_bond_ordering_bonds(
+    nx: int,
+    ny: int,
+    *,
+    a: float = 1.0,
+    neighbor_shells: int = 2,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """Return a fixed geometric adjacency graph for KP site ordering.
+
+    These bonds are not Hamiltonian interaction bonds.  They are only a local
+    connectivity graph used to choose boundary-first ratio/ladder site orders.
+    The default first two distance shells connect KP regions on the kagome-bond
+    lattice while staying independent of the Rydberg ``neighbor_cutoff``.
+    """
+    if neighbor_shells <= 0:
+        raise ValueError("neighbor_shells must be positive")
+
+    pos = generate_kagome_bond_lattice(nx, ny, a)
+    n_sites = int(pos.shape[0])
+    distances: list[float] = []
+    pairs: list[tuple[int, int, float]] = []
+    for i in range(n_sites):
+        for j in range(i + 1, n_sites):
+            dist = float(np.linalg.norm(pos[i] - pos[j]))
+            if dist <= 0.0:
+                continue
+            distances.append(dist)
+            pairs.append((i, j, dist))
+
+    if not distances:
+        return np.empty((0, 2), dtype=np.int32)
+
+    distances_sorted = np.sort(np.asarray(distances, dtype=np.float64))
+    shells = [float(distances_sorted[0])]
+    for dist in distances_sorted[1:]:
+        ref = max(abs(shells[-1]), 1e-15)
+        if abs(float(dist) - shells[-1]) / ref > float(tol):
+            shells.append(float(dist))
+        if len(shells) >= neighbor_shells:
+            break
+    cutoff = shells[min(int(neighbor_shells), len(shells)) - 1] * (1.0 + float(tol))
+
+    bonds = [(i, j) for i, j, dist in pairs if dist <= cutoff]
+    return np.asarray(bonds, dtype=np.int32).reshape(-1, 2)
+
+
 def _resolve_label(label: str, kagome: np.ndarray, centers: np.ndarray) -> np.ndarray:
     prefix = label[0]
     idx = int(label[1:])

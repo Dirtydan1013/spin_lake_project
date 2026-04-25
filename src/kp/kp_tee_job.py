@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from src.tee.compose_tee import save_kp_result_hdf5
-from src.kp.kp_geometry import KP_REGION_NAMES
+from src.kp.kp_geometry import KP_REGION_NAMES, build_kagome_bond_ordering_bonds
 from src.kp.kp_workflows import KagomeKPExpandedWorkflow, KagomeKPRatioWorkflow
 from src.rydberg.lattices import generate_kagome_bond_lattice
 from src.tee.reweighting import save_expanded_result_hdf5
@@ -102,6 +102,7 @@ def run_ratio_job(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pos = generate_kagome_bond_lattice(nx, ny, a=a)
+    ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
     if workflow is None:
         workflow = KagomeKPRatioWorkflow(
             N=int(pos.shape[0]),
@@ -121,7 +122,7 @@ def run_ratio_job(
         nx=nx,
         ny=ny,
         m=m,
-        bond_sites=pos,
+        bond_sites=ordering_bonds,
         n_therm=n_therm,
         n_measure=n_measure,
         a=a,
@@ -199,6 +200,7 @@ def run_expanded_job(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pos = generate_kagome_bond_lattice(nx, ny, a=a)
+    ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
     if workflow is None:
         workflow = KagomeKPExpandedWorkflow(
             N=int(pos.shape[0]),
@@ -253,7 +255,7 @@ def run_expanded_job(
             nx=nx,
             ny=ny,
             m=m,
-            bond_sites=pos,
+            bond_sites=ordering_bonds,
             a=a,
             preferred_center_label=preferred_center_label,
             autotune_steps_per_iter=autotune_steps_per_iter,

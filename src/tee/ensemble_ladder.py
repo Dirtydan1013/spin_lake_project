@@ -14,10 +14,26 @@ def _normalise_mask(region_mask) -> np.ndarray:
     return (mask > 0).astype(np.uint8)
 
 
+def _normalise_bond_sites(bond_sites, n_sites: int) -> np.ndarray:
+    bonds_raw = np.asarray(bond_sites)
+    if bonds_raw.ndim != 2 or bonds_raw.shape[1] != 2:
+        raise ValueError("bond_sites must be an array of site-index pairs with shape (n_bonds, 2)")
+    if not np.issubdtype(bonds_raw.dtype, np.integer):
+        if not np.all(np.isfinite(bonds_raw)) or not np.allclose(bonds_raw, np.rint(bonds_raw)):
+            raise ValueError(
+                "bond_sites must contain integer site indices, not coordinates; "
+                "use a geometry adjacency list for KP site ordering"
+            )
+    bonds = bonds_raw.astype(np.int32, copy=False)
+    if bonds.size and (int(np.min(bonds)) < 0 or int(np.max(bonds)) >= int(n_sites)):
+        raise ValueError("bond_sites contains site indices outside the region mask length")
+    return bonds
+
+
 def build_region_adjacency(region_mask, bond_sites) -> dict[int, list[int]]:
     """Build the induced graph on the selected region sites."""
     mask = _normalise_mask(region_mask)
-    bonds = np.asarray(bond_sites, dtype=np.int32)
+    bonds = _normalise_bond_sites(bond_sites, mask.size)
     adjacency = {site: set() for site in np.flatnonzero(mask)}
     for si, sj in bonds:
         if si == sj:
@@ -31,7 +47,7 @@ def build_region_adjacency(region_mask, bond_sites) -> dict[int, list[int]]:
 def boundary_sites(region_mask, bond_sites) -> list[int]:
     """Sites in the region that touch at least one site outside the region."""
     mask = _normalise_mask(region_mask)
-    bonds = np.asarray(bond_sites, dtype=np.int32)
+    bonds = _normalise_bond_sites(bond_sites, mask.size)
     boundary = set()
     for si, sj in bonds:
         if mask[si] != mask[sj]:

@@ -33,6 +33,7 @@ except ImportError as exc:  # pragma: no cover
 from src.kp.kp_geometry import (
     KP_REGION_NAMES,
     attach_kp_site_orders,
+    build_kagome_bond_ordering_bonds,
     build_kp_ladders,
     build_kp_region_masks,
 )
@@ -111,9 +112,10 @@ def run_ratio_job_mpi(
     # Rank 0 builds KP geometry then broadcasts the parts everyone needs.
     if rank == 0:
         pos = generate_kagome_bond_lattice(nx, ny, a=a)
+        ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
         spec = build_kp_region_masks(nx, ny, m=m, a=a,
                                      preferred_center_label=preferred_center_label)
-        spec = attach_kp_site_orders(spec, pos)
+        spec = attach_kp_site_orders(spec, ordering_bonds)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "ratio_steps").mkdir(parents=True, exist_ok=True)
@@ -239,9 +241,10 @@ def run_expanded_job_mpi(
 
     if rank == 0:
         pos = generate_kagome_bond_lattice(nx, ny, a=a)
+        ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
         spec = build_kp_region_masks(nx, ny, m=m, a=a,
                                      preferred_center_label=preferred_center_label)
-        ladders = build_kp_ladders(spec, bond_sites=pos)
+        ladders = build_kp_ladders(spec, bond_sites=ordering_bonds)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
