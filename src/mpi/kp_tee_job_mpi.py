@@ -38,8 +38,9 @@ from src.kp.kp_geometry import (
     build_kp_region_masks,
 )
 from src.kp.kp_tee_job import _parse_regions, _to_attr_value
+from src.engines.qaqmc_renyi import QAQMCRenyiRydberg
 from src.mpi.qaqmc_renyi_ratio_mpi import run_ratio_mpi
-from src.mpi.reweighting_mpi import run_expanded_mpi
+from src.mpi.reweighting_mpi import _rank_seed, run_expanded_mpi
 from src.rydberg.lattices import generate_kagome_bond_lattice
 from src.tee.compose_tee import (
     KPResult,
@@ -292,6 +293,23 @@ def run_expanded_job_mpi(
     N = int(pos.shape[0])
     outputs: dict = {"geometry_path": str(geometry_path)} if rank == 0 else {}
 
+    # Build the C++ engine ONCE per rank and reuse across regions.  Each call
+    # to run_expanded_mpi resets its ladder via set_ensemble_ladder, which is
+    # cheap (~0.1s) compared with engine construction (~7 min for the probed
+    # 6×6 kagome).  We share one engine via engine_factory.
+    shared_engine = QAQMCRenyiRydberg(
+        N=N, M=int(M),
+        Omega=float(Omega), Rb=float(Rb),
+        delta_min=float(delta_min), delta_max=float(delta_max),
+        pos=pos, epsilon=float(epsilon),
+        seed=_rank_seed(int(seed), rank),
+        neighbor_cutoff=neighbor_cutoff,
+        delta_groups=int(delta_groups),
+    )
+
+    def _shared_engine_factory(_local_rank):
+        return shared_engine
+
     for region_name in regions:
         ladder = ladders[region_name]
         masks = [np.asarray(x, dtype=np.uint8) for x in ladder.masks]
@@ -307,7 +325,7 @@ def run_expanded_job_mpi(
             Omega=float(Omega), Rb=float(Rb),
             delta_min=float(delta_min), delta_max=float(delta_max),
             pos=pos, epsilon=float(epsilon),
-            seed=int(seed) + 7919 * hash(region_name) % 997,  # decorrelate seeds per region
+            seed=int(seed) + 7919 * hash(region_name) % 997,  # ignored when factory supplies engine
             neighbor_cutoff=neighbor_cutoff, delta_groups=int(delta_groups),
             initial_ensemble=0,
             autotune_steps_per_iter=int(autotune_steps_per_iter),
@@ -322,6 +340,7 @@ def run_expanded_job_mpi(
             reference_ensemble=0,
             filepath=None,
             comm=comm,
+            engine_factory=_shared_engine_factory,
         )
 
         if rank != 0:

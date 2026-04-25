@@ -180,6 +180,11 @@ private:
     std::vector<int32_t> ch_site_bond_head_;
     std::vector<BondEvent> ch_site_bond_list_;
     std::vector<int32_t> bond_spin_by_replica_;  // [2 * M_total_]
+    // Per-bond-op log_W cache, layout [(replica * M_total + p) * 4 + w_idx].
+    // Populated by build_bond_spins_from_ops() at the start of each
+    // cluster_update so the inner segment-Metropolis loop avoids both
+    // compute_bond_W_inline() and std::log() in the hot path.
+    std::vector<double> log_W_by_op_;
     OffdiagPaths paths_scratch_from_;
     OffdiagPaths paths_scratch_to_;
     std::vector<OffdiagPaths> paths_scratch_targets_;

@@ -69,13 +69,25 @@ class KagomeKPRatioWorkflow:
 
 
 class KagomeKPExpandedWorkflow:
-    def __init__(self, driver_factory=None, **engine_kwargs):
+    def __init__(self, driver_factory=None, *, share_engine: bool = True, **engine_kwargs):
+        # When share_engine is True (default), the underlying QAQMCRenyiRydberg
+        # is built lazily on the first run_region() call and reused for all
+        # subsequent regions.  Engine construction dominates wall-time on large
+        # systems (M~10^6 takes minutes), and set_ensemble_ladder() resets the
+        # ladder cleanly between regions.  Set share_engine=False (or supply a
+        # driver_factory) to restore the original per-region construction.
         self.driver_factory = driver_factory
         self.engine_kwargs = dict(engine_kwargs)
+        self.share_engine = bool(share_engine)
+        self._shared_driver: ReweightingDriver | None = None
 
     def _make_driver(self, region_name: str) -> ReweightingDriver:
         if self.driver_factory is not None:
             return self.driver_factory(region_name)
+        if self.share_engine:
+            if self._shared_driver is None:
+                self._shared_driver = ReweightingDriver(**self.engine_kwargs)
+            return self._shared_driver
         return ReweightingDriver(**self.engine_kwargs)
 
     def run_region(

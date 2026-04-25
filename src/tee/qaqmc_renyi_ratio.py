@@ -368,13 +368,26 @@ class RatioRunner:
 
 
 class RegionRatioRunner:
-    def __init__(self, engine_factory=None, **engine_kwargs):
+    def __init__(self, engine_factory=None, *, share_engine: bool = True, **engine_kwargs):
+        # When share_engine is True (default) and no engine_factory is provided,
+        # the QAQMCRenyiRydberg is constructed once on the first step and reused
+        # for every ratio step / region.  set_topology_pair() resets the
+        # topology pair cleanly between calls.  Engine construction is O(min)
+        # for production-size lattices, while a step is O(s) — building per
+        # step burns most of the wall-clock on init.
         self.engine_factory = engine_factory
         self.engine_kwargs = dict(engine_kwargs)
+        self.share_engine = bool(share_engine)
+        self._shared_engine = None
 
     def _make_engine(self, step_index: int):
         if self.engine_factory is not None:
             return self.engine_factory(step_index)
+        if self.share_engine:
+            if self._shared_engine is None:
+                kwargs = dict(self.engine_kwargs)
+                self._shared_engine = QAQMCRenyiRydberg(**kwargs)
+            return self._shared_engine
         kwargs = dict(self.engine_kwargs)
         if "seed" in kwargs:
             kwargs["seed"] = int(kwargs["seed"]) + 104729 * step_index

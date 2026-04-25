@@ -94,6 +94,7 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
     ch_site_bond_count_.assign(ch_sites, 0);
     ch_site_bond_head_.assign(ch_sites, 0);
     bond_spin_by_replica_.assign(static_cast<size_t>(2) * M_total_, 0);
+    log_W_by_op_.assign(static_cast<size_t>(2) * M_total_ * 4, 0.0);
 }
 
 void QAQMCRenyiEngine::compute_site_coloring() {
@@ -959,10 +960,22 @@ void QAQMCRenyiEngine::build_bond_spins_from_ops() {
     } else {
         std::fill(bond_spin_by_replica_.begin(), bond_spin_by_replica_.end(), 0);
     }
-    std::vector<int32_t> channel_state(2 * N_, 0);
+    const size_t need_log_W = static_cast<size_t>(2) * M_total_ * 4;
+    if (log_W_by_op_.size() != need_log_W) {
+        log_W_by_op_.assign(need_log_W, 0.0);
+    }
     auto ch_idx = [&](int channel, int site) { return channel * N_ + site; };
     const int* bond_sites = vij_.bond_sites_flat.data();
+    // Choose between precomputed alias_.bond_W_all (delta_groups==0 path) and
+    // on-the-fly compute_bond_W_inline (delta_groups>0 or no precompute).
+    // Either way we materialise log_W[4] for every bond op so the segment
+    // Metropolis is pure memory loads.
+    const bool have_alias_W = (delta_groups_ <= 0 && !alias_.bond_W_all.empty());
 
+    // Pass 1 (sequential, cheap): walk channel_state to compute bond_spin.
+    // The channel_state propagation is inherently sequential in p, but each
+    // iteration is just a couple of array updates (no log/W work).
+    std::vector<int32_t> channel_state(2 * N_, 0);
     for (int p = 0; p < M_total_; ++p) {
         for (int replica = 0; replica < 2; ++replica) {
             int ot = replicas_[replica].op_types[p];
@@ -978,6 +991,37 @@ void QAQMCRenyiEngine::build_bond_spins_from_ops() {
                 int site = replicas_[replica].op_sites[p];
                 int channel = channel_for_actual(replica, site, p);
                 channel_state[ch_idx(channel, site)] ^= 1;
+            }
+        }
+    }
+
+    // Pass 2 (OpenMP parallel, expensive): fill log_W cache.  Each (p, replica)
+    // type-2 entry is independent — no channel_state dependency, only
+    // delta_sched_[p], coord_number, vij_, and epsilon.  The std::log calls
+    // dominated cluster_build before parallelization (~700 ms at M_total≈4.5M).
+#ifdef QAQMC_USE_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int p = 0; p < M_total_; ++p) {
+        for (int replica = 0; replica < 2; ++replica) {
+            if (replicas_[replica].op_types[p] != 2) continue;
+            int b = replicas_[replica].op_sites[p];
+            double W[4];
+            if (have_alias_W) {
+                const double* base = &alias_.bond_W_all[(p * n_bonds_pad_ + b) * 4];
+                W[0] = base[0]; W[1] = base[1]; W[2] = base[2]; W[3] = base[3];
+            } else {
+                int si = bond_sites[b * 2 + 0];
+                int sj = bond_sites[b * 2 + 1];
+                const double delta = delta_sched_[p];
+                const double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
+                const double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
+                double wmax;
+                compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
+            }
+            double* lw = &log_W_by_op_[(replica * M_total_ + p) * 4];
+            for (int k = 0; k < 4; ++k) {
+                lw[k] = (W[k] > 1e-300) ? std::log(W[k]) : -1e30;
             }
         }
     }
@@ -1035,22 +1079,11 @@ void QAQMCRenyiEngine::cluster_update() {
                         const BondEvent& event = ch_site_bond_list_[j];
                         int p = event.p;
                         int replica = event.replica;
-                        int b = event.bond;
-                        int si = bond_sites[b * 2 + 0];
-                        int sj = bond_sites[b * 2 + 1];
                         int w_idx = bond_spin_by_replica_[replica * M_total_ + p];
-                        int n_i = w_idx >> 1;
-                        int n_j = w_idx & 1;
-                        double w_old = actual_bond_weight(p, b, w_idx);
+                        int new_w_idx = w_idx ^ ((event.endpoint == 0) ? 2 : 1);
 
-                        int new_n_i = n_i;
-                        int new_n_j = n_j;
-                        if (event.endpoint == 0 && si == site) new_n_i ^= 1;
-                        if (event.endpoint == 1 && sj == site) new_n_j ^= 1;
-                        double w_new = actual_bond_weight(p, b, new_n_i * 2 + new_n_j);
-
-                        log_ratio += ((w_new > 1e-300) ? std::log(w_new) : -1e30)
-                                   - ((w_old > 1e-300) ? std::log(w_old) : -1e30);
+                        const double* lw = &log_W_by_op_[(replica * M_total_ + p) * 4];
+                        log_ratio += lw[new_w_idx] - lw[w_idx];
                     }
 
                     bool do_flip = (log_ratio >= 0.0) || (renyi_u01(rng) < std::exp(log_ratio));
