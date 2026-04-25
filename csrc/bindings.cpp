@@ -561,7 +561,14 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def_property_readonly("ensemble_count", &QAQMCRenyiEngine::get_ensemble_count)
         .def_property_readonly("mode", &QAQMCRenyiEngine::get_mode)
         .def_property_readonly("delta_groups", &QAQMCRenyiEngine::get_delta_groups)
-        .def_property_readonly("diff_site", &QAQMCRenyiEngine::get_diff_site);
+        .def_property_readonly("diff_site", &QAQMCRenyiEngine::get_diff_site)
+        .def_property_readonly("time_diag", &QAQMCRenyiEngine::get_time_diag)
+        .def_property_readonly("time_clus_build", &QAQMCRenyiEngine::get_time_clus_build)
+        .def_property_readonly("time_clus_sweep", &QAQMCRenyiEngine::get_time_clus_sweep)
+        .def_property_readonly("time_topology", &QAQMCRenyiEngine::get_time_topology)
+        .def_property_readonly("time_ensemble", &QAQMCRenyiEngine::get_time_ensemble)
+        .def_property_readonly("mc_steps", &QAQMCRenyiEngine::get_mc_steps)
+        .def("reset_timers", &QAQMCRenyiEngine::reset_timers);
 
     // ── SSEEngine ─────────────────────────────────────────────────────────────
 

@@ -73,6 +73,20 @@ public:
     int get_diff_site() const { return diff_site_; }
     int get_mode() const { return static_cast<int>(mode_); }
     int get_delta_groups() const { return delta_groups_; }
+    double get_time_diag() const { return time_diag_; }
+    double get_time_clus_build() const { return time_clus_build_; }
+    double get_time_clus_sweep() const { return time_clus_sweep_; }
+    double get_time_topology() const { return time_topology_; }
+    double get_time_ensemble() const { return time_ensemble_; }
+    int64_t get_mc_steps() const { return mc_steps_; }
+    void reset_timers() {
+        time_diag_ = 0.0;
+        time_clus_build_ = 0.0;
+        time_clus_sweep_ = 0.0;
+        time_topology_ = 0.0;
+        time_ensemble_ = 0.0;
+        mc_steps_ = 0;
+    }
 
     void set_A_mask(const uint8_t* mask, int len);
     void set_topology_pair(const uint8_t* A_k, const uint8_t* A_kp1, int len, int diff_site);
@@ -139,6 +153,12 @@ private:
     int indicator_site_{-1};
     int64_t indicator_sum_{0};
     int64_t indicator_count_{0};
+    double time_diag_{0.0};
+    double time_clus_build_{0.0};
+    double time_clus_sweep_{0.0};
+    double time_topology_{0.0};
+    double time_ensemble_{0.0};
+    int64_t mc_steps_{0};
 
     int n_bonds_pad_{1};
     int max_alias_{0};

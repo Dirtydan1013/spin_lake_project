@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -983,6 +984,7 @@ void QAQMCRenyiEngine::build_bond_spins_from_ops() {
 }
 
 void QAQMCRenyiEngine::cluster_update() {
+    auto t_build0 = std::chrono::high_resolution_clock::now();
     const int* bond_sites = vij_.bond_sites_flat.data();
     auto cs_idx = [&](int channel, int site) { return channel * N_ + site; };
     auto upper_bound_event = [&](const std::vector<BondEvent>& events,
@@ -997,6 +999,7 @@ void QAQMCRenyiEngine::cluster_update() {
 
     build_channel_vertex_lists();
     build_bond_spins_from_ops();
+    auto t_build1 = std::chrono::high_resolution_clock::now();
 
     // Per-colour parallel sweep: sites in the same colour share no bond, so
     // their bond-spin writes cannot race.  Within one site the segment
@@ -1073,21 +1076,33 @@ void QAQMCRenyiEngine::cluster_update() {
     }
 
     recompute_midpoint_states_from_ops();
+    auto t_sweep1 = std::chrono::high_resolution_clock::now();
+    time_clus_build_ += std::chrono::duration<double>(t_build1 - t_build0).count();
+    time_clus_sweep_ += std::chrono::duration<double>(t_sweep1 - t_build1).count();
 }
 
 void QAQMCRenyiEngine::mc_step() {
+    auto t0 = std::chrono::high_resolution_clock::now();
     diagonal_update();
+    auto t1 = std::chrono::high_resolution_clock::now();
     cluster_update();
+    auto t2 = std::chrono::high_resolution_clock::now();
     if (mode_ == Mode::Expanded) {
         ensemble_switch();
+        auto t3 = std::chrono::high_resolution_clock::now();
+        time_ensemble_ += std::chrono::duration<double>(t3 - t2).count();
         if (!visit_count_ext_.empty()) {
             visit_count_ext_[cur_ens_]++;
         }
     } else {
         topology_toggle();
+        auto t3 = std::chrono::high_resolution_clock::now();
+        time_topology_ += std::chrono::duration<double>(t3 - t2).count();
         visit_count_[cur_topology_]++;
     }
     accumulate_indicator();
+    time_diag_ += std::chrono::duration<double>(t1 - t0).count();
+    mc_steps_++;
 }
 
 void QAQMCRenyiEngine::run_steps(int n_steps) {

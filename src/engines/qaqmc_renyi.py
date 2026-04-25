@@ -72,6 +72,19 @@ class QAQMCRenyiRydberg:
     def run_steps(self, n_steps: int):
         self._cpp_engine.run_steps(int(n_steps))
 
+    def reset_timers(self):
+        self._cpp_engine.reset_timers()
+
+    def timer_snapshot(self) -> dict[str, float | int]:
+        return {
+            "diag": float(self._cpp_engine.time_diag),
+            "cluster_build": float(self._cpp_engine.time_clus_build),
+            "cluster_sweep": float(self._cpp_engine.time_clus_sweep),
+            "topology": float(self._cpp_engine.time_topology),
+            "ensemble": float(self._cpp_engine.time_ensemble),
+            "mc_steps": int(self._cpp_engine.mc_steps),
+        }
+
     def set_A_mask(self, mask):
         mask_arr = np.ascontiguousarray(mask, dtype=np.uint8)
         self._cpp_engine.set_A_mask(mask_arr)
