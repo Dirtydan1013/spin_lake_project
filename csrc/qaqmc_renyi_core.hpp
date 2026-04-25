@@ -125,6 +125,22 @@ private:
     int n_bonds_pad_{1};
     int max_alias_{0};
 
+    // Cached channel-occupancy for the current A_mask_, refreshed at the start
+    // of every cluster_update (after diagonal_update modifies the op string).
+    // Layout matches build_channel_occupancies(): index = ((c * (M_total+1) + p) * N) + site.
+    std::vector<int32_t> occ_curr_;
+    // Scratch buffer for single-site occupancy under a proposed mask
+    // (used by topology_toggle / ensemble_switch).  Size 2 * (M_total+1).
+    std::vector<int32_t> occ_site_buf_;
+
+    // Greedy bond-graph coloring used by the parallel cluster_update.  Sites in
+    // the same color share no bond, so their per-site segment Metropolis can run
+    // concurrently without racing on occ_curr_ writes.  Size = n_colors.
+    std::vector<std::vector<int>> color_groups_;
+    // Per-site RNG (one stream per site) so the OpenMP cluster_update doesn't
+    // need to synchronize the original two-channel RNGs.  Size = N.
+    std::vector<std::mt19937_64> site_rngs_;
+
     static inline void compute_bond_W_inline(double delta_i, double delta_j,
                                              double vij, double epsilon,
                                              double W[4], double& W_max) {
@@ -138,8 +154,19 @@ private:
 
     std::vector<int32_t> build_channel_occupancies(const std::vector<uint8_t>& mask) const;
     std::vector<int32_t> build_channel_occupancies() const;
+    // In-place writer: fills `dest` (resized if needed) with the same layout as
+    // build_channel_occupancies() but without allocating a new vector.
+    void build_channel_occupancies_into(std::vector<int32_t>& dest,
+                                        const std::vector<uint8_t>& mask) const;
+    // Compute the channel occupancy at a single `site` under `mask`.
+    // `dest` has size 2 * (M_total+1); index = c * (M_total+1) + p.
+    void compute_occ_at_site(int site, const std::vector<uint8_t>& mask,
+                             std::vector<int32_t>& dest) const;
     void update_midpoint_from_channels(const std::vector<int32_t>& occ);
     void reproject_site_ops_for_current_topology(const std::vector<int32_t>& occ);
+    // Reproject only site ops on `diff_site` at p >= M (those whose
+    // channel_for_actual changed when A_mask_[diff_site] flipped).
+    void reproject_site_ops_at_site(int diff_site, const std::vector<int32_t>& occ);
     void accumulate_indicator();
     int diff_site_between_masks(const std::vector<uint8_t>& from_mask,
                                 const std::vector<uint8_t>& to_mask) const;
@@ -148,8 +175,17 @@ private:
                                           const std::vector<uint8_t>& to_mask) const;
     double log_weight_for_site_with_mask(int site, const std::vector<uint8_t>& mask,
                                          const std::vector<int32_t>& occ) const;
+    // Optimized log-weight at the diff site when only one site differs between
+    // masks.  Reads non-diff endpoints from `occ_other_sites` (correct for both
+    // masks since they agree there) and the diff endpoint from `occ_site` (built
+    // for the target mask via compute_occ_at_site).
+    double log_weight_for_diff_site(int diff_site,
+                                    const std::vector<uint8_t>& mask,
+                                    const std::vector<int32_t>& occ_other_sites,
+                                    const std::vector<int32_t>& occ_site) const;
     double actual_bond_weight(int p, int b, int w_idx) const;
     void build_grouped_alias_tables();
+    void compute_site_coloring();
 
     void diagonal_update();
     void cluster_update();

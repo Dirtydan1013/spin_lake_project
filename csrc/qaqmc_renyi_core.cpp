@@ -69,6 +69,69 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
     A_mask_.assign(N_, 0);
     A_masks_[0] = A_mask_;
     A_masks_[1] = A_mask_;
+    // Member buffers for cached occupancy: full (under current A_mask_) plus a
+    // scratch column for single-site recomputation under a proposed mask.
+    occ_curr_.assign(static_cast<size_t>(2) * (M_total_ + 1) * N_, 0);
+    occ_site_buf_.assign(static_cast<size_t>(2) * (M_total_ + 1), 0);
+    // After op strings + A_mask_ are initialised above the cached occ is valid
+    // (all zeros, since op_types are all "diagonal site" and A_mask_ is empty).
+
+    // Per-site RNG streams seeded deterministically from the master seed; used
+    // by the parallel cluster_update so multiple threads don't race on a shared
+    // generator.  SplitMix-style mixing keeps streams nominally independent.
+    site_rngs_.resize(N_);
+    for (int s = 0; s < N_; ++s) {
+        uint64_t z = seed + 0xD2B74407B1CE6E93ULL * static_cast<uint64_t>(s + 1);
+        z ^= z >> 33;
+        z *= 0xFF51AFD7ED558CCDULL;
+        z ^= z >> 33;
+        z *= 0xC4CEB9FE1A85EC53ULL;
+        z ^= z >> 33;
+        site_rngs_[s].seed(z);
+    }
+
+    // Compute bond-graph coloring once so cluster_update can dispatch each
+    // colour class in parallel without races on occ_curr_.
+    compute_site_coloring();
+}
+
+void QAQMCRenyiEngine::compute_site_coloring() {
+    // Build undirected adjacency from the active bond list.
+    std::vector<std::vector<int>> adj(N_);
+    const int* bond_sites = vij_.bond_sites_flat.data();
+    for (int b = 0; b < vij_.n_bonds; ++b) {
+        int si = bond_sites[b * 2 + 0];
+        int sj = bond_sites[b * 2 + 1];
+        if (si == sj) continue;
+        adj[si].push_back(sj);
+        adj[sj].push_back(si);
+    }
+    // Greedy first-fit colouring.  Order: descending degree gives near-optimal
+    // colour count on irregular graphs.
+    std::vector<int> order(N_);
+    for (int s = 0; s < N_; ++s) order[s] = s;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return adj[a].size() > adj[b].size();
+    });
+
+    std::vector<int> color_of(N_, -1);
+    int max_color = -1;
+    std::vector<int> used;
+    for (int s : order) {
+        used.assign(adj[s].size() + 1, 0);
+        for (int n : adj[s]) {
+            int c = color_of[n];
+            if (c >= 0 && c < static_cast<int>(used.size())) used[c] = 1;
+        }
+        int c = 0;
+        while (c < static_cast<int>(used.size()) && used[c]) ++c;
+        color_of[s] = c;
+        if (c > max_color) max_color = c;
+    }
+    color_groups_.assign(max_color + 1, {});
+    for (int s = 0; s < N_; ++s) {
+        color_groups_[color_of[s]].push_back(s);
+    }
 }
 
 void QAQMCRenyiEngine::build_grouped_alias_tables() {
@@ -302,9 +365,9 @@ void QAQMCRenyiEngine::set_ensemble_ladder(const std::vector<std::vector<uint8_t
     collection_count_.assign(static_cast<size_t>(n_ens) * n_ens, 0.0);
     log_g_.assign(n_ens, 0.0);
 
-    auto occ = build_channel_occupancies();
-    reproject_site_ops_for_current_topology(occ);
-    update_midpoint_from_channels(occ);
+    build_channel_occupancies_into(occ_curr_, A_mask_);
+    reproject_site_ops_for_current_topology(occ_curr_);
+    update_midpoint_from_channels(occ_curr_);
 }
 
 void QAQMCRenyiEngine::set_log_g(const std::vector<double>& log_g) {
@@ -366,36 +429,59 @@ void QAQMCRenyiEngine::ensemble_switch() {
         return;
     }
 
-    // Pre-compute occ and log weights for the current topology once.
-    auto occ_from = build_channel_occupancies(ensembles_[from_ens].A_mask);
+    // The cached occ_curr_ already corresponds to A_mask_ (== from-ensemble's
+    // mask) — refreshed at the start of cluster_update().  No need to rebuild.
+    const auto& mask_from = ensembles_[from_ens].A_mask;
 
     const double propose_prob = 1.0 / static_cast<double>(nbrs.size());
     std::vector<double> accept_probs(nbrs.size(), 0.0);
+    std::vector<int> diff_sites(nbrs.size(), -1);
     double off_diag_weight = 0.0;
+
+    auto full_idx = [&](int c, int p, int s) {
+        return ((c * (M_total_ + 1) + p) * N_) + s;
+    };
+    auto site_idx_local = [&](int c, int p) { return c * (M_total_ + 1) + p; };
 
     for (size_t i = 0; i < nbrs.size(); ++i) {
         const int to_ens = nbrs[i];
+        const auto& mask_to = ensembles_[to_ens].A_mask;
+        const int diff = diff_site_between_masks(mask_from, mask_to);
+        diff_sites[i] = diff;
+
         double log_ratio = 0.0;
         bool feasible = true;
 
-        auto occ_to = build_channel_occupancies(ensembles_[to_ens].A_mask);
-        for (int s = 0; s < N_; ++s) {
-            if (ensembles_[from_ens].A_mask[s] == ensembles_[to_ens].A_mask[s]) {
-                continue;
-            }
-            const double log_from = log_weight_for_site_with_mask(
-                s, ensembles_[from_ens].A_mask, occ_from);
-            const double log_to = log_weight_for_site_with_mask(
-                s, ensembles_[to_ens].A_mask, occ_to);
+        if (diff >= 0) {
+            // Single-diff fast path: only one site's column changes.  Reuse
+            // occ_curr_ for non-diff endpoints and rebuild just the diff column.
+            compute_occ_at_site(diff, mask_to, occ_site_buf_);
+            const double log_from = log_weight_for_site_with_mask(diff, mask_from, occ_curr_);
+            const double log_to = log_weight_for_diff_site(diff, mask_to, occ_curr_, occ_site_buf_);
             if (log_to <= -1e29) {
                 feasible = false;
-                break;
+            } else if (log_from <= -1e29) {
+                log_ratio = 1e30;  // from unreachable ⇒ force accept
+            } else {
+                log_ratio = log_to - log_from;
             }
-            if (log_from <= -1e29) {
-                log_ratio = 1e30;  // from-weight zero ⇒ from-ensemble unreachable, force accept
-                break;
+        } else {
+            // Fallback: multi-site or zero-site difference; rebuild full occ_to.
+            auto occ_to = build_channel_occupancies(mask_to);
+            for (int s = 0; s < N_; ++s) {
+                if (mask_from[s] == mask_to[s]) continue;
+                const double log_from = log_weight_for_site_with_mask(s, mask_from, occ_curr_);
+                const double log_to = log_weight_for_site_with_mask(s, mask_to, occ_to);
+                if (log_to <= -1e29) {
+                    feasible = false;
+                    break;
+                }
+                if (log_from <= -1e29) {
+                    log_ratio = 1e30;
+                    break;
+                }
+                log_ratio += (log_to - log_from);
             }
-            log_ratio += (log_to - log_from);
         }
 
         double a = 0.0;
@@ -430,9 +516,24 @@ void QAQMCRenyiEngine::ensemble_switch() {
         to_ens = proposed;
         cur_ens_ = proposed;
         A_mask_ = ensembles_[proposed].A_mask;
-        auto occ = build_channel_occupancies();
-        reproject_site_ops_for_current_topology(occ);
-        update_midpoint_from_channels(occ);
+        const int diff = diff_sites[idx];
+        if (diff >= 0) {
+            // Recompute the diff-site column under the new mask — accept_probs
+            // computation may have overwritten occ_site_buf_ with a different
+            // neighbour's column, so rebuild here for the chosen `proposed`.
+            compute_occ_at_site(diff, A_mask_, occ_site_buf_);
+            for (int c = 0; c < 2; ++c) {
+                for (int p = 0; p <= M_total_; ++p) {
+                    occ_curr_[full_idx(c, p, diff)] = occ_site_buf_[site_idx_local(c, p)];
+                }
+            }
+            reproject_site_ops_at_site(diff, occ_curr_);
+        } else {
+            // Multi-site change — fall back to full rebuild.
+            build_channel_occupancies_into(occ_curr_, A_mask_);
+            reproject_site_ops_for_current_topology(occ_curr_);
+        }
+        update_midpoint_from_channels(occ_curr_);
     }
     transition_count_[static_cast<size_t>(from_ens) * n_ens + to_ens]++;
 }
@@ -471,29 +572,61 @@ void QAQMCRenyiEngine::set_replica_op_string(int replica, const int32_t* types, 
 }
 
 std::vector<int32_t> QAQMCRenyiEngine::build_channel_occupancies(const std::vector<uint8_t>& mask) const {
-    std::vector<int32_t> occ(2 * (M_total_ + 1) * N_, 0);
-    auto idx = [&](int channel, int p, int site) {
-        return ((channel * (M_total_ + 1) + p) * N_) + site;
-    };
-
-    for (int channel = 0; channel < 2; ++channel) {
-        for (int site = 0; site < N_; ++site) {
-            int value = 0;
-            occ[idx(channel, 0, site)] = 0;
-            for (int p = 0; p < M_total_; ++p) {
-                int replica = replica_for_with_mask(channel, site, p, mask);
-                if (replicas_[replica].op_types[p] == -1 && replicas_[replica].op_sites[p] == site) {
-                    value ^= 1;
-                }
-                occ[idx(channel, p + 1, site)] = value;
-            }
-        }
-    }
+    std::vector<int32_t> occ;
+    build_channel_occupancies_into(occ, mask);
     return occ;
 }
 
 std::vector<int32_t> QAQMCRenyiEngine::build_channel_occupancies() const {
     return build_channel_occupancies(A_mask_);
+}
+
+void QAQMCRenyiEngine::build_channel_occupancies_into(
+    std::vector<int32_t>& dest, const std::vector<uint8_t>& mask) const {
+    const size_t need = static_cast<size_t>(2) * (M_total_ + 1) * N_;
+    if (dest.size() != need) {
+        dest.assign(need, 0);
+    } else {
+        std::fill(dest.begin(), dest.end(), 0);
+    }
+    auto idx = [&](int channel, int p, int site) {
+        return ((channel * (M_total_ + 1) + p) * N_) + site;
+    };
+    for (int channel = 0; channel < 2; ++channel) {
+        for (int site = 0; site < N_; ++site) {
+            int value = 0;
+            dest[idx(channel, 0, site)] = 0;
+            for (int p = 0; p < M_total_; ++p) {
+                int replica = replica_for_with_mask(channel, site, p, mask);
+                if (replicas_[replica].op_types[p] == -1 && replicas_[replica].op_sites[p] == site) {
+                    value ^= 1;
+                }
+                dest[idx(channel, p + 1, site)] = value;
+            }
+        }
+    }
+}
+
+void QAQMCRenyiEngine::compute_occ_at_site(int site,
+                                           const std::vector<uint8_t>& mask,
+                                           std::vector<int32_t>& dest) const {
+    const size_t need = static_cast<size_t>(2) * (M_total_ + 1);
+    if (dest.size() != need) {
+        dest.assign(need, 0);
+    }
+    auto out_idx = [&](int c, int p) { return c * (M_total_ + 1) + p; };
+    for (int channel = 0; channel < 2; ++channel) {
+        int value = 0;
+        dest[out_idx(channel, 0)] = 0;
+        for (int p = 0; p < M_total_; ++p) {
+            int replica = replica_for_with_mask(channel, site, p, mask);
+            if (replicas_[replica].op_types[p] == -1 &&
+                replicas_[replica].op_sites[p] == site) {
+                value ^= 1;
+            }
+            dest[out_idx(channel, p + 1)] = value;
+        }
+    }
 }
 
 void QAQMCRenyiEngine::update_midpoint_from_channels(const std::vector<int32_t>& occ) {
@@ -508,8 +641,8 @@ void QAQMCRenyiEngine::update_midpoint_from_channels(const std::vector<int32_t>&
 }
 
 void QAQMCRenyiEngine::recompute_midpoint_states() {
-    auto occ = build_channel_occupancies();
-    update_midpoint_from_channels(occ);
+    build_channel_occupancies_into(occ_curr_, A_mask_);
+    update_midpoint_from_channels(occ_curr_);
 }
 
 void QAQMCRenyiEngine::reproject_site_ops_for_current_topology(const std::vector<int32_t>& occ) {
@@ -525,6 +658,27 @@ void QAQMCRenyiEngine::reproject_site_ops_for_current_topology(const std::vector
             int channel = channel_for_actual(replica, site, p);
             int before = occ[idx(channel, p, site)];
             int after = occ[idx(channel, p + 1, site)];
+            ot = (before == after) ? 1 : -1;
+        }
+    }
+}
+
+void QAQMCRenyiEngine::reproject_site_ops_at_site(int diff_site,
+                                                  const std::vector<int32_t>& occ) {
+    // Only site ops on `diff_site` at p >= M_ can change classification when
+    // mask[diff_site] flips, since channel_for_actual depends on mask only at
+    // p >= M (and only via the site whose mask bit is queried).
+    auto idx = [&](int channel, int p, int site) {
+        return ((channel * (M_total_ + 1) + p) * N_) + site;
+    };
+    for (int replica = 0; replica < 2; ++replica) {
+        for (int p = M_; p < M_total_; ++p) {
+            int& ot = replicas_[replica].op_types[p];
+            if (ot != 1 && ot != -1) continue;
+            if (replicas_[replica].op_sites[p] != diff_site) continue;
+            int channel = channel_for_actual(replica, diff_site, p);
+            int before = occ[idx(channel, p, diff_site)];
+            int after = occ[idx(channel, p + 1, diff_site)];
             ot = (before == after) ? 1 : -1;
         }
     }
@@ -593,6 +747,59 @@ double QAQMCRenyiEngine::log_weight_for_site_with_mask(int site, const std::vect
     return log_weight;
 }
 
+double QAQMCRenyiEngine::log_weight_for_diff_site(
+    int diff_site,
+    const std::vector<uint8_t>& mask,
+    const std::vector<int32_t>& occ_other_sites,
+    const std::vector<int32_t>& occ_site) const {
+    // Computes log_weight_for_site(diff_site, mask) without rebuilding the full
+    // occupancy under `mask`.  Valid when `mask` differs from the mask used to
+    // build `occ_other_sites` only at `diff_site` — non-diff endpoints have the
+    // same occupancy under both masks, while the diff endpoint is supplied via
+    // `occ_site` (size 2 * (M_total+1), built by compute_occ_at_site for `mask`).
+    if (diff_site < 0 || diff_site >= N_) {
+        throw std::runtime_error("diff_site out of range");
+    }
+    auto full_idx = [&](int c, int p, int s) {
+        return ((c * (M_total_ + 1) + p) * N_) + s;
+    };
+    auto site_idx = [&](int c, int p) { return c * (M_total_ + 1) + p; };
+
+    // Boundary feasibility: occupancy at p = M_total at the diff site.
+    for (int channel = 0; channel < 2; ++channel) {
+        if (occ_site[site_idx(channel, M_total_)] != 0) {
+            return -1e30;
+        }
+    }
+
+    const int* bond_sites = vij_.bond_sites_flat.data();
+    double log_weight = 0.0;
+    for (int replica = 0; replica < 2; ++replica) {
+        for (int p = 0; p < M_total_; ++p) {
+            const int ot = replicas_[replica].op_types[p];
+            if (ot != 2) continue;
+            int b = replicas_[replica].op_sites[p];
+            int si = bond_sites[b * 2 + 0];
+            int sj = bond_sites[b * 2 + 1];
+            if (si != diff_site && sj != diff_site) continue;
+
+            int c_i = channel_for_actual_with_mask(replica, si, p, mask);
+            int c_j = channel_for_actual_with_mask(replica, sj, p, mask);
+            int n_i = (si == diff_site) ? occ_site[site_idx(c_i, p)]
+                                        : occ_other_sites[full_idx(c_i, p, si)];
+            int n_j = (sj == diff_site) ? occ_site[site_idx(c_j, p)]
+                                        : occ_other_sites[full_idx(c_j, p, sj)];
+            int w_idx = n_i * 2 + n_j;
+            double w = actual_bond_weight(p, b, w_idx);
+            if (w <= 1e-300) {
+                return -1e30;
+            }
+            log_weight += std::log(w);
+        }
+    }
+    return log_weight;
+}
+
 double QAQMCRenyiEngine::log_weight_ratio_for_site(int site, int from_topology, int to_topology) const {
     if (from_topology < 0 || from_topology > 1 || to_topology < 0 || to_topology > 1) {
         throw std::runtime_error("topology index out of range");
@@ -646,7 +853,16 @@ void QAQMCRenyiEngine::topology_toggle() {
     }
 
     const int proposed = 1 - cur_topology_;
-    const double log_ratio = log_weight_ratio_for_site(diff_site_, cur_topology_, proposed);
+    const auto& mask_to = A_masks_[proposed];
+
+    // log_from uses the cached occupancy for the current mask.
+    const double log_from = log_weight_for_site_with_mask(diff_site_, A_mask_, occ_curr_);
+    // log_to: only the diff-site column differs between the two masks; rebuild
+    // that single column under mask_to and reuse occ_curr_ for the rest.
+    compute_occ_at_site(diff_site_, mask_to, occ_site_buf_);
+    const double log_to = log_weight_for_diff_site(diff_site_, mask_to, occ_curr_, occ_site_buf_);
+
+    const double log_ratio = log_to - log_from;
     double accept_prob = 0.0;
     if (log_ratio >= 0.0) {
         const double inv_ratio = std::exp(-log_ratio);
@@ -662,10 +878,22 @@ void QAQMCRenyiEngine::topology_toggle() {
     }
 
     cur_topology_ = proposed;
-    A_mask_ = A_masks_[cur_topology_];
-    auto occ = build_channel_occupancies();
-    reproject_site_ops_for_current_topology(occ);
-    update_midpoint_from_channels(occ);
+    A_mask_ = mask_to;
+
+    // Incrementally update occ_curr_: only the diff site's column changes when
+    // mask[diff_site] flips (sites != diff_site have identical occupancy under
+    // both masks).
+    auto full_idx = [&](int c, int p, int s) {
+        return ((c * (M_total_ + 1) + p) * N_) + s;
+    };
+    auto site_idx = [&](int c, int p) { return c * (M_total_ + 1) + p; };
+    for (int c = 0; c < 2; ++c) {
+        for (int p = 0; p <= M_total_; ++p) {
+            occ_curr_[full_idx(c, p, diff_site_)] = occ_site_buf_[site_idx(c, p)];
+        }
+    }
+    reproject_site_ops_at_site(diff_site_, occ_curr_);
+    update_midpoint_from_channels(occ_curr_);
 }
 
 void QAQMCRenyiEngine::diagonal_update() {
@@ -756,68 +984,91 @@ void QAQMCRenyiEngine::diagonal_update() {
 }
 
 void QAQMCRenyiEngine::cluster_update() {
-    auto occ = build_channel_occupancies();
+    // Refresh the cached occupancy from the (possibly modified) op string before
+    // the segment-Metropolis sweep.  All flips below mutate occ_curr_ in place,
+    // so by the end occ_curr_ already reflects the new ops + current A_mask_.
+    build_channel_occupancies_into(occ_curr_, A_mask_);
+    std::vector<int32_t>& occ = occ_curr_;
     auto occ_idx = [&](int channel, int p, int site) {
         return ((channel * (M_total_ + 1) + p) * N_) + site;
     };
     const int* bond_sites = vij_.bond_sites_flat.data();
 
-    for (int site = 0; site < N_; ++site) {
-        for (int channel = 0; channel < 2; ++channel) {
+    // Per-colour parallel sweep: sites in the same colour share no bond, so
+    // their writes (occ[*,*,site]) and reads (occ[*,*,bond_partner]) cannot
+    // race.  Within one site the segment Metropolis remains sequential.
+    for (const auto& color_sites : color_groups_) {
+        const int n_in_color = static_cast<int>(color_sites.size());
+#ifdef QAQMC_USE_OPENMP
+        #pragma omp parallel for schedule(static) if (n_in_color > 1)
+#endif
+        for (int idx = 0; idx < n_in_color; ++idx) {
+            const int site = color_sites[idx];
+            std::mt19937_64& rng = site_rngs_[site];
             std::vector<int> site_ops;
             site_ops.reserve(M_total_ + 2);
-            site_ops.push_back(-1);
-            for (int p = 0; p < M_total_; ++p) {
-                int replica = replica_for(channel, site, p);
-                int ot = replicas_[replica].op_types[p];
-                if ((ot == 1 || ot == -1) && replicas_[replica].op_sites[p] == site) {
-                    site_ops.push_back(p);
-                }
-            }
-            site_ops.push_back(M_total_);
 
-            if (site_ops.size() <= 3) continue;
-
-            for (size_t seg = 2; seg + 1 < site_ops.size(); ++seg) {
-                int p_start = site_ops[seg - 1];
-                int p_end = site_ops[seg];
-                double log_ratio = 0.0;
-
-                for (int p = std::max(0, p_start + 1); p <= std::min(M_total_ - 1, p_end); ++p) {
+            for (int channel = 0; channel < 2; ++channel) {
+                site_ops.clear();
+                site_ops.push_back(-1);
+                for (int p = 0; p < M_total_; ++p) {
                     int replica = replica_for(channel, site, p);
-                    if (replicas_[replica].op_types[p] != 2) continue;
-
-                    int b = replicas_[replica].op_sites[p];
-                    int si = bond_sites[b * 2 + 0];
-                    int sj = bond_sites[b * 2 + 1];
-                    if (si != site && sj != site) continue;
-
-                    int c_i = channel_for_actual(replica, si, p);
-                    int c_j = channel_for_actual(replica, sj, p);
-                    int n_i = occ[occ_idx(c_i, p, si)];
-                    int n_j = occ[occ_idx(c_j, p, sj)];
-                    double w_old = actual_bond_weight(p, b, n_i * 2 + n_j);
-
-                    int new_n_i = n_i;
-                    int new_n_j = n_j;
-                    if (si == site && c_i == channel) new_n_i ^= 1;
-                    if (sj == site && c_j == channel) new_n_j ^= 1;
-                    double w_new = actual_bond_weight(p, b, new_n_i * 2 + new_n_j);
-
-                    log_ratio += ((w_new > 1e-300) ? std::log(w_new) : -1e30)
-                               - ((w_old > 1e-300) ? std::log(w_old) : -1e30);
+                    int ot = replicas_[replica].op_types[p];
+                    if ((ot == 1 || ot == -1) && replicas_[replica].op_sites[p] == site) {
+                        site_ops.push_back(p);
+                    }
                 }
+                site_ops.push_back(M_total_);
 
-                bool do_flip = (log_ratio >= 0.0) || (renyi_u01(rngs_[channel]) < std::exp(log_ratio));
-                if (!do_flip) continue;
+                if (site_ops.size() <= 3) continue;
 
-                for (int p = std::max(0, p_start + 1); p <= std::min(M_total_ - 1, p_end); ++p) {
-                    occ[occ_idx(channel, p, site)] ^= 1;
+                for (size_t seg = 2; seg + 1 < site_ops.size(); ++seg) {
+                    int p_start = site_ops[seg - 1];
+                    int p_end = site_ops[seg];
+                    double log_ratio = 0.0;
+
+                    for (int p = std::max(0, p_start + 1); p <= std::min(M_total_ - 1, p_end); ++p) {
+                        int replica = replica_for(channel, site, p);
+                        if (replicas_[replica].op_types[p] != 2) continue;
+
+                        int b = replicas_[replica].op_sites[p];
+                        int si = bond_sites[b * 2 + 0];
+                        int sj = bond_sites[b * 2 + 1];
+                        if (si != site && sj != site) continue;
+
+                        int c_i = channel_for_actual(replica, si, p);
+                        int c_j = channel_for_actual(replica, sj, p);
+                        int n_i = occ[occ_idx(c_i, p, si)];
+                        int n_j = occ[occ_idx(c_j, p, sj)];
+                        double w_old = actual_bond_weight(p, b, n_i * 2 + n_j);
+
+                        int new_n_i = n_i;
+                        int new_n_j = n_j;
+                        if (si == site && c_i == channel) new_n_i ^= 1;
+                        if (sj == site && c_j == channel) new_n_j ^= 1;
+                        double w_new = actual_bond_weight(p, b, new_n_i * 2 + new_n_j);
+
+                        log_ratio += ((w_new > 1e-300) ? std::log(w_new) : -1e30)
+                                   - ((w_old > 1e-300) ? std::log(w_old) : -1e30);
+                    }
+
+                    bool do_flip = (log_ratio >= 0.0) || (renyi_u01(rng) < std::exp(log_ratio));
+                    if (!do_flip) continue;
+
+                    for (int p = std::max(0, p_start + 1); p <= std::min(M_total_ - 1, p_end); ++p) {
+                        occ[occ_idx(channel, p, site)] ^= 1;
+                    }
                 }
             }
         }
     }
 
+    // Reproject site-op classification.  The two replicas are independent and
+    // every (replica, p) entry only touches its own op_types[p], so this loop
+    // is trivially parallel.
+#ifdef QAQMC_USE_OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int replica = 0; replica < 2; ++replica) {
         for (int p = 0; p < M_total_; ++p) {
             int ot = replicas_[replica].op_types[p];
