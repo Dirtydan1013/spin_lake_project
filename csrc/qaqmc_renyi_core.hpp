@@ -26,6 +26,24 @@ public:
         int size{0};
     };
 
+    struct SiteEvent {
+        int32_t p{0};
+        int8_t replica{0};
+    };
+
+    struct BondEvent {
+        int32_t p{0};
+        int8_t replica{0};
+        int32_t bond{0};
+        int8_t endpoint{0};
+    };
+
+    struct OffdiagPaths {
+        std::vector<int32_t> count;
+        std::vector<int32_t> head;
+        std::vector<int32_t> list;
+    };
+
     QAQMCRenyiEngine(int N, double Omega, double delta_min, double delta_max,
                      double Rb, int M, double epsilon, uint64_t seed,
                      const double* pos, int pos_dim, int neighbor_cutoff = -1,
@@ -125,21 +143,26 @@ private:
     int n_bonds_pad_{1};
     int max_alias_{0};
 
-    // Cached channel-occupancy for the current A_mask_, refreshed at the start
-    // of every cluster_update (after diagonal_update modifies the op string).
-    // Layout matches build_channel_occupancies(): index = ((c * (M_total+1) + p) * N) + site.
-    std::vector<int32_t> occ_curr_;
-    // Scratch buffer for single-site occupancy under a proposed mask
-    // (used by topology_toggle / ensemble_switch).  Size 2 * (M_total+1).
-    std::vector<int32_t> occ_site_buf_;
-
     // Greedy bond-graph coloring used by the parallel cluster_update.  Sites in
     // the same color share no bond, so their per-site segment Metropolis can run
-    // concurrently without racing on occ_curr_ writes.  Size = n_colors.
+    // concurrently without racing on per-bond spin-cache writes.  Size = n_colors.
     std::vector<std::vector<int>> color_groups_;
     // Per-site RNG (one stream per site) so the OpenMP cluster_update doesn't
     // need to synchronize the original two-channel RNGs.  Size = N.
     std::vector<std::mt19937_64> site_rngs_;
+
+    // Channel-space vertex lists for the Renyi cluster update.  The flat
+    // channel/site index is channel * N_ + site; event lists are sorted by p.
+    std::vector<int32_t> ch_site_op_count_;
+    std::vector<int32_t> ch_site_op_head_;
+    std::vector<SiteEvent> ch_site_op_list_;
+    std::vector<int32_t> ch_site_bond_count_;
+    std::vector<int32_t> ch_site_bond_head_;
+    std::vector<BondEvent> ch_site_bond_list_;
+    std::vector<int32_t> bond_spin_by_replica_;  // [2 * M_total_]
+    OffdiagPaths paths_scratch_from_;
+    OffdiagPaths paths_scratch_to_;
+    std::vector<OffdiagPaths> paths_scratch_targets_;
 
     static inline void compute_bond_W_inline(double delta_i, double delta_j,
                                              double vij, double epsilon,
@@ -152,40 +175,27 @@ private:
     int replica_for(int channel, int site, int p) const;
     int channel_for_actual(int replica, int site, int p) const;
 
-    std::vector<int32_t> build_channel_occupancies(const std::vector<uint8_t>& mask) const;
-    std::vector<int32_t> build_channel_occupancies() const;
-    // In-place writer: fills `dest` (resized if needed) with the same layout as
-    // build_channel_occupancies() but without allocating a new vector.
-    void build_channel_occupancies_into(std::vector<int32_t>& dest,
-                                        const std::vector<uint8_t>& mask) const;
-    // Compute the channel occupancy at a single `site` under `mask`.
-    // `dest` has size 2 * (M_total+1); index = c * (M_total+1) + p.
-    void compute_occ_at_site(int site, const std::vector<uint8_t>& mask,
-                             std::vector<int32_t>& dest) const;
-    void update_midpoint_from_channels(const std::vector<int32_t>& occ);
-    void reproject_site_ops_for_current_topology(const std::vector<int32_t>& occ);
-    // Reproject only site ops on `diff_site` at p >= M (those whose
-    // channel_for_actual changed when A_mask_[diff_site] flipped).
-    void reproject_site_ops_at_site(int diff_site, const std::vector<int32_t>& occ);
+    void recompute_midpoint_states_from_ops();
+    void reproject_site_ops_for_mask_with_paths(const std::vector<uint8_t>& mask,
+                                                const OffdiagPaths& paths);
+    void reproject_site_ops_at_site_with_paths(int diff_site,
+                                               const std::vector<uint8_t>& mask,
+                                               const OffdiagPaths& paths);
     void accumulate_indicator();
     int diff_site_between_masks(const std::vector<uint8_t>& from_mask,
                                 const std::vector<uint8_t>& to_mask) const;
     double log_weight_ratio_between_masks(int site,
                                           const std::vector<uint8_t>& from_mask,
                                           const std::vector<uint8_t>& to_mask) const;
-    double log_weight_for_site_with_mask(int site, const std::vector<uint8_t>& mask,
-                                         const std::vector<int32_t>& occ) const;
-    // Optimized log-weight at the diff site when only one site differs between
-    // masks.  Reads non-diff endpoints from `occ_other_sites` (correct for both
-    // masks since they agree there) and the diff endpoint from `occ_site` (built
-    // for the target mask via compute_occ_at_site).
-    double log_weight_for_diff_site(int diff_site,
-                                    const std::vector<uint8_t>& mask,
-                                    const std::vector<int32_t>& occ_other_sites,
-                                    const std::vector<int32_t>& occ_site) const;
+    void build_offdiag_paths(const std::vector<uint8_t>& mask, OffdiagPaths& paths) const;
+    int occupancy_from_paths(const OffdiagPaths& paths, int channel, int site, int p) const;
+    double log_weight_for_site_with_paths(int site, const std::vector<uint8_t>& mask,
+                                          const OffdiagPaths& paths) const;
     double actual_bond_weight(int p, int b, int w_idx) const;
     void build_grouped_alias_tables();
     void compute_site_coloring();
+    void build_channel_vertex_lists();
+    void build_bond_spins_from_ops();
 
     void diagonal_update();
     void cluster_update();
