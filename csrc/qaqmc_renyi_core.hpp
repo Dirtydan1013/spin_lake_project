@@ -100,6 +100,12 @@ public:
     double get_time_topology() const { return time_topology_; }
     double get_time_ensemble() const { return time_ensemble_; }
     int64_t get_mc_steps() const { return mc_steps_; }
+    int64_t get_diag_update_slots() const { return diag_update_slots_; }
+    int64_t get_diag_proposal_attempts() const { return diag_proposal_attempts_; }
+    int64_t get_diag_site_proposals() const { return diag_site_proposals_; }
+    int64_t get_diag_bond_proposals() const { return diag_bond_proposals_; }
+    int64_t get_diag_bond_accepts() const { return diag_bond_accepts_; }
+    std::array<int64_t, 3> get_operator_counts() const;
     void reset_timers() {
         time_diag_ = 0.0;
         time_clus_build_ = 0.0;
@@ -107,6 +113,11 @@ public:
         time_topology_ = 0.0;
         time_ensemble_ = 0.0;
         mc_steps_ = 0;
+        diag_update_slots_ = 0;
+        diag_proposal_attempts_ = 0;
+        diag_site_proposals_ = 0;
+        diag_bond_proposals_ = 0;
+        diag_bond_accepts_ = 0;
     }
 
     void set_A_mask(const uint8_t* mask, int len);
@@ -180,6 +191,11 @@ private:
     double time_topology_{0.0};
     double time_ensemble_{0.0};
     int64_t mc_steps_{0};
+    int64_t diag_update_slots_{0};
+    int64_t diag_proposal_attempts_{0};
+    int64_t diag_site_proposals_{0};
+    int64_t diag_bond_proposals_{0};
+    int64_t diag_bond_accepts_{0};
 
     int n_bonds_pad_{1};
     int max_alias_{0};

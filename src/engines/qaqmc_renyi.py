@@ -83,6 +83,21 @@ class QAQMCRenyiRydberg:
             "topology": float(self._cpp_engine.time_topology),
             "ensemble": float(self._cpp_engine.time_ensemble),
             "mc_steps": int(self._cpp_engine.mc_steps),
+            "diag_update_slots": int(self._cpp_engine.diag_update_slots),
+            "diag_proposal_attempts": int(self._cpp_engine.diag_proposal_attempts),
+            "diag_site_proposals": int(self._cpp_engine.diag_site_proposals),
+            "diag_bond_proposals": int(self._cpp_engine.diag_bond_proposals),
+            "diag_bond_accepts": int(self._cpp_engine.diag_bond_accepts),
+        }
+
+    def get_operator_counts(self) -> dict[str, int]:
+        site_diag, bond_diag, offdiag = np.array(
+            self._cpp_engine.get_operator_counts(), dtype=np.int64
+        )
+        return {
+            "site_diag": int(site_diag),
+            "bond_diag": int(bond_diag),
+            "offdiag": int(offdiag),
         }
 
     def set_A_mask(self, mask):

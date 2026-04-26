@@ -20,7 +20,29 @@ pybind11_add_module(qaqmc_cpp
 )
 
 target_include_directories(qaqmc_cpp PRIVATE csrc)
-target_compile_options(qaqmc_cpp PRIVATE -O2)
+
+# ── Optimization flags ───────────────────────────────────────────────────────
+# Production target: cpunode02 (Intel Xeon Gold 5218, Cascade Lake, AVX-512).
+# beehive (login) is also Cascade Lake so this binary runs on either; to add
+# cpunode01 (Coffee Lake, no AVX-512) drop -march to broadwell.
+#
+# Notes on what's NOT enabled:
+#   - -ffast-math: re-associates FP, can shift Metropolis accept boundaries
+#     and break ED-comparison tests. Avoid.
+#   - -ffinite-math-only: log_W cache uses log(W) which we clamp to -1e30
+#     manually; allowing finite-only assumption is unsafe.
+target_compile_options(qaqmc_cpp PRIVATE
+    -O3
+    -march=cascadelake
+    -mtune=cascadelake
+    -funroll-loops
+    -fno-math-errno
+    -fno-trapping-math
+)
+
+# Link-time optimization: lets the compiler inline across translation units
+# (channel_for_actual, compute_bond_W_inline, etc.) and prune dead code.
+set_target_properties(qaqmc_cpp PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(qaqmc_cpp PRIVATE OpenMP::OpenMP_CXX)

@@ -543,6 +543,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             int n = self.get_ensemble_count();
             return py::array_t<double>({n, n}, v.data());
         })
+        .def("get_operator_counts", [](const QAQMCRenyiEngine& self) {
+            auto v = self.get_operator_counts();
+            py::array_t<int64_t> arr(3);
+            auto out = arr.mutable_unchecked<1>();
+            for (ssize_t i = 0; i < 3; ++i) out(i) = v[static_cast<size_t>(i)];
+            return arr;
+        })
         .def_property_readonly("bond_sites", [](const QAQMCRenyiEngine& self) {
             const auto& v = self.get_bond_sites_flat();
             int n = static_cast<int>(v.size()) / 2;
@@ -568,6 +575,11 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def_property_readonly("time_topology", &QAQMCRenyiEngine::get_time_topology)
         .def_property_readonly("time_ensemble", &QAQMCRenyiEngine::get_time_ensemble)
         .def_property_readonly("mc_steps", &QAQMCRenyiEngine::get_mc_steps)
+        .def_property_readonly("diag_update_slots", &QAQMCRenyiEngine::get_diag_update_slots)
+        .def_property_readonly("diag_proposal_attempts", &QAQMCRenyiEngine::get_diag_proposal_attempts)
+        .def_property_readonly("diag_site_proposals", &QAQMCRenyiEngine::get_diag_site_proposals)
+        .def_property_readonly("diag_bond_proposals", &QAQMCRenyiEngine::get_diag_bond_proposals)
+        .def_property_readonly("diag_bond_accepts", &QAQMCRenyiEngine::get_diag_bond_accepts)
         .def("reset_timers", &QAQMCRenyiEngine::reset_timers);
 
     // ── SSEEngine ─────────────────────────────────────────────────────────────

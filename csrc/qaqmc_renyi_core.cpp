@@ -4,8 +4,14 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -17,6 +23,32 @@ inline double renyi_u01(std::mt19937_64& rng) {
 inline int renyi_randi(std::mt19937_64& rng, int n) {
     std::uniform_int_distribution<int> dist(0, n - 1);
     return dist(rng);
+}
+
+// THP hint: ask the kernel to back this allocation with 2 MB pages instead of
+// 4 KB pages.  TLB has ~64-1500 entries; for a 145 MB log_W cache that means
+// 36k 4 KB pages vs 72 huge pages — random-access cluster_sweep over the
+// former blows TLB constantly.  THP defrag mode is "madvise" on the cluster,
+// so without this hint the kernel won't promote the allocation.
+inline void hint_hugepage(const void* ptr, std::size_t size_bytes) {
+#if defined(__linux__)
+    if (ptr == nullptr || size_bytes < (2u * 1024u * 1024u)) return;
+    const long page = ::sysconf(_SC_PAGESIZE);
+    if (page <= 0) return;
+    const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(ptr);
+    const std::uintptr_t aligned = (addr + page - 1) & ~static_cast<std::uintptr_t>(page - 1);
+    const std::size_t lost = aligned - addr;
+    if (size_bytes <= lost) return;
+    ::madvise(reinterpret_cast<void*>(aligned), size_bytes - lost, MADV_HUGEPAGE);
+#else
+    (void)ptr;
+    (void)size_bytes;
+#endif
+}
+
+template <typename T>
+inline void hint_vector_hugepage(const std::vector<T>& v) {
+    hint_hugepage(v.data(), v.size() * sizeof(T));
 }
 
 }  // namespace
@@ -95,6 +127,27 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
     ch_site_bond_head_.assign(ch_sites, 0);
     bond_spin_by_replica_.assign(static_cast<size_t>(2) * M_total_, 0);
     log_W_by_op_.assign(static_cast<size_t>(2) * M_total_ * 4, 0.0);
+
+    // Hint the kernel to back the largest random-access buffers with 2 MB
+    // pages.  These are read in cluster_sweep / cluster_build hot paths with
+    // strides spanning the full M_total range; 4 KB-page TLB pressure costs
+    // double-digit % at production sizes.
+    hint_vector_hugepage(bond_spin_by_replica_);
+    hint_vector_hugepage(log_W_by_op_);
+    hint_vector_hugepage(replicas_[0].op_types);
+    hint_vector_hugepage(replicas_[0].op_sites);
+    hint_vector_hugepage(replicas_[1].op_types);
+    hint_vector_hugepage(replicas_[1].op_sites);
+    if (delta_groups_ > 0) {
+        hint_vector_hugepage(grp_alias_.alias_prob_all);
+        hint_vector_hugepage(grp_alias_.alias_idx_all);
+        hint_vector_hugepage(grp_alias_.bond_W_max_all);
+    } else {
+        hint_vector_hugepage(alias_.alias_prob_all);
+        hint_vector_hugepage(alias_.alias_idx_all);
+        hint_vector_hugepage(alias_.bond_W_all);
+        hint_vector_hugepage(alias_.bond_W_max_all);
+    }
 }
 
 void QAQMCRenyiEngine::compute_site_coloring() {
@@ -732,6 +785,23 @@ std::array<std::vector<int32_t>, 4> QAQMCRenyiEngine::get_site_paths(int site) c
     return paths;
 }
 
+std::array<int64_t, 3> QAQMCRenyiEngine::get_operator_counts() const {
+    std::array<int64_t, 3> counts{0, 0, 0};  // site_diag, bond_diag, offdiag
+    for (int replica = 0; replica < 2; ++replica) {
+        for (int p = 0; p < M_total_; ++p) {
+            const int ot = replicas_[replica].op_types[p];
+            if (ot == 1) {
+                counts[0]++;
+            } else if (ot == 2) {
+                counts[1]++;
+            } else if (ot == -1) {
+                counts[2]++;
+            }
+        }
+    }
+    return counts;
+}
+
 void QAQMCRenyiEngine::accumulate_indicator() {
     if (indicator_site_ < 0) return;
     indicator_sum_ += current_indicator();
@@ -797,8 +867,10 @@ void QAQMCRenyiEngine::diagonal_update() {
             }
             if (ot != 1 && ot != 2) continue;
 
+            diag_update_slots_++;
             bool inserted = false;
             while (!inserted) {
+                diag_proposal_attempts_++;
                 int kind = 0;
                 int loc = 0;
                 int group = -1;
@@ -822,10 +894,12 @@ void QAQMCRenyiEngine::diagonal_update() {
                 }
 
                 if (kind == 0) {
+                    diag_site_proposals_++;
                     next_types[replica] = 1;
                     next_sites[replica] = loc;
                     inserted = true;
                 } else {
+                    diag_bond_proposals_++;
                     int b = loc;
                     int si = bond_sites[b * 2 + 0];
                     int sj = bond_sites[b * 2 + 1];
@@ -837,6 +911,7 @@ void QAQMCRenyiEngine::diagonal_update() {
                         ? grp_alias_.bond_W_max_all[group * n_bonds_pad_ + b]
                         : alias_.bond_W_max_all[p * n_bonds_pad_ + b];
                     if (w_max > 0.0 && renyi_u01(rng) < w_actual / w_max) {
+                        diag_bond_accepts_++;
                         next_types[replica] = 2;
                         next_sites[replica] = b;
                         inserted = true;
@@ -903,6 +978,10 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
     }
     ch_site_op_list_.assign(total_ops, 0u);
     ch_site_bond_list_.assign(total_bonds, 0u);
+    // Event lists are touched in cluster_sweep with site-strided segment
+    // queries — promote to hugepages so the random p-walk doesn't thrash TLB.
+    hint_vector_hugepage(ch_site_op_list_);
+    hint_vector_hugepage(ch_site_bond_list_);
 
     std::vector<int32_t> op_cursor(ch_sites, 0);
     std::vector<int32_t> bond_cursor(ch_sites, 0);
