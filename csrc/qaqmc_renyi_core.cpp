@@ -244,26 +244,6 @@ void QAQMCRenyiEngine::build_grouped_alias_tables() {
     }
 }
 
-int QAQMCRenyiEngine::replica_for_with_mask(int channel, int site, int p,
-                                            const std::vector<uint8_t>& mask) const {
-    if (p < M_) return channel;
-    return mask[site] ? (1 - channel) : channel;
-}
-
-int QAQMCRenyiEngine::channel_for_actual_with_mask(int replica, int site, int p,
-                                                   const std::vector<uint8_t>& mask) const {
-    if (p < M_) return replica;
-    return mask[site] ? (1 - replica) : replica;
-}
-
-int QAQMCRenyiEngine::replica_for(int channel, int site, int p) const {
-    return replica_for_with_mask(channel, site, p, A_mask_);
-}
-
-int QAQMCRenyiEngine::channel_for_actual(int replica, int site, int p) const {
-    return channel_for_actual_with_mask(replica, site, p, A_mask_);
-}
-
 void QAQMCRenyiEngine::set_A_mask(const uint8_t* mask, int len) {
     if (len != N_) {
         throw std::runtime_error("A_mask length mismatch");
@@ -921,8 +901,8 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
         ch_site_bond_head_[idx] = total_bonds;
         total_bonds += ch_site_bond_count_[idx];
     }
-    ch_site_op_list_.assign(total_ops, SiteEvent{});
-    ch_site_bond_list_.assign(total_bonds, BondEvent{});
+    ch_site_op_list_.assign(total_ops, 0u);
+    ch_site_bond_list_.assign(total_bonds, 0u);
 
     std::vector<int32_t> op_cursor(ch_sites, 0);
     std::vector<int32_t> bond_cursor(ch_sites, 0);
@@ -934,7 +914,7 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
                 int channel = channel_for_actual(replica, site, p);
                 int idx = cs_idx(channel, site);
                 ch_site_op_list_[ch_site_op_head_[idx] + op_cursor[idx]++] =
-                    SiteEvent{static_cast<int32_t>(p), static_cast<int8_t>(replica)};
+                    pack_site_event(static_cast<int32_t>(p), static_cast<int8_t>(replica));
             } else if (ot == 2) {
                 int b = replicas_[replica].op_sites[p];
                 int si = bond_sites[b * 2 + 0];
@@ -944,11 +924,9 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
                 int idx_i = cs_idx(c_i, si);
                 int idx_j = cs_idx(c_j, sj);
                 ch_site_bond_list_[ch_site_bond_head_[idx_i] + bond_cursor[idx_i]++] =
-                    BondEvent{static_cast<int32_t>(p), static_cast<int8_t>(replica),
-                              static_cast<int32_t>(b), static_cast<int8_t>(0)};
+                    pack_bond_event(static_cast<int32_t>(p), static_cast<int8_t>(replica), 0);
                 ch_site_bond_list_[ch_site_bond_head_[idx_j] + bond_cursor[idx_j]++] =
-                    BondEvent{static_cast<int32_t>(p), static_cast<int8_t>(replica),
-                              static_cast<int32_t>(b), static_cast<int8_t>(1)};
+                    pack_bond_event(static_cast<int32_t>(p), static_cast<int8_t>(replica), 1);
             }
         }
     }
@@ -1029,16 +1007,18 @@ void QAQMCRenyiEngine::build_bond_spins_from_ops() {
 
 void QAQMCRenyiEngine::cluster_update() {
     auto t_build0 = std::chrono::high_resolution_clock::now();
-    const int* bond_sites = vij_.bond_sites_flat.data();
     auto cs_idx = [&](int channel, int site) { return channel * N_ + site; };
-    auto upper_bound_event = [&](const std::vector<BondEvent>& events,
-                                 int begin, int end, int val) {
+    // Find the first event whose unpacked p > val.  Events are stored in
+    // ascending packed order (built from p-ascending outer loop); since the
+    // p field occupies the high bits, packed-order matches p-order so we can
+    // search on the packed value directly.  For BondEvent (low 2 bits = flags)
+    // we want the first packed value > ((val << 2) | 0b11).
+    auto upper_bound_bond = [&](int begin, int end, int val) {
+        const uint32_t key = (static_cast<uint32_t>(val) << 2) | 0x3u;
         return static_cast<int>(std::upper_bound(
-            events.begin() + begin,
-            events.begin() + end,
-            val,
-            [](int value, const BondEvent& event) { return value < event.p; }
-        ) - events.begin());
+            ch_site_bond_list_.begin() + begin,
+            ch_site_bond_list_.begin() + end,
+            key) - ch_site_bond_list_.begin());
     };
 
     build_channel_vertex_lists();
@@ -1069,18 +1049,19 @@ void QAQMCRenyiEngine::cluster_update() {
                 std::vector<int8_t> seg_flipped(n_sops + 1, 0);
 
                 for (int seg = 1; seg < n_sops; ++seg) {
-                    int p_start = ch_site_op_list_[op_base + seg - 1].p;
-                    int p_end = ch_site_op_list_[op_base + seg].p;
+                    int p_start = site_event_p(ch_site_op_list_[op_base + seg - 1]);
+                    int p_end = site_event_p(ch_site_op_list_[op_base + seg]);
                     double log_ratio = 0.0;
 
-                    int j0 = upper_bound_event(ch_site_bond_list_, bond_base, bond_end, p_start);
-                    int j1 = upper_bound_event(ch_site_bond_list_, bond_base, bond_end, p_end);
+                    int j0 = upper_bound_bond(bond_base, bond_end, p_start);
+                    int j1 = upper_bound_bond(bond_base, bond_end, p_end);
                     for (int j = j0; j < j1; ++j) {
-                        const BondEvent& event = ch_site_bond_list_[j];
-                        int p = event.p;
-                        int replica = event.replica;
-                        int w_idx = bond_spin_by_replica_[replica * M_total_ + p];
-                        int new_w_idx = w_idx ^ ((event.endpoint == 0) ? 2 : 1);
+                        const BondEvent ev = ch_site_bond_list_[j];
+                        const int p = bond_event_p(ev);
+                        const int replica = bond_event_replica(ev);
+                        const int endpoint = bond_event_endpoint(ev);
+                        const int w_idx = bond_spin_by_replica_[replica * M_total_ + p];
+                        const int new_w_idx = w_idx ^ (endpoint == 0 ? 2 : 1);
 
                         const double* lw = &log_W_by_op_[(replica * M_total_ + p) * 4];
                         log_ratio += lw[new_w_idx] - lw[w_idx];
@@ -1090,9 +1071,11 @@ void QAQMCRenyiEngine::cluster_update() {
                     if (!do_flip) continue;
 
                     for (int j = j0; j < j1; ++j) {
-                        const BondEvent& event = ch_site_bond_list_[j];
-                        int& w_idx = bond_spin_by_replica_[event.replica * M_total_ + event.p];
-                        w_idx ^= (event.endpoint == 0) ? 2 : 1;
+                        const BondEvent ev = ch_site_bond_list_[j];
+                        const int replica = bond_event_replica(ev);
+                        const int p = bond_event_p(ev);
+                        const int endpoint = bond_event_endpoint(ev);
+                        bond_spin_by_replica_[replica * M_total_ + p] ^= (endpoint == 0 ? 2 : 1);
                     }
                     seg_flipped[seg] = 1;
                 }
@@ -1100,8 +1083,8 @@ void QAQMCRenyiEngine::cluster_update() {
                 for (int k = 0; k < n_sops; ++k) {
                     bool flip_xor = seg_flipped[k] != seg_flipped[k + 1];
                     if (!flip_xor) continue;
-                    const SiteEvent& event = ch_site_op_list_[op_base + k];
-                    int& ot = replicas_[event.replica].op_types[event.p];
+                    const SiteEvent ev = ch_site_op_list_[op_base + k];
+                    int& ot = replicas_[site_event_replica(ev)].op_types[site_event_p(ev)];
                     ot = (ot == 1) ? -1 : 1;
                 }
             }

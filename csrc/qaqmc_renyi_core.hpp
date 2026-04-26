@@ -26,17 +26,38 @@ public:
         int size{0};
     };
 
-    struct SiteEvent {
-        int32_t p{0};
-        int8_t replica{0};
-    };
+    // Bit-packed channel-space vertex events.  After A.1 the cluster_update
+    // hot loop only needs (p, replica, endpoint) — bond/site can be derived
+    // from replicas_[replica].op_sites[p] when ever needed (they aren't in the
+    // current segment Metropolis), and the original 16-byte BondEvent/SiteEvent
+    // structs blew the L3 budget at production sizes (M_total≈4.5M produces
+    // ~9M bond events ≈ 144 MB).  Packing into uint32_t mirrors the original
+    // single-replica QAQMC vertex-list layout (4 B/event) and quarters the
+    // memory bandwidth pressure on cluster_build / cluster_sweep.
+    //
+    // Layout:
+    //   BondEvent : [ p : 30 bits ][ replica : 1 ][ endpoint : 1 ]
+    //   SiteEvent : [ p : 31 bits ][ replica : 1 ]
+    // Sorted ascending: lists are filled in p-ascending order, so monotonicity
+    // is preserved by the high-bit p prefix and std::upper_bound by p just
+    // needs to compare on (event >> shift).
+    using BondEvent = uint32_t;
+    using SiteEvent = uint32_t;
 
-    struct BondEvent {
-        int32_t p{0};
-        int8_t replica{0};
-        int32_t bond{0};
-        int8_t endpoint{0};
-    };
+    static inline BondEvent pack_bond_event(int32_t p, int8_t replica, int8_t endpoint) {
+        return (static_cast<uint32_t>(p) << 2)
+             | (static_cast<uint32_t>(replica & 1) << 1)
+             | static_cast<uint32_t>(endpoint & 1);
+    }
+    static inline int bond_event_p(BondEvent e)        { return static_cast<int>(e >> 2); }
+    static inline int bond_event_replica(BondEvent e)  { return static_cast<int>((e >> 1) & 1u); }
+    static inline int bond_event_endpoint(BondEvent e) { return static_cast<int>(e & 1u); }
+
+    static inline SiteEvent pack_site_event(int32_t p, int8_t replica) {
+        return (static_cast<uint32_t>(p) << 1) | static_cast<uint32_t>(replica & 1);
+    }
+    static inline int site_event_p(SiteEvent e)       { return static_cast<int>(e >> 1); }
+    static inline int site_event_replica(SiteEvent e) { return static_cast<int>(e & 1u); }
 
     struct OffdiagPaths {
         std::vector<int32_t> count;
@@ -195,10 +216,27 @@ private:
         QAQMCEngine::compute_bond_W_inline(delta_i, delta_j, vij, epsilon, W, W_max);
     }
 
-    int replica_for_with_mask(int channel, int site, int p, const std::vector<uint8_t>& mask) const;
-    int channel_for_actual_with_mask(int replica, int site, int p, const std::vector<uint8_t>& mask) const;
-    int replica_for(int channel, int site, int p) const;
-    int channel_for_actual(int replica, int site, int p) const;
+    inline int replica_for_with_mask(int channel, int site, int p,
+                                     const std::vector<uint8_t>& mask) const {
+        if (p < M_) return channel;
+        return mask[site] ? (1 - channel) : channel;
+    }
+
+    inline int channel_for_actual_with_mask(int replica, int site, int p,
+                                            const std::vector<uint8_t>& mask) const {
+        if (p < M_) return replica;
+        return mask[site] ? (1 - replica) : replica;
+    }
+
+    inline int replica_for(int channel, int site, int p) const {
+        if (p < M_) return channel;
+        return A_mask_[site] ? (1 - channel) : channel;
+    }
+
+    inline int channel_for_actual(int replica, int site, int p) const {
+        if (p < M_) return replica;
+        return A_mask_[site] ? (1 - replica) : replica;
+    }
 
     void recompute_midpoint_states_from_ops();
     void reproject_site_ops_for_mask_with_paths(const std::vector<uint8_t>& mask,
