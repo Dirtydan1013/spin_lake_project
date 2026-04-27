@@ -408,6 +408,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--n_therm", type=int, default=2000)
     parser.add_argument("--n_measure", type=int, default=50000)
+    parser.add_argument("--n_measure_total", type=int, default=-1,
+                        help="total measurement sweeps across ranks; auto-divided per rank")
     parser.add_argument("--measure_stride", type=int, default=1)
     parser.add_argument("--block_size", type=int, default=-1)
 
@@ -418,17 +420,48 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--autotune_method", type=str, default="transition_matrix")
     parser.add_argument("--autotune_damping", type=float, default=0.7)
     parser.add_argument("--n_steps", type=int, default=-1)
+    parser.add_argument("--n_steps_total", type=int, default=-1,
+                        help="total production sweeps across ranks; auto-divided per rank")
     parser.add_argument("--target_s2_err", type=float, default=-1.0)
     parser.add_argument("--batch_steps", type=int, default=-1)
+    parser.add_argument("--batch_steps_total", type=int, default=-1,
+                        help="total adaptive batch sweeps across ranks")
     parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--max_steps_total", type=int, default=-1,
+                        help="total adaptive cap across ranks")
     parser.add_argument("--min_steps", type=int, default=0)
+    parser.add_argument("--min_steps_total", type=int, default=-1,
+                        help="total adaptive minimum across ranks")
     parser.add_argument("--estimator", type=str, default="collection")
     return parser
+
+
+def _resolve_total_per_rank(per_rank: int, total: int, n_ranks: int, *,
+                            name: str, sentinel: int = -1) -> int:
+    """Resolve a per-rank vs total count flag.
+
+    - If only ``per_rank`` is set (``> sentinel``) it is used as-is.
+    - If only ``total`` is set, returns ``ceil(total / n_ranks)``.
+    - If both are set (both > sentinel), raises.
+    - If neither, returns ``sentinel`` so downstream can treat as "not provided".
+    """
+    has_per_rank = int(per_rank) > sentinel
+    has_total = int(total) > sentinel
+    if has_per_rank and has_total:
+        raise ValueError(
+            f"specify either --{name} (per rank) or --{name}_total (sum across ranks), not both"
+        )
+    if has_total:
+        if int(n_ranks) <= 0:
+            raise ValueError("n_ranks must be positive")
+        return -(-int(total) // int(n_ranks))  # ceil div
+    return int(per_rank)
 
 
 def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
+    n_ranks = comm.Get_size()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -437,6 +470,12 @@ def main():
     preferred = None if str(args.preferred_center_label).strip().lower() in {"", "auto", "none"} else args.preferred_center_label
 
     if args.method == "ratio":
+        n_measure = _resolve_total_per_rank(
+            args.n_measure, args.n_measure_total, n_ranks, name="n_measure"
+        )
+        if rank == 0 and int(args.n_measure_total) > 0:
+            print(f"[kp_tee_job_mpi] n_measure_total={args.n_measure_total} → "
+                  f"{n_measure}/rank × {n_ranks} ranks")
         payload = run_ratio_job_mpi(
             nx=args.nx, ny=args.ny, m=args.m, M=args.M,
             Omega=args.Omega, Rb=args.Rb,
@@ -444,7 +483,7 @@ def main():
             epsilon=args.epsilon, seed=args.seed, a=args.a,
             neighbor_cutoff=neighbor_cutoff,
             delta_groups=int(args.delta_groups),
-            n_therm=args.n_therm, n_measure=args.n_measure,
+            n_therm=args.n_therm, n_measure=n_measure,
             measure_stride=args.measure_stride, block_size=block_size,
             preferred_center_label=preferred,
             output_dir=args.output_dir,
@@ -452,10 +491,32 @@ def main():
             comm=comm,
         )
     else:
-        n_steps = None if int(args.n_steps) < 0 else int(args.n_steps)
+        n_steps_resolved = _resolve_total_per_rank(
+            args.n_steps, args.n_steps_total, n_ranks, name="n_steps"
+        )
+        batch_steps_resolved = _resolve_total_per_rank(
+            args.batch_steps, args.batch_steps_total, n_ranks, name="batch_steps"
+        )
+        max_steps_resolved = _resolve_total_per_rank(
+            args.max_steps, args.max_steps_total, n_ranks, name="max_steps"
+        )
+        min_steps_resolved = _resolve_total_per_rank(
+            args.min_steps, args.min_steps_total, n_ranks, name="min_steps", sentinel=0
+        )
+        if rank == 0:
+            for label, total, per_rank in [
+                ("n_steps", args.n_steps_total, n_steps_resolved),
+                ("batch_steps", args.batch_steps_total, batch_steps_resolved),
+                ("max_steps", args.max_steps_total, max_steps_resolved),
+                ("min_steps", args.min_steps_total, min_steps_resolved),
+            ]:
+                if int(total) > 0:
+                    print(f"[kp_tee_job_mpi] {label}_total={total} → "
+                          f"{per_rank}/rank × {n_ranks} ranks")
+        n_steps = None if n_steps_resolved < 0 else n_steps_resolved
         target_s2_err = None if float(args.target_s2_err) < 0.0 else float(args.target_s2_err)
-        batch_steps = None if int(args.batch_steps) < 0 else int(args.batch_steps)
-        max_steps = None if int(args.max_steps) < 0 else int(args.max_steps)
+        batch_steps = None if batch_steps_resolved < 0 else batch_steps_resolved
+        max_steps = None if max_steps_resolved < 0 else max_steps_resolved
         payload = run_expanded_job_mpi(
             nx=args.nx, ny=args.ny, m=args.m, M=args.M,
             Omega=args.Omega, Rb=args.Rb,
@@ -473,7 +534,7 @@ def main():
             autotune_damping=args.autotune_damping,
             n_steps=n_steps, block_size=block_size,
             target_s2_err=target_s2_err, batch_steps=batch_steps,
-            max_steps=max_steps, min_steps=args.min_steps,
+            max_steps=max_steps, min_steps=min_steps_resolved,
             estimator=args.estimator,
             lattice=args.lattice,
             comm=comm,
