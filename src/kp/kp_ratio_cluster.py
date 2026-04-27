@@ -11,9 +11,15 @@ from pathlib import Path
 import numpy as np
 
 from src.tee.compose_tee import KPResult, aggregate_ratios, compose_kp, save_kp_result_hdf5
-from src.kp.kp_geometry import KP_REGION_NAMES, attach_kp_site_orders, build_kp_region_masks
-from src.kp.kp_geometry import build_kagome_bond_ordering_bonds
-from src.rydberg.lattices import generate_kagome_bond_lattice
+from src.kp.kp_geometry import (
+    DEFAULT_LATTICE,
+    KP_REGION_NAMES,
+    LATTICE_NAMES,
+    attach_kp_site_orders,
+    build_kp_region_masks_for_lattice,
+    kagome_bond_pos,
+    kp_ordering_bonds,
+)
 from src.tee.qaqmc_renyi_ratio import (
     build_ratio_job_specs,
     load_ratio_manifest_hdf5,
@@ -76,12 +82,15 @@ def build_kp_ratio_manifest(
     a: float = 1.0,
     preferred_center_label: str | None = None,
     output_dir: str | Path,
+    lattice: str = DEFAULT_LATTICE,
 ) -> dict:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
-    spec = build_kp_region_masks(nx, ny, m=m, a=a, preferred_center_label=preferred_center_label)
+    ordering_bonds = kp_ordering_bonds(lattice, nx, ny, a=a)
+    spec = build_kp_region_masks_for_lattice(
+        lattice, nx, ny, m=m, a=a, preferred_center_label=preferred_center_label,
+    )
     spec = attach_kp_site_orders(spec, ordering_bonds)
 
     ratio_dir = out_dir / "ratio_steps"
@@ -100,6 +109,7 @@ def build_kp_ratio_manifest(
 
     manifest_path = out_dir / "ratio_manifest.h5"
     params = {
+        "lattice": str(lattice),
         "nx": int(nx),
         "ny": int(ny),
         "m": int(m),
@@ -173,7 +183,8 @@ def run_manifest_task(
     nx = int(params["nx"])
     ny = int(params["ny"])
     a = float(params["a"])
-    pos = generate_kagome_bond_lattice(nx, ny, a=a)
+    lattice = str(params.get("lattice", DEFAULT_LATTICE))
+    pos = kagome_bond_pos(lattice, nx, ny, a=a)
 
     from src.mpi.qaqmc_renyi_ratio_mpi import run_ratio_job
 
@@ -261,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_build = sub.add_parser("build-manifest")
+    p_build.add_argument("--lattice", choices=list(LATTICE_NAMES), default=DEFAULT_LATTICE)
     p_build.add_argument("--nx", type=int, required=True)
     p_build.add_argument("--ny", type=int, required=True)
     p_build.add_argument("--m", type=int, required=True)
@@ -306,6 +318,7 @@ def main():
             a=args.a,
             preferred_center_label=args.preferred_center_label,
             output_dir=args.output_dir,
+            lattice=args.lattice,
         )
     elif args.command == "count-jobs":
         payload = {"n_jobs": count_manifest_jobs(args.manifest)}

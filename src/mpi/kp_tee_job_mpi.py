@@ -31,17 +31,19 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("mpi4py is required for src.mpi.kp_tee_job_mpi") from exc
 
 from src.kp.kp_geometry import (
+    DEFAULT_LATTICE,
     KP_REGION_NAMES,
+    LATTICE_NAMES,
     attach_kp_site_orders,
-    build_kagome_bond_ordering_bonds,
     build_kp_ladders,
-    build_kp_region_masks,
+    build_kp_region_masks_for_lattice,
+    kagome_bond_pos,
+    kp_ordering_bonds,
 )
 from src.kp.kp_tee_job import _parse_regions, _to_attr_value
 from src.engines.qaqmc_renyi import QAQMCRenyiRydberg
 from src.mpi.qaqmc_renyi_ratio_mpi import run_ratio_mpi
 from src.mpi.reweighting_mpi import _rank_seed, run_expanded_mpi
-from src.rydberg.lattices import generate_kagome_bond_lattice
 from src.tee.compose_tee import (
     KPResult,
     compose_kp,
@@ -104,6 +106,7 @@ def run_ratio_job_mpi(
     block_size: int | None,
     preferred_center_label: str | None,
     output_dir,
+    lattice: str = DEFAULT_LATTICE,
     comm=None,
 ) -> dict | None:
     if comm is None:
@@ -112,10 +115,12 @@ def run_ratio_job_mpi(
 
     # Rank 0 builds KP geometry then broadcasts the parts everyone needs.
     if rank == 0:
-        pos = generate_kagome_bond_lattice(nx, ny, a=a)
-        ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
-        spec = build_kp_region_masks(nx, ny, m=m, a=a,
-                                     preferred_center_label=preferred_center_label)
+        pos = kagome_bond_pos(lattice, nx, ny, a=a)
+        ordering_bonds = kp_ordering_bonds(lattice, nx, ny, a=a)
+        spec = build_kp_region_masks_for_lattice(
+            lattice, nx, ny, m=m, a=a,
+            preferred_center_label=preferred_center_label,
+        )
         spec = attach_kp_site_orders(spec, ordering_bonds)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -123,6 +128,7 @@ def run_ratio_job_mpi(
 
         params = {
             "method": "ratio",
+            "lattice": str(lattice),
             "nx": int(nx), "ny": int(ny), "m": int(m),
             "N": int(pos.shape[0]), "M": int(M),
             "Omega": float(Omega), "Rb": float(Rb),
@@ -234,6 +240,7 @@ def run_expanded_job_mpi(
     max_steps: int | None,
     min_steps: int,
     estimator: str,
+    lattice: str = DEFAULT_LATTICE,
     comm=None,
 ) -> dict | None:
     if comm is None:
@@ -241,16 +248,19 @@ def run_expanded_job_mpi(
     rank = comm.Get_rank()
 
     if rank == 0:
-        pos = generate_kagome_bond_lattice(nx, ny, a=a)
-        ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
-        spec = build_kp_region_masks(nx, ny, m=m, a=a,
-                                     preferred_center_label=preferred_center_label)
+        pos = kagome_bond_pos(lattice, nx, ny, a=a)
+        ordering_bonds = kp_ordering_bonds(lattice, nx, ny, a=a)
+        spec = build_kp_region_masks_for_lattice(
+            lattice, nx, ny, m=m, a=a,
+            preferred_center_label=preferred_center_label,
+        )
         ladders = build_kp_ladders(spec, bond_sites=ordering_bonds)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         common_params = {
             "method": "expanded",
+            "lattice": str(lattice),
             "nx": int(nx), "ny": int(ny), "m": int(m),
             "N": int(pos.shape[0]), "M": int(M),
             "Omega": float(Omega), "Rb": float(Rb),
@@ -379,6 +389,7 @@ def run_expanded_job_mpi(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MPI-aware KP TEE jobs on kagome")
     parser.add_argument("--method", choices=["ratio", "expanded"], required=True)
+    parser.add_argument("--lattice", choices=list(LATTICE_NAMES), default=DEFAULT_LATTICE)
     parser.add_argument("--nx", type=int, required=True)
     parser.add_argument("--ny", type=int, required=True)
     parser.add_argument("--m", type=int, required=True)
@@ -437,6 +448,7 @@ def main():
             measure_stride=args.measure_stride, block_size=block_size,
             preferred_center_label=preferred,
             output_dir=args.output_dir,
+            lattice=args.lattice,
             comm=comm,
         )
     else:
@@ -463,6 +475,7 @@ def main():
             target_s2_err=target_s2_err, batch_steps=batch_steps,
             max_steps=max_steps, min_steps=args.min_steps,
             estimator=args.estimator,
+            lattice=args.lattice,
             comm=comm,
         )
 

@@ -8,11 +8,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from src.kp.kp_geometry import (
+    DEFAULT_LATTICE,
     KPRegionSpec,
     RegionLadderSpec,
     attach_kp_site_orders,
     build_kp_ladders,
-    build_kp_region_masks,
+    build_kp_region_masks_for_lattice,
 )
 from src.tee.qaqmc_renyi_ratio import KPRatioRunner
 from src.tee.reweighting import ExpandedProductionResult, ReweightingDriver
@@ -51,9 +52,10 @@ class KagomeKPRatioWorkflow:
         preferred_center_label: str | None = None,
         measure_stride: int = 1,
         block_size: int | None = None,
+        lattice: str = DEFAULT_LATTICE,
     ) -> KagomeKPRatioResult:
-        spec = build_kp_region_masks(
-            nx, ny, m=m, a=a, preferred_center_label=preferred_center_label
+        spec = build_kp_region_masks_for_lattice(
+            lattice, nx, ny, m=m, a=a, preferred_center_label=preferred_center_label
         )
         spec = attach_kp_site_orders(spec, bond_sites)
         result = self.kp_runner.run_kp(
@@ -112,9 +114,10 @@ class KagomeKPExpandedWorkflow:
         max_steps: int | None = None,
         min_steps: int = 0,
         estimator: str = "collection",
+        lattice: str = DEFAULT_LATTICE,
     ) -> KagomeExpandedRegionResult:
-        spec = build_kp_region_masks(
-            nx, ny, m=m, a=a, preferred_center_label=preferred_center_label
+        spec = build_kp_region_masks_for_lattice(
+            lattice, nx, ny, m=m, a=a, preferred_center_label=preferred_center_label
         )
         ladders = build_kp_ladders(spec, bond_sites=bond_sites)
         ladder = ladders[str(region_name)]

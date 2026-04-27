@@ -36,6 +36,51 @@ from src.rydberg.lattices import (
 
 KP_REGION_NAMES = ("A", "B", "C", "AB", "BC", "CA", "ABC")
 
+LATTICE_NAMES = ("kagome_bond", "kagome_bond_triangle")
+DEFAULT_LATTICE = "kagome_bond_triangle"
+
+
+def _normalise_lattice(lattice: str | None) -> str:
+    name = DEFAULT_LATTICE if lattice is None else str(lattice).strip().lower()
+    if name not in LATTICE_NAMES:
+        raise ValueError(
+            f"unknown lattice {lattice!r}; expected one of {LATTICE_NAMES}"
+        )
+    return name
+
+
+def kagome_bond_pos(lattice: str, nx: int, ny: int, *, a: float = 1.0) -> np.ndarray:
+    name = _normalise_lattice(lattice)
+    if name == "kagome_bond":
+        return generate_kagome_bond_lattice(nx, ny, a)
+    return generate_kagome_bond_triangle_lattice(nx, ny, a)
+
+
+def kp_ordering_bonds(lattice: str, nx: int, ny: int, *, a: float = 1.0) -> np.ndarray:
+    name = _normalise_lattice(lattice)
+    if name == "kagome_bond":
+        return build_kagome_bond_ordering_bonds(nx, ny, a=a)
+    return build_cropped_kagome_bond_ordering_bonds(nx, ny, a=a)
+
+
+def build_kp_region_masks_for_lattice(
+    lattice: str,
+    nx: int,
+    ny: int,
+    *,
+    m: int,
+    a: float = 1.0,
+    preferred_center_label: str | None = None,
+) -> "KPRegionSpec":
+    name = _normalise_lattice(lattice)
+    if name == "kagome_bond":
+        return build_kp_region_masks(
+            nx, ny, m=m, a=a, preferred_center_label=preferred_center_label
+        )
+    return build_cropped_kp_region_masks(
+        nx, ny, m=m, a=a, preferred_center_label=preferred_center_label
+    )
+
 
 @dataclass(frozen=True)
 class KPRegionSpec:

@@ -11,9 +11,14 @@ from pathlib import Path
 import numpy as np
 
 from src.tee.compose_tee import save_kp_result_hdf5
-from src.kp.kp_geometry import KP_REGION_NAMES, build_kagome_bond_ordering_bonds
+from src.kp.kp_geometry import (
+    DEFAULT_LATTICE,
+    KP_REGION_NAMES,
+    LATTICE_NAMES,
+    kagome_bond_pos,
+    kp_ordering_bonds,
+)
 from src.kp.kp_workflows import KagomeKPExpandedWorkflow, KagomeKPRatioWorkflow
-from src.rydberg.lattices import generate_kagome_bond_lattice
 from src.tee.reweighting import save_expanded_result_hdf5
 
 
@@ -96,13 +101,14 @@ def run_ratio_job(
     block_size: int | None,
     preferred_center_label: str,
     output_dir: str | Path,
+    lattice: str = DEFAULT_LATTICE,
     workflow: KagomeKPRatioWorkflow | None = None,
 ) -> dict:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pos = generate_kagome_bond_lattice(nx, ny, a=a)
-    ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
+    pos = kagome_bond_pos(lattice, nx, ny, a=a)
+    ordering_bonds = kp_ordering_bonds(lattice, nx, ny, a=a)
     if workflow is None:
         workflow = KagomeKPRatioWorkflow(
             N=int(pos.shape[0]),
@@ -129,10 +135,12 @@ def run_ratio_job(
         preferred_center_label=preferred_center_label,
         measure_stride=measure_stride,
         block_size=block_size,
+        lattice=lattice,
     )
 
     params = {
         "method": "ratio",
+        "lattice": str(lattice),
         "nx": int(nx),
         "ny": int(ny),
         "m": int(m),
@@ -194,13 +202,14 @@ def run_expanded_job(
     max_steps: int | None,
     min_steps: int,
     estimator: str,
+    lattice: str = DEFAULT_LATTICE,
     workflow: KagomeKPExpandedWorkflow | None = None,
 ) -> dict:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pos = generate_kagome_bond_lattice(nx, ny, a=a)
-    ordering_bonds = build_kagome_bond_ordering_bonds(nx, ny, a=a)
+    pos = kagome_bond_pos(lattice, nx, ny, a=a)
+    ordering_bonds = kp_ordering_bonds(lattice, nx, ny, a=a)
     if workflow is None:
         workflow = KagomeKPExpandedWorkflow(
             N=int(pos.shape[0]),
@@ -220,6 +229,7 @@ def run_expanded_job(
     geometry_written = False
     common_params = {
         "method": "expanded",
+        "lattice": str(lattice),
         "nx": int(nx),
         "ny": int(ny),
         "m": int(m),
@@ -270,6 +280,7 @@ def run_expanded_job(
             max_steps=max_steps,
             min_steps=min_steps,
             estimator=estimator,
+            lattice=lattice,
         )
 
         if not geometry_written:
@@ -314,6 +325,7 @@ def run_expanded_job(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run kagome KP TEE jobs")
     parser.add_argument("--method", choices=["ratio", "expanded"], required=True)
+    parser.add_argument("--lattice", choices=list(LATTICE_NAMES), default=DEFAULT_LATTICE)
     parser.add_argument("--nx", type=int, required=True)
     parser.add_argument("--ny", type=int, required=True)
     parser.add_argument("--m", type=int, required=True)
@@ -378,6 +390,7 @@ def main():
             block_size=block_size,
             preferred_center_label=args.preferred_center_label,
             output_dir=args.output_dir,
+            lattice=args.lattice,
         )
     else:
         n_steps = None if int(args.n_steps) < 0 else int(args.n_steps)
@@ -413,6 +426,7 @@ def main():
             max_steps=max_steps,
             min_steps=args.min_steps,
             estimator=args.estimator,
+            lattice=args.lattice,
         )
 
     print(json.dumps(payload, indent=2, sort_keys=True))
