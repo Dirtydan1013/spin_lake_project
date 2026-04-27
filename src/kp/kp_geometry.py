@@ -28,6 +28,7 @@ from scipy.spatial import KDTree
 from src.tee.ensemble_ladder import build_boundary_first_site_order
 from src.rydberg.lattices import (
     generate_kagome_bond_lattice,
+    generate_kagome_bond_triangle_lattice,
     generate_kagome_lattice,
     kagome_hex_centers,
 )
@@ -77,6 +78,22 @@ def build_kagome_bond_ordering_bonds(
         raise ValueError("neighbor_shells must be positive")
 
     pos = generate_kagome_bond_lattice(nx, ny, a)
+    return _build_ordering_bonds_from_positions(
+        pos,
+        neighbor_shells=neighbor_shells,
+        tol=tol,
+    )
+
+
+def _build_ordering_bonds_from_positions(
+    pos: np.ndarray,
+    *,
+    neighbor_shells: int = 2,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    if neighbor_shells <= 0:
+        raise ValueError("neighbor_shells must be positive")
+
     n_sites = int(pos.shape[0])
     distances: list[float] = []
     pairs: list[tuple[int, int, float]] = []
@@ -103,6 +120,23 @@ def build_kagome_bond_ordering_bonds(
 
     bonds = [(i, j) for i, j, dist in pairs if dist <= cutoff]
     return np.asarray(bonds, dtype=np.int32).reshape(-1, 2)
+
+
+def build_cropped_kagome_bond_ordering_bonds(
+    nx: int,
+    ny: int,
+    *,
+    a: float = 1.0,
+    neighbor_shells: int = 2,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """Return the KP site-ordering graph for the cropped kagome-bond lattice."""
+    pos = generate_kagome_bond_triangle_lattice(nx, ny, a)
+    return _build_ordering_bonds_from_positions(
+        pos,
+        neighbor_shells=neighbor_shells,
+        tol=tol,
+    )
 
 
 def _resolve_label(label: str, kagome: np.ndarray, centers: np.ndarray) -> np.ndarray:
@@ -292,6 +326,75 @@ def build_kp_region_masks(
 
     side_paths, branch_paths, center_label = build_kp_paths(
         nx, ny, m=m, preferred_center_label=preferred_center_label, a=a
+    )
+    poly_labels = _polygon_labels_for_regions(side_paths, branch_paths)
+    region_masks: dict[str, np.ndarray] = {}
+    region_indices: dict[str, np.ndarray] = {}
+    atomic_masks: dict[str, np.ndarray] = {}
+
+    for name in ("A", "B", "C"):
+        polygon = _polygon_points(poly_labels[name], kagome, centers)
+        inside = Path(polygon).contains_points(bond_pos, radius=-1e-9)
+        mask = np.ascontiguousarray(inside.astype(np.uint8))
+        atomic_masks[name] = mask
+        region_masks[name] = mask
+        region_indices[name] = np.flatnonzero(mask).astype(np.int32)
+
+    for name, parts in {
+        "AB": ("A", "B"),
+        "BC": ("B", "C"),
+        "CA": ("C", "A"),
+        "ABC": ("A", "B", "C"),
+    }.items():
+        mask = np.zeros_like(atomic_masks["A"], dtype=np.uint8)
+        for part in parts:
+            mask = np.maximum(mask, atomic_masks[part])
+        region_masks[name] = mask
+        region_indices[name] = np.flatnonzero(mask).astype(np.int32)
+
+    return KPRegionSpec(
+        nx=int(nx),
+        ny=int(ny),
+        m=int(m),
+        center_label=str(center_label),
+        region_masks=region_masks,
+        region_indices=region_indices,
+        site_orders=None,
+        outer_paths=side_paths,
+        branch_paths=branch_paths,
+    )
+
+
+def build_cropped_kp_region_masks(
+    nx: int,
+    ny: int,
+    *,
+    m: int,
+    a: float = 1.0,
+    preferred_center_label: str | None = None,
+) -> KPRegionSpec:
+    """Build KP masks on the cropped protruding-boundary kagome-bond lattice.
+
+    The cropped lattice is generated from an oversized ``(nx+1) * (ny+1)``
+    kagome patch and then clipped by the outer unit-cell centers.  The KP cut
+    therefore uses the same oversized center/vertex coordinate system for its
+    polygons, while the masks are evaluated on the cropped bond-atom sites.
+
+    ``center_label`` in the returned spec is labelled in the oversized
+    ``(nx+1)`` center indexing convention.
+    """
+    kp_nx = int(nx) + 1
+    kp_ny = int(ny) + 1
+    kagome = generate_kagome_lattice(kp_nx, kp_ny, a)
+    centers = kagome_hex_centers(kp_nx, kp_ny, a)
+    bond_pos = generate_kagome_bond_triangle_lattice(nx, ny, a)
+
+    side_paths, branch_paths, center_label = build_kp_paths(
+        kp_nx,
+        kp_ny,
+        m=m,
+        preferred_center_label=preferred_center_label,
+        a=a,
     )
     poly_labels = _polygon_labels_for_regions(side_paths, branch_paths)
     region_masks: dict[str, np.ndarray] = {}
