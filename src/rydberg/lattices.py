@@ -110,6 +110,134 @@ def generate_kagome_bond_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray
     return np.array(pos)
 
 
+def kagome_edge_patch_graph(
+    nx: int,
+    ny: int,
+    a: float = 1.0,
+    trim_edge_layers: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate the cropped kagome graph used by the protruding-boundary patch.
+
+    The construction follows the geometric recipe used for the paper-style
+    boundary: first build an oversized ``(nx+1) * (ny+1)`` kagome patch, then
+    keep only the kagome edges whose midpoints lie inside the polygon formed
+    by the outer unit-cell centers.  The returned graph has exactly
+    ``6*nx*ny`` retained edges, so the corresponding bond lattice has
+    ``6*nx*ny`` atoms.
+
+    Args:
+        nx: Number of kagome unit cells along v1.
+        ny: Number of kagome unit cells along v2.
+        a:  Triangular Bravais lattice constant.
+        trim_edge_layers: Remove this many outer unit-cell layers before
+            generating the finite graph.
+
+    Returns:
+        ``(vertices, edges)`` where ``vertices`` is an ``(Nv, 2)`` Cartesian
+        coordinate array and ``edges`` is an ``(Ne, 2)`` integer array of
+        nearest-neighbour kagome vertex pairs.
+    """
+    trim = int(trim_edge_layers)
+    if trim < 0:
+        raise ValueError("trim_edge_layers must be non-negative")
+    if 2 * trim >= nx or 2 * trim >= ny:
+        raise ValueError("trim_edge_layers removes all kagome unit cells")
+
+    v1 = np.array([a, 0.0])
+    v2 = np.array([a / 2.0, a * np.sqrt(3) / 2.0])
+    vertex_offsets = np.column_stack([
+        (a / 2.0) * np.cos(np.radians(np.arange(6) * 60.0)),
+        (a / 2.0) * np.sin(np.radians(np.arange(6) * 60.0)),
+    ])
+    crop_corners = np.array([
+        trim * v1 + trim * v2,
+        (nx - trim) * v1 + trim * v2,
+        (nx - trim) * v1 + (ny - trim) * v2,
+        trim * v1 + (ny - trim) * v2,
+    ])
+
+    def inside_crop(points, eps=1e-10):
+        keep = np.ones(len(points), dtype=bool)
+        for idx in range(len(crop_corners)):
+            start = crop_corners[idx]
+            end = crop_corners[(idx + 1) % len(crop_corners)]
+            edge = end - start
+            rel = points - start
+            keep &= edge[0] * rel[:, 1] - edge[1] * rel[:, 0] >= -eps
+        return keep
+
+    def key(point):
+        return tuple(np.round(point, 10))
+
+    vertices = []
+    index_by_pos = {}
+
+    def vertex_index(point):
+        k = key(point)
+        idx = index_by_pos.get(k)
+        if idx is None:
+            idx = len(vertices)
+            index_by_pos[k] = idx
+            vertices.append(point)
+        return idx
+
+    edges = set()
+    for j in range(trim, ny - trim + 1):
+        for i in range(trim, nx - trim + 1):
+            center = i * v1 + j * v2
+            ids = [vertex_index(center + offset) for offset in vertex_offsets]
+            for sub in range(6):
+                edge = tuple(sorted((ids[sub], ids[(sub + 1) % 6])))
+                midpoint = 0.5 * (vertices[edge[0]] + vertices[edge[1]])
+                if inside_crop(midpoint[None, :])[0]:
+                    edges.add(edge)
+
+    if not edges:
+        return np.zeros((0, 2), dtype=float), np.zeros((0, 2), dtype=np.int32)
+
+    edges = sorted(edges)
+    used = sorted({idx for edge in edges for idx in edge})
+    remap = {old: new for new, old in enumerate(used)}
+    compact_vertices = np.array([vertices[idx] for idx in used])
+    compact_edges = np.array(
+        [[remap[i], remap[j]] for i, j in edges],
+        dtype=np.int32,
+    )
+    return compact_vertices, compact_edges
+
+
+def generate_kagome_bond_triangle_lattice(
+    nx: int,
+    ny: int,
+    a: float = 1.0,
+    trim_edge_layers: int = 0,
+) -> np.ndarray:
+    """Generate atoms on the cropped finite kagome-edge patch.
+
+    Atoms are placed at the midpoints of the retained edges returned by
+    ``kagome_edge_patch_graph``.
+
+    Args:
+        nx: Number of kagome unit cells along v1.
+        ny: Number of kagome unit cells along v2.
+        a:  Triangular Bravais lattice constant.
+        trim_edge_layers: Remove this many outer cell layers before placing
+            atoms.
+
+    Returns:
+        Cartesian coordinate array with one site per retained kagome edge.
+    """
+    vertices, edges = kagome_edge_patch_graph(
+        nx,
+        ny,
+        a,
+        trim_edge_layers=trim_edge_layers,
+    )
+    if len(edges) == 0:
+        return np.zeros((0, 2), dtype=float)
+    return 0.5 * (vertices[edges[:, 0]] + vertices[edges[:, 1]])
+
+
 def generate_kagome_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
     """Generate the original kagome-lattice vertices for the same void tiling.
 
@@ -413,4 +541,3 @@ def kagome_hex_centers(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
         for i in range(nx):
             centers.append(i * v1 + j * v2)
     return np.array(centers)
-
