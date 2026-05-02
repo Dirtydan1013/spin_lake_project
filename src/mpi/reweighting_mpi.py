@@ -36,6 +36,130 @@ class ExpandedMPIResult:
     production: ExpandedProductionResult
 
 
+def _print_production_diagnostics(label: str | None,
+                                  root_result: ExpandedProductionResult,
+                                  local_results,
+                                  *,
+                                  target_ensemble: int,
+                                  reference_ensemble: int,
+                                  estimator: str) -> None:
+    prefix = "[expanded_mpi]"
+    if label:
+        prefix += f" {label}"
+
+    visits = np.asarray(root_result.visit_counts, dtype=np.int64).reshape(-1)
+    zero_global = np.flatnonzero(visits <= 0)
+    print(
+        f"{prefix} visits: sum={int(np.sum(visits))} "
+        f"min={int(np.min(visits))} max={int(np.max(visits))} "
+        f"zero={zero_global.tolist()}",
+        flush=True,
+    )
+
+    local_zero = []
+    for rank, result in enumerate(local_results):
+        local_visits = np.asarray(result.visit_counts, dtype=np.int64).reshape(-1)
+        zero = np.flatnonzero(local_visits <= 0)
+        if zero.size:
+            local_zero.append(f"r{rank}:{zero.tolist()}")
+    if local_zero:
+        print(f"{prefix} local zero-count ensembles: {'; '.join(local_zero)}", flush=True)
+
+    if root_result.block_visit_counts is not None:
+        blocks = np.asarray(root_result.block_visit_counts, dtype=np.int64)
+        zero_cells = int(np.sum(blocks <= 0))
+        zero_blocks = int(np.sum(np.any(blocks <= 0, axis=1)))
+        print(
+            f"{prefix} visit blocks: blocks={blocks.shape[0]} "
+            f"zero_blocks={zero_blocks} zero_cells={zero_cells}",
+            flush=True,
+        )
+
+    transition = np.asarray(root_result.transition_counts, dtype=np.int64)
+    if transition.size:
+        row_sums = np.sum(transition, axis=1)
+        print(
+            f"{prefix} transition row sums: "
+            f"min={int(np.min(row_sums))} max={int(np.max(row_sums))} "
+            f"zero_rows={np.flatnonzero(row_sums <= 0).tolist()}",
+            flush=True,
+        )
+
+    if root_result.collection_counts is not None:
+        collection = np.asarray(root_result.collection_counts, dtype=np.float64)
+        row_sums = np.sum(collection, axis=1)
+        print(
+            f"{prefix} collection row sums: "
+            f"min={float(np.min(row_sums)):.3g} max={float(np.max(row_sums)):.3g} "
+            f"zero_rows={np.flatnonzero(row_sums <= 0.0).tolist()}",
+            flush=True,
+        )
+
+    estimator_name = str(estimator).strip().lower()
+    try:
+        if estimator_name == "collection" and root_result.collection_log_z is not None:
+            s2, s2_err = root_result.s2_collection(
+                int(target_ensemble),
+                reference_ensemble=int(reference_ensemble),
+            )
+            print(f"{prefix} S2(collection)={s2:.8g} +/- {s2_err:.3g}", flush=True)
+        else:
+            s2, s2_err = root_result.s2(
+                int(target_ensemble),
+                reference_ensemble=int(reference_ensemble),
+            )
+            print(f"{prefix} S2(histogram)={s2:.8g} +/- {s2_err:.3g}", flush=True)
+    except ValueError as exc:
+        print(f"{prefix} S2 diagnostic unavailable: {exc}", flush=True)
+
+
+def _combine_results_with_optional_diagnostics(results, *, reference_ensemble: int,
+                                               require_histogram: bool,
+                                               require_collection: bool,
+                                               diagnostic_label: str | None,
+                                               target_ensemble: int,
+                                               estimator: str
+                                               ) -> ExpandedProductionResult:
+    try:
+        root_result = combine_expanded_production_results(
+            results,
+            reference_ensemble=reference_ensemble,
+            require_histogram=require_histogram,
+            require_collection=require_collection,
+        )
+    except ValueError:
+        if diagnostic_label is not None:
+            try:
+                diagnostic_result = combine_expanded_production_results(
+                    results,
+                    reference_ensemble=reference_ensemble,
+                    require_histogram=False,
+                    require_collection=False,
+                )
+                _print_production_diagnostics(
+                    diagnostic_label,
+                    diagnostic_result,
+                    results,
+                    target_ensemble=target_ensemble,
+                    reference_ensemble=reference_ensemble,
+                    estimator=estimator,
+                )
+            except ValueError:
+                pass
+        raise
+
+    if diagnostic_label is not None:
+        _print_production_diagnostics(
+            diagnostic_label,
+            root_result,
+            results,
+            target_ensemble=target_ensemble,
+            reference_ensemble=reference_ensemble,
+            estimator=estimator,
+        )
+    return root_result
+
+
 def _autotune_shared_log_g(driver: ReweightingDriver, *, n_steps_per_iter: int,
                            max_iters: int, tol: float, method: str,
                            damping: float, comm) -> AutoTuneResult:
@@ -103,10 +227,16 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
                      reference_ensemble: int = 0,
                      filepath=None,
                      comm=None,
-                     engine_factory=None):
+                     engine_factory=None,
+                     diagnostic_label: str | None = None):
     if comm is None:
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
+    estimator_name = str(estimator).strip().lower()
+    if estimator_name not in {"histogram", "collection"}:
+        raise ValueError("estimator must be 'histogram' or 'collection'")
+    require_histogram = estimator_name == "histogram"
+    require_collection = estimator_name == "collection"
 
     if engine_factory is None:
         def engine_factory(local_rank):
@@ -145,13 +275,20 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
             n_steps=int(n_steps),
             block_size=block_size,
             reference_ensemble=reference_ensemble,
+            require_histogram=False,
+            require_collection=False,
         )
         gathered = comm.gather(local_result, root=0)
         root_result = None
         if rank == 0:
-            root_result = combine_expanded_production_results(
+            root_result = _combine_results_with_optional_diagnostics(
                 gathered,
                 reference_ensemble=reference_ensemble,
+                require_histogram=require_histogram,
+                require_collection=require_collection,
+                diagnostic_label=diagnostic_label,
+                target_ensemble=target_ensemble,
+                estimator=estimator_name,
             )
     else:
         if batch_steps is None or max_steps is None or block_size is None:
@@ -165,24 +302,27 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
         steps_done = 0
         root_result = None
         done = False
-        estimator_name = str(estimator).strip().lower()
-        if estimator_name not in {"histogram", "collection"}:
-            raise ValueError("estimator must be 'histogram' or 'collection'")
-
         while steps_done < int(max_steps) and not done:
             current_batch = min(int(batch_steps), int(max_steps) - steps_done)
             local_batch = driver.run_production(
                 n_steps=current_batch,
                 block_size=block_size,
                 reference_ensemble=reference_ensemble,
+                require_histogram=False,
+                require_collection=False,
             )
             gathered_batch = comm.gather(local_batch, root=0)
             steps_done += current_batch
             if rank == 0:
                 gathered_results.extend(gathered_batch)
-                root_result = combine_expanded_production_results(
+                root_result = _combine_results_with_optional_diagnostics(
                     gathered_results,
                     reference_ensemble=reference_ensemble,
+                    require_histogram=require_histogram,
+                    require_collection=require_collection,
+                    diagnostic_label=None,
+                    target_ensemble=target_ensemble,
+                    estimator=estimator_name,
                 )
                 if estimator_name == "collection":
                     _, current_err = root_result.s2_collection(target_ensemble, reference_ensemble=reference_ensemble)
@@ -190,6 +330,16 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
                     _, current_err = root_result.s2(target_ensemble, reference_ensemble=reference_ensemble)
                 done = steps_done >= int(min_steps) and current_err <= float(target_s2_err)
             done = comm.bcast(done, root=0)
+
+        if rank == 0 and diagnostic_label is not None and root_result is not None:
+            _print_production_diagnostics(
+                diagnostic_label,
+                root_result,
+                gathered_results,
+                target_ensemble=target_ensemble,
+                reference_ensemble=reference_ensemble,
+                estimator=estimator_name,
+            )
 
     if rank == 0 and filepath:
         save_expanded_result_hdf5(

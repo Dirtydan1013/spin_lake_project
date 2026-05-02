@@ -97,6 +97,33 @@ def _jackknife_log_z(block_counts, log_g, *, reference_ensemble: int = 0) -> tup
     return log_z, log_z_err
 
 
+def _is_zero_count_log_z_error(exc: ValueError) -> bool:
+    msg = str(exc)
+    return (
+        "ensemble counts must be positive" in msg or
+        "leave-one-out block count must remain positive" in msg
+    )
+
+
+def _nan_log_z_pair(log_g) -> tuple[np.ndarray, np.ndarray]:
+    shape = np.asarray(log_g, dtype=np.float64).reshape(-1).shape
+    return np.full(shape, np.nan, dtype=np.float64), np.full(shape, np.nan, dtype=np.float64)
+
+
+def _jackknife_log_z_or_nan(block_counts, log_g, *, reference_ensemble: int = 0,
+                            require_histogram: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        return _jackknife_log_z(
+            block_counts,
+            log_g,
+            reference_ensemble=reference_ensemble,
+        )
+    except ValueError as exc:
+        if require_histogram or not _is_zero_count_log_z_error(exc):
+            raise
+        return _nan_log_z_pair(log_g)
+
+
 def _row_stochastic_from_collection(collection_counts) -> np.ndarray:
     matrix = np.asarray(collection_counts, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
@@ -163,6 +190,30 @@ def _jackknife_log_z_from_collection(block_collection_counts, log_g, *,
     prefactor = (block_arr.shape[0] - 1) / float(block_arr.shape[0])
     log_z_err = np.sqrt(prefactor * np.sum((loo_arr - loo_mean) ** 2, axis=0))
     return log_z, log_z_err
+
+
+def _is_zero_collection_log_z_error(exc: ValueError) -> bool:
+    msg = str(exc)
+    return (
+        "ensemble must contribute positive collection weight" in msg or
+        "stationary distribution must stay positive" in msg
+    )
+
+
+def _jackknife_log_z_from_collection_or_nan(block_collection_counts, log_g, *,
+                                            reference_ensemble: int = 0,
+                                            require_collection: bool = True
+                                            ) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        return _jackknife_log_z_from_collection(
+            block_collection_counts,
+            log_g,
+            reference_ensemble=reference_ensemble,
+        )
+    except ValueError as exc:
+        if require_collection or not _is_zero_collection_log_z_error(exc):
+            raise
+        return _nan_log_z_pair(log_g)
 
 
 class ReweightingDriver:
@@ -251,7 +302,9 @@ class ReweightingDriver:
         )
 
     def run_production(self, *, n_steps: int, block_size: int | None = None,
-                       reference_ensemble: int = 0) -> ExpandedProductionResult:
+                       reference_ensemble: int = 0,
+                       require_histogram: bool = True,
+                       require_collection: bool = True) -> ExpandedProductionResult:
         if not self._masks:
             raise ValueError("set_ensemble_ladder must be called before run_production")
         if self._log_g is None:
@@ -267,12 +320,17 @@ class ReweightingDriver:
             counts = self.engine.get_visit_counts_ext()
             transitions = self.engine.get_transition_counts()
             collection = self.engine.get_collection_counts()
-            log_z, log_z_err = _jackknife_log_z(counts.reshape(1, -1), self._log_g,
-                                                reference_ensemble=reference_ensemble)
-            collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection(
+            log_z, log_z_err = _jackknife_log_z_or_nan(
+                counts.reshape(1, -1),
+                self._log_g,
+                reference_ensemble=reference_ensemble,
+                require_histogram=bool(require_histogram),
+            )
+            collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection_or_nan(
                 collection.reshape(1, collection.shape[0], collection.shape[1]),
                 self._log_g,
                 reference_ensemble=reference_ensemble,
+                require_collection=bool(require_collection),
             )
             return ExpandedProductionResult(
                 log_g=self.log_g,
@@ -311,11 +369,17 @@ class ReweightingDriver:
         block_arr = np.asarray(blocks, dtype=np.int64)
         collection_block_arr = np.asarray(collection_blocks, dtype=np.float64)
         counts = np.sum(block_arr, axis=0, dtype=np.int64)
-        log_z, log_z_err = _jackknife_log_z(block_arr, self._log_g, reference_ensemble=reference_ensemble)
-        collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection(
+        log_z, log_z_err = _jackknife_log_z_or_nan(
+            block_arr,
+            self._log_g,
+            reference_ensemble=reference_ensemble,
+            require_histogram=bool(require_histogram),
+        )
+        collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection_or_nan(
             collection_block_arr,
             self._log_g,
             reference_ensemble=reference_ensemble,
+            require_collection=bool(require_collection),
         )
         return ExpandedProductionResult(
             log_g=self.log_g,
@@ -434,7 +498,9 @@ class ReweightingDriver:
         )
 
 
-def combine_expanded_production_results(results, *, reference_ensemble: int = 0) -> ExpandedProductionResult:
+def combine_expanded_production_results(results, *, reference_ensemble: int = 0,
+                                        require_histogram: bool = True,
+                                        require_collection: bool = True) -> ExpandedProductionResult:
     result_list = list(results)
     if not result_list:
         raise ValueError("results must be non-empty")
@@ -501,24 +567,36 @@ def combine_expanded_production_results(results, *, reference_ensemble: int = 0)
         raise ValueError("either all or none of the results must carry block_collection_counts")
 
     if block_visit is not None:
-        log_z, log_z_err = _jackknife_log_z(block_visit, log_g, reference_ensemble=reference_ensemble)
+        log_z, log_z_err = _jackknife_log_z_or_nan(
+            block_visit,
+            log_g,
+            reference_ensemble=reference_ensemble,
+            require_histogram=bool(require_histogram),
+        )
     else:
-        log_z, log_z_err = _jackknife_log_z(total_visit.reshape(1, -1), log_g, reference_ensemble=reference_ensemble)
+        log_z, log_z_err = _jackknife_log_z_or_nan(
+            total_visit.reshape(1, -1),
+            log_g,
+            reference_ensemble=reference_ensemble,
+            require_histogram=bool(require_histogram),
+        )
 
     collection_log_z = None
     collection_log_z_err = None
     if total_collection is not None:
         if block_collection is not None:
-            collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection(
+            collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection_or_nan(
                 block_collection,
                 log_g,
                 reference_ensemble=reference_ensemble,
+                require_collection=bool(require_collection),
             )
         else:
-            collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection(
+            collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection_or_nan(
                 total_collection.reshape(1, n_ens, n_ens),
                 log_g,
                 reference_ensemble=reference_ensemble,
+                require_collection=bool(require_collection),
             )
 
     return ExpandedProductionResult(

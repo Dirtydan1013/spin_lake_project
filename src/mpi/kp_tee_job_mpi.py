@@ -351,6 +351,7 @@ def run_expanded_job_mpi(
             filepath=None,
             comm=comm,
             engine_factory=_shared_engine_factory,
+            diagnostic_label=str(region_name),
         )
 
         if rank != 0:
