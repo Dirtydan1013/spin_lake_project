@@ -1,16 +1,15 @@
-"""Skeleton tests for ``src.tee.log_g_io`` (Day-3 module).
+"""Tests for ``src.tee.log_g_io.load_region_log_g``.
 
-The contract:
+Contract:
 
-- ``load_region_log_g(h5_path, expected_masks)`` reads ``result/log_g`` from a
-  region HDF5 file produced by an earlier expanded-ensemble run.
-- It validates length matches ``len(expected_masks)``.
-- It validates masks (when present in the h5 manifest) byte-equal
+- Reads ``result/log_g`` from a region HDF5 file produced by an earlier
+  expanded-ensemble run.
+- Validates length matches ``len(expected_masks)``.
+- Validates masks (when present in the h5 manifest) byte-equal
   ``expected_masks`` — log_g indices are positionally tied to mask order.
-- It rejects NaN values.
+- Rejects NaN / Inf values.
 - Returns a writable ``np.ndarray`` of dtype float64.
-
-These are ``xfail(strict=True)`` until Day 3.
+- Physical-param mismatches (M, lattice) warn but do not raise.
 """
 
 from __future__ import annotations
@@ -53,13 +52,11 @@ def good_h5(tmp_path):
     return path, masks
 
 
-@pytest.mark.xfail(strict=True, reason="log_g_io implemented in Day 3")
 class TestLogGIoModuleExists:
     def test_can_import_load_region_log_g(self):
         from src.tee.log_g_io import load_region_log_g  # noqa: F401
 
 
-@pytest.mark.xfail(strict=True, reason="log_g_io implemented in Day 3")
 class TestLoadRegionLogG:
     def test_returns_float64_array(self, good_h5):
         from src.tee.log_g_io import load_region_log_g

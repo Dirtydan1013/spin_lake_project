@@ -1,6 +1,6 @@
-"""Skeleton tests for ``ReweightingDriver.warm_up`` (Day-3 feature).
+"""Tests for ``ReweightingDriver.warm_up``.
 
-The contract:
+Contract:
 
 - ``warm_up(n_steps)`` thermalises the underlying MC chain by calling
   ``engine.run_steps(n_steps)``.
@@ -8,10 +8,6 @@ The contract:
 - It MUST leave ``visit_counts_ext``, ``transition_counts``, and
   ``collection_counts`` at zero (resets before AND after the run).
 - It is allowed only after ``set_ensemble_ladder``.
-
-These tests are marked ``xfail(strict=True)`` until Day 3 implements them.
-When the implementation lands, the marker is removed (strict=True flips
-unexpected passes into failures, so we cannot forget).
 """
 
 from __future__ import annotations
@@ -46,14 +42,12 @@ def _make_driver_with_mock_engine():
     return driver, engine
 
 
-@pytest.mark.xfail(strict=True, reason="warm_up implemented in Day 3")
 class TestWarmUpExists:
     def test_warm_up_method_present(self):
         driver, _ = _make_driver_with_mock_engine()
         assert hasattr(driver, "warm_up") and callable(driver.warm_up)
 
 
-@pytest.mark.xfail(strict=True, reason="warm_up implemented in Day 3")
 class TestWarmUpBehaviour:
     def test_warm_up_calls_run_steps_with_argument(self):
         driver, engine = _make_driver_with_mock_engine()
@@ -85,7 +79,6 @@ class TestWarmUpBehaviour:
         assert engine.reset_visit_counts_ext.call_count >= 1
 
 
-@pytest.mark.xfail(strict=True, reason="warm_up implemented in Day 3")
 class TestWarmUpRequiresLadder:
     def test_warm_up_before_set_ladder_raises(self):
         engine = MagicMock()

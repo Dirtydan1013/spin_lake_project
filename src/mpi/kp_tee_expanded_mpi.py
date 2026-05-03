@@ -49,7 +49,28 @@ from src.mpi.kp_tee_common import (
     normalize_common_args,
 )
 from src.mpi.reweighting_mpi import _rank_seed, run_expanded_mpi
+from src.tee.log_g_io import load_region_log_g
 from src.tee.reweighting import save_expanded_result_hdf5
+
+
+# Default warm-up when log_g is loaded from disk and the user didn't override.
+# Picked so the chain has time to leave the C++ constructor's fresh state but
+# remains a small fraction of typical production budgets (~62k/rank).
+DEFAULT_WARM_UP_WHEN_LOADING = 5000
+
+
+def validate_mode_args(args) -> None:
+    """Reject incoherent combinations of the three Day-3 mode flags.
+
+    - ``--skip_autotune`` requires ``--log_g_init`` (frozen production needs
+      tuned weights to freeze).
+    - ``--warm_up_steps`` must be non-negative.
+    """
+    if getattr(args, "skip_autotune", False) and not getattr(args, "log_g_init", None):
+        raise ValueError("--skip_autotune requires --log_g_init <dir>")
+    warm = int(getattr(args, "warm_up_steps", 0))
+    if warm < 0:
+        raise ValueError("--warm_up_steps must be non-negative")
 
 
 def run_expanded_job_mpi(
@@ -84,10 +105,16 @@ def run_expanded_job_mpi(
     estimator: str,
     lattice: str = DEFAULT_LATTICE,
     comm=None,
+    log_g_init: str | None = None,
+    skip_autotune: bool = False,
+    warm_up_steps: int = 0,
 ) -> dict | None:
     if comm is None:
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
+
+    if skip_autotune and not log_g_init:
+        raise ValueError("skip_autotune requires log_g_init to be provided")
 
     if rank == 0:
         pos = kagome_bond_pos(lattice, nx, ny, a=a)
@@ -124,6 +151,9 @@ def run_expanded_job_mpi(
             "min_steps": int(min_steps),
             "estimator": str(estimator),
             "n_ranks": int(comm.Get_size()),
+            "log_g_init": "" if log_g_init is None else str(log_g_init),
+            "skip_autotune": bool(skip_autotune),
+            "warm_up_steps": int(warm_up_steps),
         }
         geometry_path = _write_geometry_json(
             out_dir / "kp_geometry.json",
@@ -168,6 +198,27 @@ def run_expanded_job_mpi(
         neighbors = [list(map(int, row)) for row in ladder.neighbors]
         target_ensemble = int(ladder.target_ensemble)
 
+        # Resolve per-region log_g if --log_g_init was given.  Rank 0 reads
+        # the file (with sanity checks against this region's mask ladder)
+        # then broadcasts to all ranks.
+        region_log_g = None
+        if log_g_init is not None:
+            if rank == 0:
+                src_path = Path(log_g_init) / f"kp_expanded_{region_name}.h5"
+                expected = np.stack([np.asarray(m, dtype=np.uint8) for m in masks], axis=0)
+                expected_params_check = {
+                    "M": int(M),
+                    "lattice": str(lattice),
+                    "region_name": str(region_name),
+                }
+                region_log_g = load_region_log_g(
+                    src_path, expected_masks=expected,
+                    expected_params=expected_params_check,
+                )
+                print(f"[kp_tee_expanded_mpi] loaded log_g for {region_name} "
+                      f"from {src_path} (n_windows={region_log_g.size})", flush=True)
+            region_log_g = comm.bcast(region_log_g, root=0)
+
         # Drive MPI-distributed auto_tune + production for this region.  We pass
         # filepath=None here and write the HDF5 ourselves so we can attach the
         # region_name / target_ensemble into the params block uniformly.
@@ -192,6 +243,9 @@ def run_expanded_job_mpi(
             reference_ensemble=0,
             filepath=None,
             comm=comm,
+            initial_log_g=region_log_g,
+            skip_autotune=bool(skip_autotune),
+            warm_up_steps=int(warm_up_steps),
             engine_factory=_shared_engine_factory,
             diagnostic_label=str(region_name),
         )
@@ -256,6 +310,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_steps_total", type=int, default=-1,
                         help="total adaptive minimum across ranks")
     parser.add_argument("--estimator", type=str, default="collection")
+    # ----- Day-3 modes: frozen production / resume tune / warm-up -----
+    parser.add_argument(
+        "--log_g_init", type=str, default=None,
+        help="directory containing prior tune outputs (kp_expanded_<REGION>.h5); "
+             "loaded log_g seeds the chain before autotune (resume mode) or "
+             "is used directly with --skip_autotune (frozen production)",
+    )
+    parser.add_argument(
+        "--skip_autotune", action="store_true",
+        help="frozen production: skip autotune entirely; requires --log_g_init",
+    )
+    parser.add_argument(
+        "--warm_up_steps", type=int, default=0,
+        help=f"MC steps before autotune/production to thermalise the chain. "
+             f"Default 0; recommend ~{DEFAULT_WARM_UP_WHEN_LOADING} when "
+             "loading log_g via --log_g_init so the chain leaves the C++ "
+             "constructor's fresh state before measurements begin.",
+    )
     return parser
 
 
@@ -265,6 +337,7 @@ def main():
     n_ranks = comm.Get_size()
     parser = build_parser()
     args = parser.parse_args()
+    validate_mode_args(args)
 
     common = normalize_common_args(args)
     n_steps_resolved = _resolve_total_per_rank(
@@ -315,6 +388,9 @@ def main():
         estimator=args.estimator,
         lattice=args.lattice,
         comm=comm,
+        log_g_init=args.log_g_init,
+        skip_autotune=bool(args.skip_autotune),
+        warm_up_steps=int(args.warm_up_steps),
     )
 
     if rank == 0 and payload is not None:

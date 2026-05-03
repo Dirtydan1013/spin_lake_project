@@ -228,7 +228,10 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
                      filepath=None,
                      comm=None,
                      engine_factory=None,
-                     diagnostic_label: str | None = None):
+                     diagnostic_label: str | None = None,
+                     initial_log_g=None,
+                     skip_autotune: bool = False,
+                     warm_up_steps: int = 0):
     if comm is None:
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -237,6 +240,9 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
         raise ValueError("estimator must be 'histogram' or 'collection'")
     require_histogram = estimator_name == "histogram"
     require_collection = estimator_name == "collection"
+
+    if skip_autotune and initial_log_g is None:
+        raise ValueError("skip_autotune requires initial_log_g to be provided")
 
     if engine_factory is None:
         def engine_factory(local_rank):
@@ -258,15 +264,30 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
     driver = ReweightingDriver(engine=engine)
     driver.set_ensemble_ladder(masks, neighbors, initial_ensemble=initial_ensemble)
 
-    auto_result = _autotune_shared_log_g(
-        driver,
-        n_steps_per_iter=int(autotune_steps_per_iter),
-        max_iters=int(autotune_max_iters),
-        tol=float(autotune_tol),
-        method=autotune_method,
-        damping=float(autotune_damping),
-        comm=comm,
-    )
+    if initial_log_g is not None:
+        driver.set_log_g(np.asarray(initial_log_g, dtype=np.float64))
+
+    if int(warm_up_steps) > 0:
+        driver.warm_up(int(warm_up_steps))
+
+    if skip_autotune:
+        # Frozen production: keep loaded log_g, build a stub AutoTuneResult
+        # so the downstream HDF5 writer + ExpandedMPIResult shape stay valid.
+        auto_result = AutoTuneResult(
+            log_g=driver.log_g,
+            visit_counts=[],
+            collection_counts=None,
+        )
+    else:
+        auto_result = _autotune_shared_log_g(
+            driver,
+            n_steps_per_iter=int(autotune_steps_per_iter),
+            max_iters=int(autotune_max_iters),
+            tol=float(autotune_tol),
+            method=autotune_method,
+            damping=float(autotune_damping),
+            comm=comm,
+        )
 
     if target_s2_err is None:
         if n_steps is None:

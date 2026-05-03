@@ -248,6 +248,27 @@ class ReweightingDriver:
             raise ValueError("log_g is not initialized")
         return self._log_g.copy()
 
+    def warm_up(self, n_steps: int) -> None:
+        """Thermalise the MC chain at the current ``log_g`` without recording stats.
+
+        Use after ``set_log_g`` (e.g. after loading saved weights) to give the
+        chain a chance to leave the engine's fresh-constructor state before
+        autotune or production starts measuring.  All counters are reset both
+        before and after so any subsequent autotune / production run sees a
+        clean slate.  ``log_g`` is preserved.
+        """
+        if not self._masks:
+            raise ValueError("set_ensemble_ladder must be called before warm_up")
+        self.engine.reset_visit_counts_ext()
+        self.engine.reset_transition_counts()
+        self.engine.reset_collection_counts()
+        n = int(n_steps)
+        if n > 0:
+            self.engine.run_steps(n)
+        self.engine.reset_visit_counts_ext()
+        self.engine.reset_transition_counts()
+        self.engine.reset_collection_counts()
+
     def auto_tune(self, *, n_steps_per_iter: int, max_iters: int = 10, tol: float = 0.3,
                   method: str = "visit_count", damping: float = 1.0) -> AutoTuneResult:
         if not self._masks:
