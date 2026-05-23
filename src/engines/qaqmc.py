@@ -132,15 +132,13 @@ class QAQMC_Rydberg:
                  pos: np.ndarray = None, epsilon: float = 0.01, seed: int = 42,
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
                  use_cpp: bool = True, omp_threads: int = 0,
-                 neighbor_cutoff: int = None, precompute: bool = True,
-                 chunk_slices: int = 0, delta_groups: int = 0):
+                 neighbor_cutoff: int = None, delta_groups: int = 600):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
             'verbose': False, 'n_jobs': 1, 'backend': "thread",
             'use_cpp': use_cpp, 'omp_threads': omp_threads,
-            'neighbor_cutoff': neighbor_cutoff, 'precompute': precompute,
-            'chunk_slices': chunk_slices, 'delta_groups': delta_groups,
+            'neighbor_cutoff': neighbor_cutoff, 'delta_groups': delta_groups,
         }
         
         # Set OpenMP threads environment variable before C++ engine usage
@@ -170,8 +168,7 @@ class QAQMC_Rydberg:
             pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
             self._cpp_engine = qaqmc_cpp.QAQMCEngine(
                 N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
-                neighbor_cutoff=nc, precompute=precompute, chunk_slices=chunk_slices,
-                delta_groups=delta_groups
+                neighbor_cutoff=nc, delta_groups=delta_groups
             )
             # Mirror key attributes for compatibility
             self.bond_sites = np.array(self._cpp_engine.bond_sites, dtype=np.int32)
@@ -179,8 +176,8 @@ class QAQMC_Rydberg:
             self.op_sites = np.array(self._cpp_engine.op_sites, dtype=np.int32)
             if verbose:
                 n_bonds = len(self.bond_sites)
-                mode = "precomputed" if precompute else "on-the-fly"
-                print(f"[QAQMC] Using C++ backend (N={N}, M={M}, bonds={n_bonds}, mode={mode})")
+                print(f"[QAQMC] Using C++ backend (N={N}, M={M}, bonds={n_bonds}, "
+                      f"delta_groups={delta_groups})")
             return
 
         # ── Fallback: Python/Numba path ──────────────────────────────────

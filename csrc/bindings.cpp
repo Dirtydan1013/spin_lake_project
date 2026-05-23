@@ -24,7 +24,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
                          py::array_t<double> pos_arr, int neighbor_cutoff,
-                         bool precompute, int chunk_slices, int delta_groups) {
+                         int delta_groups) {
             auto buf = pos_arr.request();
             if (buf.ndim != 2)
                 throw std::runtime_error("pos must be a 2D array (N, dim)");
@@ -32,14 +32,12 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             const double* pos_ptr = static_cast<const double*>(buf.ptr);
             return new QAQMCEngine(N, Omega, delta_min, delta_max, Rb, M,
                                     epsilon, seed, pos_ptr, pos_dim,
-                                    neighbor_cutoff, precompute, chunk_slices,
-                                    delta_groups);
+                                    neighbor_cutoff, delta_groups);
         }),
         py::arg("N"), py::arg("Omega"), py::arg("delta_min"), py::arg("delta_max"),
         py::arg("Rb"), py::arg("M"), py::arg("epsilon"), py::arg("seed"),
         py::arg("pos"), py::arg("neighbor_cutoff") = -1,
-        py::arg("precompute") = true, py::arg("chunk_slices") = 0,
-        py::arg("delta_groups") = 0)
+        py::arg("delta_groups") = 600)
 
         .def("mc_step", &QAQMCEngine::mc_step,
              "Run one diagonal update + cluster update")
@@ -96,6 +94,8 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def_property_readonly("M_total", &QAQMCEngine::get_M_total)
         .def_property_readonly("n_loops",   &QAQMCEngine::get_n_loops)
         .def_property_readonly("n_strings", &QAQMCEngine::get_n_strings)
+        .def_property_readonly("n_loop_size_groups",   &QAQMCEngine::get_n_loop_size_groups)
+        .def_property_readonly("n_string_size_groups", &QAQMCEngine::get_n_string_size_groups)
 
         .def_property_readonly("op_types", [](const QAQMCEngine& self) {
             const auto& v = self.get_op_types();
@@ -184,18 +184,14 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             int n_cml       = total_steps / me_cml;
 
             py::array_t<double> density_out(n_density);
-            py::array_t<double> z_l_out(n_zl);
-            py::array_t<double> c_m_l_out(n_cml);
             auto d_buf = density_out.mutable_unchecked<1>();
-            auto z_buf = z_l_out.mutable_unchecked<1>();
-            auto c_buf = c_m_l_out.mutable_unchecked<1>();
 
-            int n_loops   = self.get_n_loops();
-            int n_strings = self.get_n_strings();
+            int n_zg = self.get_n_loop_size_groups();
+            int n_cg = self.get_n_string_size_groups();
 
-            // Reallocate output arrays with per-copy second dimension
-            py::array_t<double> z_l_out2({n_zl,  n_loops});
-            py::array_t<double> c_m_l_out2({n_cml, n_strings});
+            // Output arrays: second dim = size group (mean over copies done in C++)
+            py::array_t<double> z_l_out2({n_zl,  n_zg});
+            py::array_t<double> c_m_l_out2({n_cml, n_cg});
             auto z_buf2 = z_l_out2.mutable_unchecked<2>();
             auto c_buf2 = c_m_l_out2.mutable_unchecked<2>();
 
@@ -210,13 +206,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                     auto obs = self.measure_at_midpoint();
                     if (step % me_density == 0) d_buf(idx_d++) = obs.density;
                     if (step % me_zl == 0) {
-                        for (int k = 0; k < n_loops; ++k)
-                            z_buf2(idx_z, k) = obs.Z_l_copies[k];
+                        for (int g = 0; g < n_zg; ++g)
+                            z_buf2(idx_z, g) = obs.Z_l_by_size[g];
                         ++idx_z;
                     }
                     if (step % me_cml == 0) {
-                        for (int k = 0; k < n_strings; ++k)
-                            c_buf2(idx_c, k) = obs.C_m_l_copies[k];
+                        for (int g = 0; g < n_cg; ++g)
+                            c_buf2(idx_c, g) = obs.C_m_l_by_size[g];
                         ++idx_c;
                     }
                 }
@@ -230,8 +226,8 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
             py::dict result;
             result["density"] = density_out;
-            result["Z_l"]     = z_l_out2;   // (n_zl, n_loops)
-            result["C_m_l"]   = c_m_l_out2; // (n_cml, n_strings)
+            result["Z_l"]     = z_l_out2;   // (n_zl,  n_loop_size_groups)
+            result["C_m_l"]   = c_m_l_out2; // (n_cml, n_string_size_groups)
             return result;
         },
         py::arg("n_equil"), py::arg("n_samples"),
@@ -242,8 +238,8 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         py::arg("progress_every") = 1000,
         "On-the-fly symmetry-point sampling with per-observable measure intervals.\n"
         "n_samples refers to the finest (smallest) interval. Others get proportionally fewer.\n"
-        "Returns dict: density (n_density,), Z_l (n_zl, n_loops), C_m_l (n_cml, n_strings).\n"
-        "To compute |<Z(l)>|: np.abs(arr.mean(axis=0)).mean() — mean per copy, then |·|, then avg.")
+        "Returns dict: density (n_density,), Z_l (n_zl, n_loop_size_groups), C_m_l (n_cml, n_string_size_groups).\n"
+        "Z_l / C_m_l are mean over copies within each size group (signed; no |·|).")
 
         .def("run_profile", [](QAQMCEngine& self, int n_equil, int n_samples,
                                int me_density, int me_zl, int me_cml,
@@ -266,12 +262,12 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
             int M_total   = self.get_M_total();
             int n_points  = M_total / profile_step;
-            int n_loops   = self.get_n_loops();
-            int n_strings = self.get_n_strings();
+            int n_zg      = self.get_n_loop_size_groups();
+            int n_cg      = self.get_n_string_size_groups();
             int min_me    = std::min({me_density, me_zl, me_cml});
 
             // n_samples is defined for the finest observable.
-            // We group samples into batches; each batch stores the mean per copy per point.
+            // We group samples into batches; each batch stores the mean per size group per point.
             int total_steps = n_samples * min_me;
             int n_density   = total_steps / me_density;  // total density samples
             int n_batches_z = (total_steps / me_zl)  / batch_size;
@@ -283,15 +279,15 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             py::array_t<double> density_out({n_density, n_points});
             auto d_buf = density_out.mutable_unchecked<2>();
 
-            // Z_l, C_m_l: batched per-copy  (n_batches, n_points, n_copies)
-            py::array_t<double> z_l_out  ({n_batches_z, n_points, n_loops});
-            py::array_t<double> c_m_l_out({n_batches_c, n_points, n_strings});
+            // Z_l, C_m_l: batched per size group (n_batches, n_points, n_size_groups)
+            py::array_t<double> z_l_out  ({n_batches_z, n_points, n_zg});
+            py::array_t<double> c_m_l_out({n_batches_c, n_points, n_cg});
             auto z_buf = z_l_out.mutable_unchecked<3>();
             auto c_buf = c_m_l_out.mutable_unchecked<3>();
 
-            // Initialize batch accumulators
-            std::vector<std::vector<double>> z_acc(n_loops,   std::vector<double>(n_points, 0.0));
-            std::vector<std::vector<double>> c_acc(n_strings, std::vector<double>(n_points, 0.0));
+            // Batch accumulators: [n_groups][n_points]
+            std::vector<std::vector<double>> z_acc(n_zg, std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> c_acc(n_cg, std::vector<double>(n_points, 0.0));
             int idx_d = 0;
             int z_in_batch = 0, c_in_batch = 0;
             int batch_z = 0, batch_c = 0;
@@ -310,32 +306,32 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                         ++idx_d;
                     }
                     if (need_z) {
-                        for (int k = 0; k < n_loops; ++k)
+                        for (int g = 0; g < n_zg; ++g)
                             for (int pt = 0; pt < n_points; ++pt)
-                                z_acc[k][pt] += prof.Z_l_copies[k][pt];
+                                z_acc[g][pt] += prof.Z_l_by_size[g][pt];
                         ++z_in_batch;
                         if (z_in_batch >= batch_size && batch_z < n_batches_z) {
                             double inv = 1.0 / z_in_batch;
-                            for (int k = 0; k < n_loops; ++k)
+                            for (int g = 0; g < n_zg; ++g)
                                 for (int pt = 0; pt < n_points; ++pt) {
-                                    z_buf(batch_z, pt, k) = z_acc[k][pt] * inv;
-                                    z_acc[k][pt] = 0.0;
+                                    z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
+                                    z_acc[g][pt] = 0.0;
                                 }
                             ++batch_z;
                             z_in_batch = 0;
                         }
                     }
                     if (need_c) {
-                        for (int k = 0; k < n_strings; ++k)
+                        for (int g = 0; g < n_cg; ++g)
                             for (int pt = 0; pt < n_points; ++pt)
-                                c_acc[k][pt] += prof.C_m_l_copies[k][pt];
+                                c_acc[g][pt] += prof.C_m_l_by_size[g][pt];
                         ++c_in_batch;
                         if (c_in_batch >= batch_size && batch_c < n_batches_c) {
                             double inv = 1.0 / c_in_batch;
-                            for (int k = 0; k < n_strings; ++k)
+                            for (int g = 0; g < n_cg; ++g)
                                 for (int pt = 0; pt < n_points; ++pt) {
-                                    c_buf(batch_c, pt, k) = c_acc[k][pt] * inv;
-                                    c_acc[k][pt] = 0.0;
+                                    c_buf(batch_c, pt, g) = c_acc[g][pt] * inv;
+                                    c_acc[g][pt] = 0.0;
                                 }
                             ++batch_c;
                             c_in_batch = 0;
@@ -352,15 +348,15 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             // Flush remaining partial batch
             if (z_in_batch > 0 && batch_z < n_batches_z) {
                 double inv = 1.0 / z_in_batch;
-                for (int k = 0; k < n_loops; ++k)
+                for (int g = 0; g < n_zg; ++g)
                     for (int pt = 0; pt < n_points; ++pt)
-                        z_buf(batch_z, pt, k) = z_acc[k][pt] * inv;
+                        z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
             }
             if (c_in_batch > 0 && batch_c < n_batches_c) {
                 double inv = 1.0 / c_in_batch;
-                for (int k = 0; k < n_strings; ++k)
+                for (int g = 0; g < n_cg; ++g)
                     for (int pt = 0; pt < n_points; ++pt)
-                        c_buf(batch_c, pt, k) = c_acc[k][pt] * inv;
+                        c_buf(batch_c, pt, g) = c_acc[g][pt] * inv;
             }
 
             // p-index array
@@ -371,8 +367,8 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
             py::dict result;
             result["density"]    = density_out;  // (n_density, n_points)
-            result["Z_l"]        = z_l_out;       // (n_batches_z, n_points, n_loops)
-            result["C_m_l"]      = c_m_l_out;     // (n_batches_c, n_points, n_strings)
+            result["Z_l"]        = z_l_out;       // (n_batches_z, n_points, n_loop_size_groups)
+            result["C_m_l"]      = c_m_l_out;     // (n_batches_c, n_points, n_string_size_groups)
             result["p_indices"]  = p_indices;
             result["batch_size"] = py::int_(batch_size);
             return result;
@@ -385,11 +381,10 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         py::arg("batch_size")    = 1000,
         py::arg("progress_callback") = py::none(),
         py::arg("progress_every") = 1000,
-        "Asymmetric profile with batched per-copy storage.\n"
+        "Asymmetric profile with batched per-size-group storage.\n"
         "density: (n_density, n_points) per-sample.\n"
-        "Z_l:     (n_batches, n_points, n_loops)   — batch means of per-copy signed products.\n"
-        "C_m_l:   (n_batches, n_points, n_strings) — batch means of per-copy signed products.\n"
-        "To get |<Z(l)>|(δ): np.abs(arr.mean(axis=0)).mean(axis=-1)  [mean over batches, then |·|, then avg copies].")
+        "Z_l:     (n_batches, n_points, n_loop_size_groups)   — batch means of size-group means (signed).\n"
+        "C_m_l:   (n_batches, n_points, n_string_size_groups) — batch means of size-group means (signed).")
 
         // Profiling
         .def_property_readonly("time_diag", &QAQMCEngine::get_time_diag)

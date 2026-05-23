@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cassert>
 #include <sstream>
+#include <stdexcept>
 
 // ─── Helper: uniform random [0, 1) ──────────────────────────────────────────
 static inline double uniform01(std::mt19937_64& rng) {
@@ -221,14 +222,17 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
 QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
                           double Rb, int M, double epsilon, uint64_t seed,
                           const double* pos, int pos_dim,
-                          int neighbor_cutoff, bool precompute,
-                          int chunk_slices, int delta_groups)
+                          int neighbor_cutoff, int delta_groups)
     : N_(N), M_(M), M_total_(2 * M),
       Omega_(Omega), Rb_(Rb), delta_min_(delta_min), delta_max_(delta_max),
-      epsilon_(epsilon), precompute_(precompute), chunk_slices_(chunk_slices),
-      delta_groups_(delta_groups),
+      epsilon_(epsilon), delta_groups_(delta_groups),
       rng_(seed)
 {
+    if (delta_groups_ <= 0) {
+        throw std::invalid_argument(
+            "QAQMCEngine: delta_groups must be > 0 (the engine only supports the grouped "
+            "alias-table path; the legacy precompute/chunk/on-the-fly modes were removed).");
+    }
     site_W_ = Omega / 2.0;
     site_W_max_ = Omega / 2.0;
 
@@ -244,24 +248,8 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
         delta_sched_[p] = delta_max - (delta_max - delta_min) * ((double)(p - M_) / M_);
     }
 
-    // Build alias tables:
-    // - precompute && chunk_slices==0: full precompute (original)
-    // - precompute && chunk_slices>0:  chunked, built on demand in diagonal_update
-    // - !precompute:                   on-the-fly (no table)
-    if (precompute_ && chunk_slices_ <= 0 && delta_groups_ == 0) {
-        alias_ = build_qaqmc_alias_tables(M_total_, N_, vij_.n_bonds, Omega_,
-                                           delta_sched_.data(), vij_.vij_list.data(),
-                                           vij_.bonds_i.data(), vij_.bonds_j.data(),
-                                           vij_.coord_number.data(),
-                                           epsilon);
-    } else {
-        // Minimal init for alias_ so accessors don't crash
-        alias_.n_bonds_pad = std::max(vij_.n_bonds, 1);
-        alias_.max_alias = N_ + vij_.n_bonds;
-    }
-
-    // Build grouped alias tables if delta_groups > 0
-    if (delta_groups_ > 0) {
+    // Build grouped alias tables
+    {
         int G = delta_groups_;
         int n_bonds = vij_.n_bonds;
         int n_bonds_pad = std::max(n_bonds, 1);
@@ -424,6 +412,30 @@ void QAQMCEngine::set_observable_sites(
         const std::vector<std::vector<int>>& string_sets) {
     loop_site_sets_ = loop_sets;
     string_site_sets_ = string_sets;
+
+    auto build_groups = [](const std::vector<std::vector<int>>& sets,
+                           std::vector<int>& group_of,
+                           std::vector<int>& group_n_copies) {
+        group_of.assign(sets.size(), 0);
+        group_n_copies.clear();
+        std::vector<size_t> size_at_group; // set length identifying each group, in order
+        for (size_t k = 0; k < sets.size(); ++k) {
+            size_t sz = sets[k].size();
+            int g = -1;
+            for (size_t i = 0; i < size_at_group.size(); ++i) {
+                if (size_at_group[i] == sz) { g = (int)i; break; }
+            }
+            if (g < 0) {
+                g = (int)size_at_group.size();
+                size_at_group.push_back(sz);
+                group_n_copies.push_back(0);
+            }
+            group_of[k] = g;
+            group_n_copies[g] += 1;
+        }
+    };
+    build_groups(loop_site_sets_,   loop_group_of_,   loop_group_n_copies_);
+    build_groups(string_site_sets_, string_group_of_, string_group_n_copies_);
 }
 
 void QAQMCEngine::set_bulk_sites(const std::vector<int>& bulk_sites) {
@@ -444,20 +456,30 @@ QAQMCEngine::MidpointObservables QAQMCEngine::measure_at_midpoint() const {
         obs.density = (double)total / N_;
     }
 
-    // Z(l): per-copy signed products — do NOT pre-average; caller averages then |·|
-    obs.Z_l_copies.resize(loop_site_sets_.size());
+    // Z(l): mean over copies within each size group (signed, no |·|).
+    const int n_zg = (int)loop_group_n_copies_.size();
+    obs.Z_l_by_size.assign(n_zg, 0.0);
     for (size_t k = 0; k < loop_site_sets_.size(); ++k) {
         double prod = 1.0;
         for (int s : loop_site_sets_[k]) prod *= (1 - 2 * state_at_M_[s]);
-        obs.Z_l_copies[k] = prod;
+        obs.Z_l_by_size[loop_group_of_[k]] += prod;
+    }
+    for (int g = 0; g < n_zg; ++g) {
+        if (loop_group_n_copies_[g] > 0)
+            obs.Z_l_by_size[g] /= (double)loop_group_n_copies_[g];
     }
 
-    // C_m(l): per-copy signed products
-    obs.C_m_l_copies.resize(string_site_sets_.size());
+    // C_m(l): mean over copies within each size group.
+    const int n_cg = (int)string_group_n_copies_.size();
+    obs.C_m_l_by_size.assign(n_cg, 0.0);
     for (size_t k = 0; k < string_site_sets_.size(); ++k) {
         double prod = 1.0;
         for (int s : string_site_sets_[k]) prod *= (1 - 2 * state_at_M_[s]);
-        obs.C_m_l_copies[k] = prod;
+        obs.C_m_l_by_size[string_group_of_[k]] += prod;
+    }
+    for (int g = 0; g < n_cg; ++g) {
+        if (string_group_n_copies_[g] > 0)
+            obs.C_m_l_by_size[g] /= (double)string_group_n_copies_[g];
     }
 
     return obs;
@@ -472,10 +494,10 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
     ProfileObservables prof;
     prof.n_points = n_points;
     prof.density.resize(n_points, 0.0);
-    prof.Z_l_copies.assign(loop_site_sets_.size(),
-                           std::vector<double>(n_points, 0.0));
-    prof.C_m_l_copies.assign(string_site_sets_.size(),
-                             std::vector<double>(n_points, 0.0));
+    const int n_zg = (int)loop_group_n_copies_.size();
+    const int n_cg = (int)string_group_n_copies_.size();
+    prof.Z_l_by_size.assign(n_zg,   std::vector<double>(n_points, 0.0));
+    prof.C_m_l_by_size.assign(n_cg, std::vector<double>(n_points, 0.0));
 
     // Propagate state from left boundary |0...0>
     std::vector<int32_t> state(N_, 0);
@@ -497,18 +519,26 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
                 prof.density[out_idx] = s / N_;
             }
 
-            // Z_l: per-copy signed products
+            // Z_l: mean over copies per size group (signed, no |·|)
             for (size_t k = 0; k < loop_site_sets_.size(); ++k) {
                 double prod = 1.0;
                 for (int s : loop_site_sets_[k]) prod *= (1 - 2 * state[s]);
-                prof.Z_l_copies[k][out_idx] = prod;
+                prof.Z_l_by_size[loop_group_of_[k]][out_idx] += prod;
+            }
+            for (int g = 0; g < n_zg; ++g) {
+                if (loop_group_n_copies_[g] > 0)
+                    prof.Z_l_by_size[g][out_idx] /= (double)loop_group_n_copies_[g];
             }
 
-            // C_m_l: per-copy signed products
+            // C_m_l: mean over copies per size group
             for (size_t k = 0; k < string_site_sets_.size(); ++k) {
                 double prod = 1.0;
                 for (int s : string_site_sets_[k]) prod *= (1 - 2 * state[s]);
-                prof.C_m_l_copies[k][out_idx] = prod;
+                prof.C_m_l_by_size[string_group_of_[k]][out_idx] += prod;
+            }
+            for (int g = 0; g < n_cg; ++g) {
+                if (string_group_n_copies_[g] > 0)
+                    prof.C_m_l_by_size[g][out_idx] /= (double)string_group_n_copies_[g];
             }
 
             ++out_idx;
@@ -523,227 +553,60 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
 void QAQMCEngine::diagonal_update() {
     std::vector<int32_t> state(N_, 0); // boundary |0...0>
     const int* bond_sites = vij_.bond_sites_flat.data();
-    int n_bonds = vij_.n_bonds;
 
-    if (delta_groups_ > 0) {
-        // ── Grouped alias table path ──
-        // Use shared alias table per group for proposal, real delta for rejection.
-        int max_alias = grp_alias_.max_alias;
-        int n_bonds_pad = grp_alias_.n_bonds_pad;
+    // Grouped alias table path: shared per-group alias table for proposal,
+    // real per-slice delta for rejection against the group envelope.
+    int max_alias = grp_alias_.max_alias;
+    int n_bonds_pad = grp_alias_.n_bonds_pad;
 
-        for (int p = 0; p < M_total_; ++p) {
-            // Capture state at symmetry point
-            if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
+    for (int p = 0; p < M_total_; ++p) {
+        // Capture state at symmetry point
+        if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
 
-            int ot = op_types_[p];
-            if (ot == -1) {
-                state[op_sites_[p]] ^= 1;
-            } else if (ot == 1 || ot == 2) {
-                int g = grp_alias_.slice_to_group[p];
-                int n_alias_g = grp_alias_.n_alias_all[g];
+        int ot = op_types_[p];
+        if (ot == -1) {
+            state[op_sites_[p]] ^= 1;
+        } else if (ot == 1 || ot == 2) {
+            int g = grp_alias_.slice_to_group[p];
+            int n_alias_g = grp_alias_.n_alias_all[g];
 
-                bool inserted = false;
-                while (!inserted) {
-                    int i = randint(rng_, n_alias_g);
-                    int idx;
-                    if (uniform01(rng_) < grp_alias_.alias_prob_all[g * max_alias + i])
-                        idx = i;
-                    else
-                        idx = (int)grp_alias_.alias_idx_all[g * max_alias + i];
+            bool inserted = false;
+            while (!inserted) {
+                int i = randint(rng_, n_alias_g);
+                int idx;
+                if (uniform01(rng_) < grp_alias_.alias_prob_all[g * max_alias + i])
+                    idx = i;
+                else
+                    idx = (int)grp_alias_.alias_idx_all[g * max_alias + i];
 
-                    int kind = grp_alias_.op_map_kind_all[g * max_alias + idx];
-                    int loc  = grp_alias_.op_map_loc_all[g * max_alias + idx];
+                int kind = grp_alias_.op_map_kind_all[g * max_alias + idx];
+                int loc  = grp_alias_.op_map_loc_all[g * max_alias + idx];
 
-                    if (kind == 0) {
-                        // Site op: always accept
-                        op_types_[p] = 1;
-                        op_sites_[p] = loc;
-                        inserted = true;
-                    } else {
-                        // Bond op: rejection with real per-slice weights
-                        int b = loc;
-                        int si = bond_sites[b * 2 + 0];
-                        int sj = bond_sites[b * 2 + 1];
-                        int w_idx = state[si] * 2 + state[sj];
-
-                        // Compute actual weight for this slice's delta
-                        double delta = delta_sched_[p];
-                        double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
-                        double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
-                        double W[4], wmax_actual;
-                        compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax_actual);
-
-                        // Reject against group envelope W_max
-                        double w_max_env = grp_alias_.bond_W_max_all[g * n_bonds_pad + b];
-                        if (w_max_env > 0.0 && uniform01(rng_) < W[w_idx] / w_max_env) {
-                            op_types_[p] = 2;
-                            op_sites_[p] = b;
-                            inserted = true;
-                        }
-                    }
-                }
-            }
-        }
-    } else if (precompute_ && chunk_slices_ <= 0) {
-        // ── Full precomputed alias table path (original) ──
-        int n_bonds_pad = alias_.n_bonds_pad;
-        int max_alias = alias_.max_alias;
-
-        for (int p = 0; p < M_total_; ++p) {
-            if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
-
-            int ot = op_types_[p];
-            if (ot == -1) {
-                state[op_sites_[p]] ^= 1;
-            } else if (ot == 1 || ot == 2) {
-                bool inserted = false;
-                while (!inserted) {
-                    int n_alias_p = alias_.n_alias_all[p];
-                    int i = randint(rng_, n_alias_p);
-                    int idx;
-                    if (uniform01(rng_) < alias_.alias_prob_all[p * max_alias + i])
-                        idx = i;
-                    else
-                        idx = (int)alias_.alias_idx_all[p * max_alias + i];
-
-                    int kind = alias_.op_map_kind_all[p * max_alias + idx];
-                    int loc  = alias_.op_map_loc_all[p * max_alias + idx];
-
-                    if (kind == 0) {
-                        op_types_[p] = 1;
-                        op_sites_[p] = loc;
-                        inserted = true;
-                    } else {
-                        int b = loc;
-                        int si = bond_sites[b * 2 + 0];
-                        int sj = bond_sites[b * 2 + 1];
-                        int w_idx = state[si] * 2 + state[sj];
-                        double w_actual = alias_.bond_W_all[(p * n_bonds_pad + b) * 4 + w_idx];
-                        double w_max = alias_.bond_W_max_all[p * n_bonds_pad + b];
-                        if (w_max > 0.0 && uniform01(rng_) < w_actual / w_max) {
-                            op_types_[p] = 2;
-                            op_sites_[p] = b;
-                            inserted = true;
-                        }
-                    }
-                }
-            }
-        }
-    } else if (precompute_ && chunk_slices_ > 0) {
-        // ── Chunked precompute path ──
-        // Build alias tables for each chunk, use them, then free.
-        for (int chunk_start = 0; chunk_start < M_total_; chunk_start += chunk_slices_) {
-            int chunk_end = std::min(chunk_start + chunk_slices_, M_total_);
-
-            // Build alias table for this chunk only
-            AliasTable chunk_alias = build_qaqmc_alias_tables(
-                M_total_, N_, n_bonds, Omega_,
-                delta_sched_.data(), vij_.vij_list.data(),
-                vij_.bonds_i.data(), vij_.bonds_j.data(),
-                vij_.coord_number.data(), epsilon_,
-                chunk_start, chunk_end);
-
-            int n_bonds_pad = chunk_alias.n_bonds_pad;
-            int max_alias = chunk_alias.max_alias;
-
-            for (int p = chunk_start; p < chunk_end; ++p) {
-                if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
-
-                int pi = p - chunk_start;  // local index into chunk_alias
-                int ot = op_types_[p];
-                if (ot == -1) {
-                    state[op_sites_[p]] ^= 1;
-                } else if (ot == 1 || ot == 2) {
-                    bool inserted = false;
-                    while (!inserted) {
-                        int n_alias_p = chunk_alias.n_alias_all[pi];
-                        int i = randint(rng_, n_alias_p);
-                        int idx;
-                        if (uniform01(rng_) < chunk_alias.alias_prob_all[pi * max_alias + i])
-                            idx = i;
-                        else
-                            idx = (int)chunk_alias.alias_idx_all[pi * max_alias + i];
-
-                        int kind = chunk_alias.op_map_kind_all[pi * max_alias + idx];
-                        int loc  = chunk_alias.op_map_loc_all[pi * max_alias + idx];
-
-                        if (kind == 0) {
-                            op_types_[p] = 1;
-                            op_sites_[p] = loc;
-                            inserted = true;
-                        } else {
-                            int b = loc;
-                            int si = bond_sites[b * 2 + 0];
-                            int sj = bond_sites[b * 2 + 1];
-                            int w_idx = state[si] * 2 + state[sj];
-                            double w_actual = chunk_alias.bond_W_all[(pi * n_bonds_pad + b) * 4 + w_idx];
-                            double w_max = chunk_alias.bond_W_max_all[pi * n_bonds_pad + b];
-                            if (w_max > 0.0 && uniform01(rng_) < w_actual / w_max) {
-                                op_types_[p] = 2;
-                                op_sites_[p] = b;
-                                inserted = true;
-                            }
-                        }
-                    }
-                }
-            }
-            // chunk_alias goes out of scope here → memory freed
-        }
-    } else {
-        // ── On-the-fly path (no precomputed tables) ──
-        std::vector<double> cum_weights(N_ + n_bonds);
-
-        for (int p = 0; p < M_total_; ++p) {
-            if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
-
-            int ot = op_types_[p];
-            if (ot == -1) {
-                state[op_sites_[p]] ^= 1;
-            } else if (ot == 1 || ot == 2) {
-                double delta = delta_sched_[p];
-
-                // Build cumulative weight array for this time slice
-                double running = 0.0;
-                for (int i = 0; i < N_; ++i) {
-                    running += site_W_;
-                    cum_weights[i] = running;
-                }
-                for (int b = 0; b < n_bonds; ++b) {
+                if (kind == 0) {
+                    // Site op: always accept
+                    op_types_[p] = 1;
+                    op_sites_[p] = loc;
+                    inserted = true;
+                } else {
+                    // Bond op: rejection with real per-slice weights
+                    int b = loc;
                     int si = bond_sites[b * 2 + 0];
                     int sj = bond_sites[b * 2 + 1];
+                    int w_idx = state[si] * 2 + state[sj];
+
+                    // Compute actual weight for this slice's delta
+                    double delta = delta_sched_[p];
                     double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
                     double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
-                    double W[4], wmax;
-                    compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
-                    running += wmax;
-                    cum_weights[N_ + b] = running;
-                }
-                double total_weight = running;
+                    double W[4], wmax_actual;
+                    compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax_actual);
 
-                bool inserted = false;
-                while (!inserted) {
-                    double r = uniform01(rng_) * total_weight;
-                    int idx = (int)(std::lower_bound(cum_weights.begin(),
-                                                     cum_weights.begin() + N_ + n_bonds, r)
-                                    - cum_weights.begin());
-                    if (idx < N_) {
-                        op_types_[p] = 1;
-                        op_sites_[p] = idx;
+                    // Reject against group envelope W_max
+                    double w_max_env = grp_alias_.bond_W_max_all[g * n_bonds_pad + b];
+                    if (w_max_env > 0.0 && uniform01(rng_) < W[w_idx] / w_max_env) {
+                        op_types_[p] = 2;
+                        op_sites_[p] = b;
                         inserted = true;
-                    } else {
-                        int b = idx - N_;
-                        int si = bond_sites[b * 2 + 0];
-                        int sj = bond_sites[b * 2 + 1];
-                        int w_idx = state[si] * 2 + state[sj];
-                        double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
-                        double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
-                        double W[4], wmax;
-                        compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
-                        if (wmax > 0.0 && uniform01(rng_) < W[w_idx] / wmax) {
-                            op_types_[p] = 2;
-                            op_sites_[p] = b;
-                            inserted = true;
-                        }
                     }
                 }
             }
@@ -852,14 +715,7 @@ void QAQMCEngine::cluster_update() {
             int ni = w_idx >> 1, nj = w_idx & 1;
 
             double w_old, w_new;
-            if (precompute_ && chunk_slices_ <= 0 && delta_groups_ == 0) {
-                int n_bonds_pad = alias_.n_bonds_pad;
-                w_old = alias_.bond_W_all[(p * n_bonds_pad + b) * 4 + w_idx];
-                if (si == site_i)
-                    w_new = alias_.bond_W_all[(p * n_bonds_pad + b) * 4 + (1 - ni) * 2 + nj];
-                else
-                    w_new = alias_.bond_W_all[(p * n_bonds_pad + b) * 4 + ni * 2 + (1 - nj)];
-            } else {
+            {
                 double delta = delta_sched_[p];
                 double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
                 double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;

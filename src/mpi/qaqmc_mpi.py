@@ -69,7 +69,7 @@ def _make_tqdm_callback(total, desc):
 def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             pos=None, epsilon=0.01, seed=42, n_equil=5000, n_samples=10000,
             measure_every=1, filepath='data/qaqmc_mpi.h5', neighbor_cutoff=None,
-            precompute=True, chunk_slices=0, delta_groups=0, omp_threads=0,
+            delta_groups=600, omp_threads=0,
             compression='gzip', compression_opts=4,
             checkpoint_every=0, verbose=True):
     """
@@ -89,8 +89,8 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         Useful to reduce autocorrelation at the cost of fewer samples per wall time.
     filepath:
         Output HDF5 path (written by rank 0)
-    neighbor_cutoff, precompute, chunk_slices, omp_threads:
-        Engine options passed to QAQMC_Rydberg
+    neighbor_cutoff, delta_groups, omp_threads:
+        Engine options passed to QAQMC_Rydberg (delta_groups must be > 0)
     compression, compression_opts:
         HDF5 compression settings
     checkpoint_every:
@@ -127,8 +127,7 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         delta_min=delta_min, delta_max=delta_max,
         pos=pos, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
-        neighbor_cutoff=neighbor_cutoff, precompute=precompute,
-        chunk_slices=chunk_slices, delta_groups=delta_groups,
+        neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
     )
 
     M2 = engine.M_total
@@ -278,8 +277,8 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                      pos=None, epsilon=0.01, seed=42, n_equil=5000, n_samples=10000,
                      measure_every=1, filepath='data/qaqmc_onthefly.h5',
-                     neighbor_cutoff=None, precompute=True, chunk_slices=0,
-                     delta_groups=0, omp_threads=0, nx=6, ny=6,
+                     neighbor_cutoff=None, delta_groups=600, omp_threads=0,
+                     nx=6, ny=6,
                      loop_sizes=(3,), string_sizes=(2,), verbose=True):
     """
     MPI-parallel QAQMC with on-the-fly observable computation.
@@ -326,8 +325,7 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         delta_min=delta_min, delta_max=delta_max,
         pos=pos, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
-        neighbor_cutoff=neighbor_cutoff, precompute=precompute,
-        chunk_slices=chunk_slices, delta_groups=delta_groups,
+        neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
     )
 
     if engine._cpp_engine is None:
@@ -393,11 +391,12 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         sa_bar.close()
 
     my_density = np.ascontiguousarray(result['density'], dtype=np.float64)
-    # Z_l / C_m_l now (n_zl, n_loops) and (n_cml, n_strings)
+    # Z_l / C_m_l now (n_zl, n_loop_size_groups) and (n_cml, n_string_size_groups):
+    # C++ already averaged over copies within each size group (signed, no |·|).
     my_z_l   = np.ascontiguousarray(result['Z_l'],   dtype=np.float64)
     my_c_m_l = np.ascontiguousarray(result['C_m_l'], dtype=np.float64)
-    n_loops   = my_z_l.shape[1]   if my_z_l.ndim   == 2 else 1
-    n_strings = my_c_m_l.shape[1] if my_c_m_l.ndim == 2 else 1
+    n_loop_sg   = my_z_l.shape[1]   if my_z_l.ndim   == 2 else 1
+    n_string_sg = my_c_m_l.shape[1] if my_c_m_l.ndim == 2 else 1
 
     t_sample = time.perf_counter() - t0
     comm.Barrier()
@@ -434,18 +433,18 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     if rank == 0:
         os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
 
-        all_density = np.empty(n_total_d,              dtype=np.float64)
-        all_z_l     = np.empty((n_total_z, n_loops),   dtype=np.float64)
-        all_c_m_l   = np.empty((n_total_c, n_strings), dtype=np.float64)
+        all_density = np.empty(n_total_d,                  dtype=np.float64)
+        all_z_l     = np.empty((n_total_z, n_loop_sg),     dtype=np.float64)
+        all_c_m_l   = np.empty((n_total_c, n_string_sg),   dtype=np.float64)
 
         all_density[off_d[0]:off_d[0] + counts_d[0]] = my_density
         all_z_l    [off_z[0]:off_z[0] + counts_z[0]] = my_z_l
         all_c_m_l  [off_c[0]:off_c[0] + counts_c[0]] = my_c_m_l
 
         for src in range(1, n_ranks):
-            buf_d = np.empty(counts_d[src],              dtype=np.float64)
-            buf_z = np.empty((counts_z[src], n_loops),   dtype=np.float64)
-            buf_c = np.empty((counts_c[src], n_strings), dtype=np.float64)
+            buf_d = np.empty(counts_d[src],                  dtype=np.float64)
+            buf_z = np.empty((counts_z[src], n_loop_sg),     dtype=np.float64)
+            buf_c = np.empty((counts_c[src], n_string_sg),   dtype=np.float64)
             comm.Recv(buf_d, source=src, tag=300 + src)
             comm.Recv(buf_z, source=src, tag=400 + src)
             comm.Recv(buf_c, source=src, tag=500 + src)
@@ -486,8 +485,8 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
             og = f.create_group('observables')
             og.create_dataset('density', data=all_density)
-            # Z_l / C_m_l: (n_total, n_copies) — per-copy signed products
-            # |<Z(l)>| = np.abs(all_z_l.mean(axis=0)).mean()
+            # Z_l / C_m_l: (n_total, n_size_groups) — signed mean over copies within each size group.
+            # <Z(l)>_size = all_z_l[:, size_index].mean(axis=0)
             og.create_dataset('Z_l',   data=all_z_l)
             og.create_dataset('C_m_l', data=all_c_m_l)
 
@@ -496,13 +495,16 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 lg.create_dataset(f'loop_{idx}', data=np.array(lp, dtype=np.int32))
             for idx, st in enumerate(string_sets):
                 lg.create_dataset(f'string_{idx}', data=np.array(st, dtype=np.int32))
-            # Size metadata for slicing Z_l/C_m_l by size in post-processing
+            # Size metadata: loop_size{s}_index maps the logical loop_size to its
+            # column index in Z_l (C++ groups by first-occurrence of set length,
+            # which matches loop_meta order). _n_copies is diagnostic (count of
+            # copies averaged into the group).
             mg = f.create_group('size_meta')
-            for m in loop_meta:
-                mg.attrs[f'loop_size{m["size"]}_offset']   = m['offset']
+            for i, m in enumerate(loop_meta):
+                mg.attrs[f'loop_size{m["size"]}_index']    = i
                 mg.attrs[f'loop_size{m["size"]}_n_copies'] = m['n_copies']
-            for m in string_meta:
-                mg.attrs[f'string_size{m["size"]}_offset']   = m['offset']
+            for i, m in enumerate(string_meta):
+                mg.attrs[f'string_size{m["size"]}_index']    = i
                 mg.attrs[f'string_size{m["size"]}_n_copies'] = m['n_copies']
 
         if verbose:
@@ -520,9 +522,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     pos=None, epsilon=0.01, seed=42, n_equil=0, n_samples=1000,
                     measure_every=1, profile_step=10000, batch_size=1000,
                     filepath='data/qaqmc_profile.h5',
-                    neighbor_cutoff=None, precompute=True, chunk_slices=0,
+                    neighbor_cutoff=None,
                     loop_sizes=(3,), string_sizes=(2,),
-                    delta_groups=0, omp_threads=0, nx=6, ny=6, verbose=True):
+                    delta_groups=600, omp_threads=0, nx=6, ny=6, verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
 
@@ -569,8 +571,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         delta_min=delta_min, delta_max=delta_max,
         pos=pos, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
-        neighbor_cutoff=neighbor_cutoff, precompute=precompute,
-        chunk_slices=chunk_slices, delta_groups=delta_groups,
+        neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
     )
 
     if engine._cpp_engine is None:
@@ -639,20 +640,30 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         sa_bar.close()
 
     # density: (n_density_rank, n_points)
-    # Z_l:     (n_batches_z_rank, n_points, n_loops+n_vertex) — batch means of per-copy values
-    # C_m_l:   (n_batches_c_rank, n_points, n_strings)
+    # Z_l:     (n_batches_z_rank, n_points, n_loop_size_groups + 1)
+    #          last group = A_v vertices (set length 4, distinct from loop set lengths
+    #          so it always forms its own trailing size group).
+    # C_m_l:   (n_batches_c_rank, n_points, n_string_size_groups)
     my_density = np.ascontiguousarray(result['density'], dtype=np.float64)
     my_z_raw   = np.ascontiguousarray(result['Z_l'],     dtype=np.float64)
     my_c_m_l   = np.ascontiguousarray(result['C_m_l'],   dtype=np.float64)
     p_indices  = np.asarray(result['p_indices'], dtype=np.int32)
     n_points   = len(p_indices)
 
-    # split Z_l and A_v
-    my_z_l  = my_z_raw[:, :, :vertex_offset]                     # (batches, pts, n_loops)
-    my_a_v  = my_z_raw[:, :, vertex_offset:].mean(axis=-1)       # (batches, pts) — avg over vertices
+    # split Z_l size groups from A_v vertex group.
+    # Regular loop size groups are first (one per entry of loop_meta), vertex group is last.
+    # Vertex sets have set length 4 (distinct from any legal loop_size's set length ≥12),
+    # so they always form a single trailing group.
+    n_loop_sg = len(loop_meta)
+    if engine._cpp_engine.n_loop_size_groups != n_loop_sg + 1:
+        raise RuntimeError(
+            f"size-group layout mismatch: expected {n_loop_sg}+1 (loops+vertex), "
+            f"got {engine._cpp_engine.n_loop_size_groups}. "
+            f"Did vertex_sets collide with a loop_size?")
+    my_z_l = np.ascontiguousarray(my_z_raw[:, :, :n_loop_sg])    # (batches, pts, n_loop_sg)
+    my_a_v = np.ascontiguousarray(my_z_raw[:, :, n_loop_sg])     # (batches, pts) — C++ already avg'd vertices
 
-    n_loops   = vertex_offset
-    n_strings = engine._cpp_engine.n_strings
+    n_string_sg = engine._cpp_engine.n_string_size_groups
 
     t_sample = time.perf_counter() - t0
     comm.Barrier()
@@ -693,10 +704,10 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     if rank == 0:
         os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
 
-        all_density = np.empty((n_total_d,  n_points),             dtype=np.float64)
-        all_z_l     = np.empty((n_total_bz, n_points, n_loops),    dtype=np.float64)
-        all_a_v     = np.empty((n_total_bz, n_points),             dtype=np.float64)
-        all_c_m_l   = np.empty((n_total_bc, n_points, n_strings),  dtype=np.float64)
+        all_density = np.empty((n_total_d,  n_points),                  dtype=np.float64)
+        all_z_l     = np.empty((n_total_bz, n_points, n_loop_sg),       dtype=np.float64)
+        all_a_v     = np.empty((n_total_bz, n_points),                  dtype=np.float64)
+        all_c_m_l   = np.empty((n_total_bc, n_points, n_string_sg),     dtype=np.float64)
 
         all_density[off_d[0] :off_d[0] +counts_d[0] ] = my_density
         all_z_l    [off_bz[0]:off_bz[0]+batches_z[0]] = my_z_l
@@ -704,10 +715,10 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         all_c_m_l  [off_bc[0]:off_bc[0]+batches_c[0]] = my_c_m_l
 
         for src in range(1, n_ranks):
-            buf_d  = np.empty((counts_d[src],  n_points),            dtype=np.float64)
-            buf_z  = np.empty((batches_z[src], n_points, n_loops),   dtype=np.float64)
-            buf_av = np.empty((batches_z[src], n_points),            dtype=np.float64)
-            buf_c  = np.empty((batches_c[src], n_points, n_strings), dtype=np.float64)
+            buf_d  = np.empty((counts_d[src],  n_points),                dtype=np.float64)
+            buf_z  = np.empty((batches_z[src], n_points, n_loop_sg),     dtype=np.float64)
+            buf_av = np.empty((batches_z[src], n_points),                dtype=np.float64)
+            buf_c  = np.empty((batches_c[src], n_points, n_string_sg),   dtype=np.float64)
             comm.Recv(buf_d,  source=src, tag=300 + src)
             comm.Recv(buf_z,  source=src, tag=400 + src)
             comm.Recv(buf_av, source=src, tag=450 + src)
@@ -756,13 +767,13 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
             og = f.create_group('profiles')
             og.create_dataset('density', data=all_density)  # (n_density, n_points)
-            og.create_dataset('Z_l',     data=all_z_l)       # (n_batches, n_points, n_loops)
-            og.create_dataset('A_v',     data=all_a_v)        # (n_batches, n_points) — avg over vertices
-            og.create_dataset('C_m_l',   data=all_c_m_l)     # (n_batches, n_points, n_strings)
+            og.create_dataset('Z_l',     data=all_z_l)       # (n_batches, n_points, n_loop_size_groups)
+            og.create_dataset('A_v',     data=all_a_v)        # (n_batches, n_points) — mean over vertices (C++)
+            og.create_dataset('C_m_l',   data=all_c_m_l)     # (n_batches, n_points, n_string_size_groups)
             og.attrs['n_vertices'] = n_vertex
             # Post-processing:
-            #   |<Z(l)>|(δ)   = np.abs(all_z_l.mean(axis=0)).mean(axis=-1)   # mean over batches, |·|, avg copies
-            #   |<C_m(l)>|(δ) = np.abs(all_c_m_l.mean(axis=0)).mean(axis=-1)
+            #   <Z(l)>(δ, size_s)   = all_z_l[..., size_meta_attrs[f'loop_size{s}_index']].mean(axis=0)
+            #   <C_m(l)>(δ, size_s) = all_c_m_l[..., size_meta_attrs[f'string_size{s}_index']].mean(axis=0)
 
             lg = f.create_group('observable_sites')
             for idx, lp in enumerate(loop_sets):
@@ -770,11 +781,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             for idx, st in enumerate(string_sets):
                 lg.create_dataset(f'string_{idx}', data=np.array(st, dtype=np.int32))
             mg = f.create_group('size_meta')
-            for m in loop_meta:
-                mg.attrs[f'loop_size{m["size"]}_offset']   = m['offset']
+            for i, m in enumerate(loop_meta):
+                mg.attrs[f'loop_size{m["size"]}_index']    = i
                 mg.attrs[f'loop_size{m["size"]}_n_copies'] = m['n_copies']
-            for m in string_meta:
-                mg.attrs[f'string_size{m["size"]}_offset']   = m['offset']
+            for i, m in enumerate(string_meta):
+                mg.attrs[f'string_size{m["size"]}_index']    = i
                 mg.attrs[f'string_size{m["size"]}_n_copies'] = m['n_copies']
 
         if verbose:
@@ -805,10 +816,8 @@ def main():
     parser.add_argument('--n_equil', type=int, default=5000)
     parser.add_argument('--n_samples', type=int, default=30000)
     parser.add_argument('--neighbor_cutoff', type=int, default=None)
-    parser.add_argument('--precompute', action='store_true', default=True)
-    parser.add_argument('--chunk_slices', type=int, default=0)
-    parser.add_argument('--delta_groups', type=int, default=0,
-                        help='Number of delta groups for shared alias tables (0=disabled)')
+    parser.add_argument('--delta_groups', type=int, default=600,
+                        help='Number of delta groups for shared alias tables (must be > 0).')
     parser.add_argument('--omp_threads', type=int, default=1)
     parser.add_argument('--filepath', type=str, default='data/qaqmc_mpi.h5')
     parser.add_argument('--lattice', type=str, default='kagome_bond',
@@ -881,9 +890,7 @@ def main():
             batch_size=config.get('batch_size', 1000),
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),
-            precompute=config.get('precompute', True),
-            chunk_slices=config.get('chunk_slices', 0),
-            delta_groups=config.get('delta_groups', 0),
+            delta_groups=config.get('delta_groups', 600),
             omp_threads=config.get('omp_threads', 1),
             nx=config.get('nx', 1), ny=config.get('ny', 1),
             loop_sizes=config.get('loop_sizes', [3]),
@@ -899,9 +906,7 @@ def main():
             measure_every=config.get('measure_every', 1),
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),
-            precompute=config.get('precompute', True),
-            chunk_slices=config.get('chunk_slices', 0),
-            delta_groups=config.get('delta_groups', 0),
+            delta_groups=config.get('delta_groups', 600),
             omp_threads=config.get('omp_threads', 1),
             nx=config.get('nx', 1), ny=config.get('ny', 1),
             loop_sizes=config.get('loop_sizes', [3]),
@@ -917,9 +922,7 @@ def main():
             measure_every=config.get('measure_every', 1),
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),
-            precompute=config.get('precompute', True),
-            chunk_slices=config.get('chunk_slices', 0),
-            delta_groups=config.get('delta_groups', 0),
+            delta_groups=config.get('delta_groups', 600),
             omp_threads=config.get('omp_threads', 1),
         )
 

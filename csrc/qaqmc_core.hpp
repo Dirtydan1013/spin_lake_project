@@ -56,8 +56,7 @@ public:
     QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
                 double Rb, int M, double epsilon, uint64_t seed,
                 const double* pos, int pos_dim,
-                int neighbor_cutoff = -1, bool precompute = true,
-                int chunk_slices = 0, int delta_groups = 0);
+                int neighbor_cutoff = -1, int delta_groups = 600);
 
     void mc_step();
 
@@ -81,24 +80,28 @@ public:
     int get_n_loops()   const { return (int)loop_site_sets_.size(); }
     int get_n_strings() const { return (int)string_site_sets_.size(); }
 
+    // Number of distinct size groups (copies are grouped by their set length,
+    // i.e. number of sites in the path; ordering = first occurrence in *_site_sets_).
+    int get_n_loop_size_groups()   const { return (int)loop_group_n_copies_.size(); }
+    int get_n_string_size_groups() const { return (int)string_group_n_copies_.size(); }
+
     // Measure diagonal observables using the captured state at the midpoint (p=M).
-    // Z_l_copies[k]   = signed product Π(1-2nᵢ) for loop copy k
-    // C_m_l_copies[k] = signed product Π(1-2nᵢ) for string copy k
-    // To get |<Z(l)>|: average each copy over samples, then take |·|, then average over copies.
+    // Z_l_by_size[g]   = mean over copies-in-group-g of Π(1-2nᵢ)
+    // C_m_l_by_size[g] = same for strings
     struct MidpointObservables {
         double density;
-        std::vector<double> Z_l_copies;    // [n_loops]   per-copy signed products
-        std::vector<double> C_m_l_copies;  // [n_strings] per-copy signed products
+        std::vector<double> Z_l_by_size;    // [n_loop_size_groups]
+        std::vector<double> C_m_l_by_size;  // [n_string_size_groups]
     };
     MidpointObservables measure_at_midpoint() const;
 
     // Asymmetric profile: measure density/Z_l/C_m_l at every profile_step slices.
-    // Z_l_copies[k][pt]   = signed product for loop copy k at profile point pt
-    // C_m_l_copies[k][pt] = signed product for string copy k at profile point pt
+    // Z_l_by_size[g][pt]   = mean over copies-in-group-g at profile point pt
+    // C_m_l_by_size[g][pt] = same for strings
     struct ProfileObservables {
-        std::vector<double> density;                    // [n_points]
-        std::vector<std::vector<double>> Z_l_copies;    // [n_loops][n_points]
-        std::vector<std::vector<double>> C_m_l_copies;  // [n_strings][n_points]
+        std::vector<double> density;                       // [n_points]
+        std::vector<std::vector<double>> Z_l_by_size;      // [n_loop_size_groups][n_points]
+        std::vector<std::vector<double>> C_m_l_by_size;    // [n_string_size_groups][n_points]
         int n_points;
     };
     ProfileObservables measure_profile(int profile_step) const;
@@ -145,9 +148,7 @@ private:
     double Omega_, Rb_, delta_min_, delta_max_;
     double site_W_, site_W_max_;
     double epsilon_;
-    bool precompute_;
-    int chunk_slices_;  // 0 = full precompute, >0 = chunked
-    int delta_groups_;  // 0 = no grouping, >0 = # groups for shared alias tables
+    int delta_groups_;  // # groups for shared alias tables (must be > 0)
 
     double time_diag_{0.0};
     double time_clus_{0.0};
@@ -156,7 +157,6 @@ private:
     std::mt19937_64 rng_;
 
     RydbergVij vij_;
-    AliasTable alias_;
     std::vector<double> delta_sched_;
 
     // ── Grouped alias tables for O(G) diagonal update ─────────────────────
@@ -183,6 +183,14 @@ private:
     std::vector<std::vector<int>> loop_site_sets_;
     std::vector<std::vector<int>> string_site_sets_;
     std::vector<int> bulk_sites_;              // interior sites for density (empty = all sites)
+
+    // Size-group bookkeeping: copies sharing the same set length (= number of sites
+    // in the path, which is bijective with the logical "loop_size" / "string_size")
+    // are aggregated. Group order = first-occurrence of each unique set length.
+    std::vector<int> loop_group_of_;          // [n_loop_copies] -> group index
+    std::vector<int> loop_group_n_copies_;    // [n_loop_size_groups]
+    std::vector<int> string_group_of_;        // [n_string_copies] -> group index
+    std::vector<int> string_group_n_copies_;  // [n_string_size_groups]
 
     // ── Vertex lists for O(M) cluster update ──────────────────────────────
     std::vector<int32_t> site_op_count_;
