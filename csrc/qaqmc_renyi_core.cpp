@@ -706,6 +706,93 @@ double QAQMCRenyiEngine::log_weight_ratio_for_site(int site, int from_topology, 
     return log_to - log_from;
 }
 
+// ── Single-bit-toggle primitives for Mode::Work ─────────────────────────────
+
+void QAQMCRenyiEngine::set_A_mask_for_work(const uint8_t* mask, int len) {
+    if (len != N_) {
+        throw std::runtime_error("set_A_mask_for_work: mask length mismatch");
+    }
+    A_mask_.assign(mask, mask + len);
+    A_masks_[0] = A_mask_;
+    A_masks_[1] = A_mask_;
+    cur_topology_ = 0;
+    diff_site_ = -1;
+
+    // Critical: clear the operator strings to the vacuum state (all type-1
+    // site ops, no offdiag flips).  A previous trajectory's operator string
+    // was valid under whatever mask it ended at (e.g. A_end), but its
+    // offdiagonal parities under the new mask may be nonzero -- the
+    // configuration would then be illegal under the new boundary.
+    // reproject_site_ops_for_mask_with_paths cannot fix this because it
+    // re-derives op_types from the *same* offdiag set it is classifying
+    // (essentially an identity operation), and cluster_update preserves
+    // parity, so the illegal sector is sticky.  Resetting to vacuum
+    // guarantees a trivially-valid starting configuration; a subsequent
+    // decorrelation / thermalization brings the chain to the new sector's
+    // equilibrium.
+    for (auto& replica : replicas_) {
+        std::fill(replica.op_types.begin(), replica.op_types.end(), 1);
+        std::fill(replica.op_sites.begin(), replica.op_sites.end(), 0);
+        std::fill(replica.state_at_M.begin(), replica.state_at_M.end(), 0);
+    }
+
+    mode_ = Mode::Work;
+    reset_visit_counts();
+}
+
+double QAQMCRenyiEngine::log_weight_ratio_for_toggle(int site) const {
+    if (site < 0 || site >= N_) {
+        throw std::runtime_error("site out of range");
+    }
+    std::vector<uint8_t> mask_to = A_mask_;
+    mask_to[site] ^= 1;
+
+    OffdiagPaths paths_from;
+    OffdiagPaths paths_to;
+    build_offdiag_paths(A_mask_, paths_from);
+    build_offdiag_paths(mask_to, paths_to);
+    double log_from = log_weight_for_site_with_paths(site, A_mask_, paths_from);
+    double log_to   = log_weight_for_site_with_paths(site, mask_to,  paths_to);
+    return log_to - log_from;
+}
+
+void QAQMCRenyiEngine::save_op_string_checkpoint() {
+    for (int r = 0; r < 2; ++r) {
+        op_ckpt_types_[r] = replicas_[r].op_types;
+        op_ckpt_sites_[r] = replicas_[r].op_sites;
+    }
+    op_ckpt_valid_ = true;
+}
+
+void QAQMCRenyiEngine::restore_op_string_checkpoint() {
+    if (!op_ckpt_valid_) {
+        throw std::runtime_error("restore_op_string_checkpoint: no checkpoint saved");
+    }
+    for (int r = 0; r < 2; ++r) {
+        replicas_[r].op_types = op_ckpt_types_[r];
+        replicas_[r].op_sites = op_ckpt_sites_[r];
+    }
+    // Op string changed — state_at_M no longer reflects the new ops.  The
+    // caller must ensure A_mask_ matches the mask under which the checkpoint
+    // was saved, otherwise the configuration may be invalid under the
+    // current channel mapping.
+    recompute_midpoint_states_from_ops();
+}
+
+void QAQMCRenyiEngine::apply_single_bit_toggle(int site) {
+    if (site < 0 || site >= N_) {
+        throw std::runtime_error("site out of range");
+    }
+    A_mask_[site] ^= 1;
+
+    OffdiagPaths paths;
+    build_offdiag_paths(A_mask_, paths);
+    reproject_site_ops_at_site_with_paths(site, A_mask_, paths);
+    // state_at_M is invariant under single-bit toggle: reproject only flips
+    // op_types at p >= M (1 <-> -1 for the affected site), and state_at_M is
+    // accumulated from offdiag ops at p < M, so it does not change.
+}
+
 std::array<std::vector<int32_t>, 4> QAQMCRenyiEngine::get_site_paths(int site) const {
     if (site < 0 || site >= N_) {
         throw std::runtime_error("site out of range");
@@ -1133,6 +1220,9 @@ void QAQMCRenyiEngine::mc_step() {
         if (!visit_count_ext_.empty()) {
             visit_count_ext_[cur_ens_]++;
         }
+    } else if (mode_ == Mode::Work) {
+        // Work mode: outer engine owns topology transitions; mc_step() just
+        // does diagonal + cluster update at the current A_mask_.
     } else {
         topology_toggle();
         auto t3 = std::chrono::high_resolution_clock::now();

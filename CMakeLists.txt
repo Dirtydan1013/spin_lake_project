@@ -15,6 +15,7 @@ find_package(OpenMP)
 pybind11_add_module(qaqmc_cpp
     csrc/qaqmc_core.cpp
     csrc/qaqmc_renyi_core.cpp
+    csrc/qaqmc_renyi_work_core.cpp
     csrc/sse_core.cpp
     csrc/bindings.cpp
 )

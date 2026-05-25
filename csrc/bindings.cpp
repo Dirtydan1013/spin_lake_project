@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include "qaqmc_core.hpp"
 #include "qaqmc_renyi_core.hpp"
+#include "qaqmc_renyi_work_core.hpp"
 #include "sse_core.hpp"
 
 namespace py = pybind11;
@@ -386,6 +387,172 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         "Z_l:     (n_batches, n_points, n_loop_size_groups)   — batch means of size-group means (signed).\n"
         "C_m_l:   (n_batches, n_points, n_string_size_groups) — batch means of size-group means (signed).")
 
+        // ── Dimer structure factor measurement ─────────────────────────────
+        .def("set_dimer_sf_q_points", [](QAQMCEngine& self, py::array_t<double> q_arr) {
+            auto buf = q_arr.request();
+            if (buf.ndim != 2)
+                throw std::runtime_error("q_points must be a 2D array (n_q, pos_dim)");
+            int n_q = (int)buf.shape[0];
+            int pos_dim = (int)buf.shape[1];
+            const double* p = static_cast<const double*>(buf.ptr);
+            std::vector<std::vector<double>> q_points(n_q, std::vector<double>(pos_dim));
+            for (int qi = 0; qi < n_q; ++qi)
+                for (int d = 0; d < pos_dim; ++d)
+                    q_points[qi][d] = p[qi * pos_dim + d];
+            self.set_dimer_sf_q_points(q_points);
+        },
+        py::arg("q_points"),
+        "Set q-points (n_q, pos_dim) and precompute cos/sin tables for "
+        "Σ_i n_i exp(iq·r_i).")
+
+        .def("set_dimer_sf_measure_deltas", [](QAQMCEngine& self, py::array_t<double> deltas_arr) {
+            auto buf = deltas_arr.request();
+            std::vector<double> deltas(static_cast<const double*>(buf.ptr),
+                                       static_cast<const double*>(buf.ptr) + buf.shape[0]);
+            self.set_dimer_sf_measure_deltas(deltas);
+        },
+        py::arg("deltas"),
+        "Set target delta values for dimer SF measurements; engine snaps each "
+        "to the nearest forward-ramp slice p ∈ [0, M).")
+
+        .def("set_dimer_sf_measure_p_indices", [](QAQMCEngine& self, py::array_t<int> p_arr) {
+            auto buf = p_arr.request();
+            std::vector<int> p_idx(static_cast<const int*>(buf.ptr),
+                                   static_cast<const int*>(buf.ptr) + buf.shape[0]);
+            self.set_dimer_sf_measure_p_indices(p_idx);
+        },
+        py::arg("p_indices"),
+        "Directly specify forward-ramp slice indices for dimer SF measurements.")
+
+        .def_property_readonly("n_q_points",            &QAQMCEngine::get_n_q_points)
+        .def_property_readonly("n_dimer_measure_points",&QAQMCEngine::get_n_dimer_measure_points)
+        .def_property_readonly("dimer_p_indices", [](const QAQMCEngine& self) {
+            const auto& v = self.get_dimer_p_indices();
+            return py::array_t<int>(v.size(), v.data());
+        })
+        .def_property_readonly("dimer_deltas_used", [](const QAQMCEngine& self) {
+            const auto& v = self.get_dimer_deltas_used();
+            return py::array_t<double>(v.size(), v.data());
+        })
+
+        .def("run_dimer_sf", [](QAQMCEngine& self, int n_equil, int n_samples,
+                                int batch_size,
+                                py::object progress_callback, int progress_every) {
+            if (batch_size <= 0) batch_size = 1000;
+            if (progress_every <= 0) progress_every = 1;
+            const bool has_cb = !progress_callback.is_none();
+
+            int n_p = self.get_n_dimer_measure_points();
+            int n_q = self.get_n_q_points();
+            if (n_p == 0 || n_q == 0)
+                throw std::runtime_error("run_dimer_sf: set q-points + measure deltas first");
+
+            // Equilibration.
+            for (int i = 0; i < n_equil; ++i) {
+                self.mc_step();
+                if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_equil))
+                    progress_callback(i + 1, n_equil, "equil");
+            }
+
+            int n_batches = n_samples / batch_size;
+            if (n_batches < 1) n_batches = 1;
+
+            // Outputs: batch-averaged.  Density per batch per measure point;
+            // s_q components per batch per (measure_p, q).
+            py::array_t<double> density_out({n_batches, n_p});
+            py::array_t<double> s_re_out({n_batches, n_p, n_q});
+            py::array_t<double> s_im_out({n_batches, n_p, n_q});
+            py::array_t<double> s_a2_out({n_batches, n_p, n_q});
+            auto d_buf  = density_out.mutable_unchecked<2>();
+            auto re_buf = s_re_out.mutable_unchecked<3>();
+            auto im_buf = s_im_out.mutable_unchecked<3>();
+            auto a2_buf = s_a2_out.mutable_unchecked<3>();
+
+            std::vector<double> dens_acc(n_p, 0.0);
+            std::vector<double> re_acc(n_p * n_q, 0.0);
+            std::vector<double> im_acc(n_p * n_q, 0.0);
+            std::vector<double> a2_acc(n_p * n_q, 0.0);
+
+            int in_batch = 0;
+            int batch = 0;
+            for (int s = 0; s < n_samples; ++s) {
+                self.mc_step();
+                auto sample = self.measure_dimer_sf();
+                for (int pi = 0; pi < n_p; ++pi) dens_acc[pi] += sample.density[pi];
+                for (size_t k = 0; k < re_acc.size(); ++k) {
+                    re_acc[k] += sample.s_q_real[k];
+                    im_acc[k] += sample.s_q_imag[k];
+                    a2_acc[k] += sample.s_q_abs2[k];
+                }
+                ++in_batch;
+
+                if (in_batch >= batch_size && batch < n_batches) {
+                    double inv = 1.0 / in_batch;
+                    for (int pi = 0; pi < n_p; ++pi) {
+                        d_buf(batch, pi) = dens_acc[pi] * inv;
+                        dens_acc[pi] = 0.0;
+                        for (int qi = 0; qi < n_q; ++qi) {
+                            size_t k = (size_t)pi * n_q + qi;
+                            re_buf(batch, pi, qi) = re_acc[k] * inv;
+                            im_buf(batch, pi, qi) = im_acc[k] * inv;
+                            a2_buf(batch, pi, qi) = a2_acc[k] * inv;
+                            re_acc[k] = 0.0;
+                            im_acc[k] = 0.0;
+                            a2_acc[k] = 0.0;
+                        }
+                    }
+                    ++batch;
+                    in_batch = 0;
+                }
+
+                if (has_cb && (((s + 1) % progress_every) == 0 || (s + 1) == n_samples))
+                    progress_callback(s + 1, n_samples, "sample");
+            }
+
+            // Flush partial last batch (if any) into the final slot.
+            if (in_batch > 0 && batch < n_batches) {
+                double inv = 1.0 / in_batch;
+                for (int pi = 0; pi < n_p; ++pi) {
+                    d_buf(batch, pi) = dens_acc[pi] * inv;
+                    for (int qi = 0; qi < n_q; ++qi) {
+                        size_t k = (size_t)pi * n_q + qi;
+                        re_buf(batch, pi, qi) = re_acc[k] * inv;
+                        im_buf(batch, pi, qi) = im_acc[k] * inv;
+                        a2_buf(batch, pi, qi) = a2_acc[k] * inv;
+                    }
+                }
+            }
+
+            // Also return the actual slice indices and matched delta values.
+            const auto& p_vec = self.get_dimer_p_indices();
+            const auto& d_vec = self.get_dimer_deltas_used();
+            py::array_t<int>    p_idx_out(p_vec.size(), p_vec.data());
+            py::array_t<double> delta_out(d_vec.size(), d_vec.data());
+
+            py::dict result;
+            result["density"]      = density_out;
+            result["s_q_real"]     = s_re_out;
+            result["s_q_imag"]     = s_im_out;
+            result["s_q_abs2"]     = s_a2_out;
+            result["p_indices"]    = p_idx_out;
+            result["deltas_used"]  = delta_out;
+            result["batch_size"]   = py::int_(batch_size);
+            return result;
+        },
+        py::arg("n_equil"), py::arg("n_samples"),
+        py::arg("batch_size") = 1000,
+        py::arg("progress_callback") = py::none(),
+        py::arg("progress_every") = 1000,
+        "Run sampling and measure dimer structure factor at the pre-set "
+        "(q-points × measure deltas).  Returns dict with batch-averaged "
+        "<Re(s_q)>, <Im(s_q)>, <|s_q|²>, density per (batch, measure_p, q).\n"
+        "The site sum in s_q = Σ_i n_i exp(iq·r_i) is restricted to "
+        "bulk_sites (set via set_bulk_sites) if non-empty; otherwise all N "
+        "sites are summed.  This matches the density convention so boundary "
+        "atoms can be excluded the same way.\n"
+        "Connected S_d(q) per measure_p: "
+        "<|s_q|²> - |<s_q>|², then divide by N_d (caller).")
+
         // Profiling
         .def_property_readonly("time_diag", &QAQMCEngine::get_time_diag)
         .def_property_readonly("time_clus", &QAQMCEngine::get_time_clus)
@@ -469,6 +636,21 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def("ensemble_switch", &QAQMCRenyiEngine::ensemble_switch)
         .def("log_weight_ratio_for_site", &QAQMCRenyiEngine::log_weight_ratio_for_site,
              py::arg("site"), py::arg("from_topology"), py::arg("to_topology"))
+        // ── Single-bit-toggle primitives for Mode::Work ────────────────────
+        .def("set_mode", [](QAQMCRenyiEngine& self, int m) {
+            self.set_mode(static_cast<QAQMCRenyiEngine::Mode>(m));
+        }, py::arg("mode"),
+        "Set engine mode: 0 = PairToggle, 1 = Expanded, 2 = Work.")
+        .def("log_weight_ratio_for_toggle",
+             &QAQMCRenyiEngine::log_weight_ratio_for_toggle,
+             py::arg("site"),
+             "log[ Z(A_mask ^ {site}) / Z(A_mask) ] using current A_mask_ and op strings. "
+             "Cost ~O(M_total). Used by the work engine for dynamic single-bit proposals.")
+        .def("apply_single_bit_toggle",
+             &QAQMCRenyiEngine::apply_single_bit_toggle,
+             py::arg("site"),
+             "Flip A_mask_[site] and reproject affected site ops at p >= M. "
+             "Caller is responsible for the Metropolis accept/reject before calling.")
         .def("set_indicator_site", &QAQMCRenyiEngine::set_indicator_site, py::arg("site"))
         .def("reset_indicator", &QAQMCRenyiEngine::reset_indicator)
         .def("get_indicator_avg", &QAQMCRenyiEngine::get_indicator_avg)
@@ -710,4 +892,141 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                                "Total number of mc_step() calls since last reset")
         .def("reset_timers", &SSEEngine::reset_timers,
              "Reset profiling counters to zero");
+
+    // ── QAQMCRenyiWorkEngine ─────────────────────────────────────────────────
+
+    py::class_<QAQMCRenyiWorkEngine::WorkTrajectoryResult>(m, "WorkTrajectoryResult")
+        .def_readonly("work",                  &QAQMCRenyiWorkEngine::WorkTrajectoryResult::work)
+        .def_readonly("exp_minus_work",        &QAQMCRenyiWorkEngine::WorkTrajectoryResult::exp_minus_work)
+        .def_readonly("final_swap_count",      &QAQMCRenyiWorkEngine::WorkTrajectoryResult::final_swap_count)
+        .def_readonly("unjoined_at_end_count", &QAQMCRenyiWorkEngine::WorkTrajectoryResult::unjoined_at_end_count)
+        .def_readonly("topology_attempts",     &QAQMCRenyiWorkEngine::WorkTrajectoryResult::topology_attempts)
+        .def_readonly("topology_accepts",      &QAQMCRenyiWorkEngine::WorkTrajectoryResult::topology_accepts);
+
+    py::class_<QAQMCRenyiWorkEngine::WorkRunResult>(m, "WorkRunResult")
+        .def_readonly("mean_exp_minus_work",      &QAQMCRenyiWorkEngine::WorkRunResult::mean_exp_minus_work)
+        .def_readonly("delta_s2",                 &QAQMCRenyiWorkEngine::WorkRunResult::delta_s2)
+        .def_readonly("work_mean",                &QAQMCRenyiWorkEngine::WorkRunResult::work_mean)
+        .def_readonly("work_var",                 &QAQMCRenyiWorkEngine::WorkRunResult::work_var)
+        .def_readonly("trajectory_count",         &QAQMCRenyiWorkEngine::WorkRunResult::trajectory_count)
+        .def_readonly("total_topology_attempts",  &QAQMCRenyiWorkEngine::WorkRunResult::total_topology_attempts)
+        .def_readonly("total_topology_accepts",   &QAQMCRenyiWorkEngine::WorkRunResult::total_topology_accepts)
+        .def_readonly("total_unjoined_at_end",    &QAQMCRenyiWorkEngine::WorkRunResult::total_unjoined_at_end)
+        .def_property_readonly("work_samples", [](const QAQMCRenyiWorkEngine::WorkRunResult& self) {
+            return py::array_t<double>(self.work_samples.size(), self.work_samples.data());
+        })
+        .def_property_readonly("final_swap_counts", [](const QAQMCRenyiWorkEngine::WorkRunResult& self) {
+            return py::array_t<int32_t>(self.final_swap_counts.size(), self.final_swap_counts.data());
+        })
+        .def_property_readonly("unjoined_counts_per_traj", [](const QAQMCRenyiWorkEngine::WorkRunResult& self) {
+            return py::array_t<int32_t>(self.unjoined_counts_per_traj.size(),
+                                        self.unjoined_counts_per_traj.data());
+        })
+        .def_property_readonly("topology_attempts_per_traj", [](const QAQMCRenyiWorkEngine::WorkRunResult& self) {
+            return py::array_t<int64_t>(self.topology_attempts_per_traj.size(),
+                                        self.topology_attempts_per_traj.data());
+        })
+        .def_property_readonly("topology_accepts_per_traj", [](const QAQMCRenyiWorkEngine::WorkRunResult& self) {
+            return py::array_t<int64_t>(self.topology_accepts_per_traj.size(),
+                                        self.topology_accepts_per_traj.data());
+        });
+
+    py::class_<QAQMCRenyiWorkEngine>(m, "QAQMCRenyiWorkEngine")
+        .def(py::init([](int N, double Omega, double delta_min, double delta_max,
+                         double Rb, int M, double epsilon, uint64_t seed,
+                         py::array_t<double> pos_arr,
+                         int neighbor_cutoff, int delta_groups) {
+            auto buf = pos_arr.request();
+            if (buf.ndim != 2)
+                throw std::runtime_error("pos must be a 2D array (N, dim)");
+            int pos_dim = (int)buf.shape[1];
+            const double* pos_ptr = static_cast<const double*>(buf.ptr);
+            return new QAQMCRenyiWorkEngine(N, Omega, delta_min, delta_max, Rb, M,
+                                            epsilon, seed, pos_ptr, pos_dim,
+                                            neighbor_cutoff, delta_groups);
+        }),
+        py::arg("N"), py::arg("Omega"), py::arg("delta_min"), py::arg("delta_max"),
+        py::arg("Rb"), py::arg("M"), py::arg("epsilon"), py::arg("seed"),
+        py::arg("pos"), py::arg("neighbor_cutoff") = -1,
+        py::arg("delta_groups") = 600)
+
+        .def("set_region_pair", [](QAQMCRenyiWorkEngine& self,
+                                   py::array_t<uint8_t> A_start, py::array_t<uint8_t> A_end) {
+            auto s = A_start.request();
+            auto e = A_end.request();
+            if (s.shape[0] != e.shape[0])
+                throw std::runtime_error("A_start and A_end must have the same length");
+            self.set_region_pair(static_cast<const uint8_t*>(s.ptr),
+                                 static_cast<const uint8_t*>(e.ptr),
+                                 static_cast<int>(s.shape[0]));
+        }, py::arg("A_start_mask"), py::arg("A_end_mask"),
+        "Set nested region pair (A_start ⊆ A_end). Builds D = A_end \\ A_start, "
+        "resets B = ∅, and sets backend A_mask = A_start.")
+
+        .def("set_region", [](QAQMCRenyiWorkEngine& self, py::array_t<uint8_t> A_mask) {
+            auto a = A_mask.request();
+            self.set_region(static_cast<const uint8_t*>(a.ptr),
+                            static_cast<int>(a.shape[0]));
+        }, py::arg("A_mask"),
+        "Convenience: equivalent to set_region_pair(zeros, A_mask). "
+        "Corresponds to the paper's ∅→A case.")
+
+        .def("set_lambda_schedule", [](QAQMCRenyiWorkEngine& self,
+                                       py::array_t<double> lambdas) {
+            auto b = lambdas.request();
+            std::vector<double> v(static_cast<const double*>(b.ptr),
+                                  static_cast<const double*>(b.ptr) + b.shape[0]);
+            self.set_lambda_schedule(v);
+        }, py::arg("lambdas"),
+        "Set forward λ schedule (must start at 0, end at 1, monotonic non-decreasing).")
+
+        .def("set_sweeps_per_lambda", &QAQMCRenyiWorkEngine::set_sweeps_per_lambda,
+             py::arg("n_topology_sweeps"), py::arg("n_qaqmc_sweeps"),
+             "Set per-λ-step sweep counts. v1 paper default = (1, 1).")
+
+        .def("thermalize", &QAQMCRenyiWorkEngine::thermalize, py::arg("n_steps"),
+             "Thermalise in the start sector (backend A_mask = A_start, B = ∅).")
+
+        .def("run_trajectory", &QAQMCRenyiWorkEngine::run_trajectory,
+             "Run one trajectory; assumes engine is at (λ=0, B=∅, backend.A_mask=A_start).")
+
+        .def("run_trajectories", &QAQMCRenyiWorkEngine::run_trajectories,
+             py::arg("n_trajectories"), py::arg("decorrelation_steps"),
+             "Run n trajectories with decorrelation_steps in the start sector between, "
+             "and aggregate via log-sum-exp into ΔS2 = S2(A_end) - S2(A_start).")
+
+        // Accessors
+        .def_property_readonly("N", &QAQMCRenyiWorkEngine::get_N)
+        .def_property_readonly("M_total", &QAQMCRenyiWorkEngine::get_M_total)
+        .def_property_readonly("D_size", &QAQMCRenyiWorkEngine::get_D_size)
+        .def_property_readonly("B_size", &QAQMCRenyiWorkEngine::get_B_size)
+        .def_property_readonly("A_start_mask", [](const QAQMCRenyiWorkEngine& self) {
+            const auto& v = self.get_A_start_mask();
+            return py::array_t<uint8_t>(v.size(), v.data());
+        })
+        .def_property_readonly("A_end_mask", [](const QAQMCRenyiWorkEngine& self) {
+            const auto& v = self.get_A_end_mask();
+            return py::array_t<uint8_t>(v.size(), v.data());
+        })
+        .def_property_readonly("D_mask", [](const QAQMCRenyiWorkEngine& self) {
+            const auto& v = self.get_D_mask();
+            return py::array_t<uint8_t>(v.size(), v.data());
+        })
+        .def_property_readonly("B_mask", [](const QAQMCRenyiWorkEngine& self) {
+            const auto& v = self.get_B_mask();
+            return py::array_t<uint8_t>(v.size(), v.data());
+        })
+        .def_property_readonly("lambda_schedule", [](const QAQMCRenyiWorkEngine& self) {
+            const auto& v = self.get_lambda_schedule();
+            return py::array_t<double>(v.size(), v.data());
+        })
+        // Expose underlying QAQMCRenyiEngine backend for probe / diagnostic use.
+        // py::return_value_policy::reference_internal keeps the backend alive
+        // as long as the work engine is alive (no copy).
+        .def_property_readonly("backend",
+            [](QAQMCRenyiWorkEngine& self) -> QAQMCRenyiEngine& { return self.backend(); },
+            py::return_value_policy::reference_internal,
+            "Underlying QAQMCRenyiEngine (Mode::Work). Use sparingly — direct "
+            "mutation can desync work-engine bookkeeping; OK for read-only "
+            "timing of mc_step / log_weight_ratio_for_toggle.");
 }

@@ -1,0 +1,609 @@
+"""
+MPI driver for the QAQMC Renyi nonequilibrium-work engine.
+
+Each rank runs an independent set of Jarzynski trajectories with a different
+seed (no inter-rank communication during sampling). Rank 0 reduces the work
+samples across ranks via log-sum-exp aggregation and prints / saves the result.
+
+Used for K-sweep convergence validation against ED on small systems, and as
+the prototype production driver for larger systems.
+
+Usage:
+    mpiexec -n <N> python -m src.mpi.qaqmc_renyi_work_mpi \\
+        --N 4 --M 100 --Omega 1.0 --Rb 1.2 \\
+        --delta-min -1.0 --delta-max 2.0 \\
+        --A-end "1,1,0,0" \\
+        --K-values "4,20,50,200" \\
+        --n-trajectories 8000 --n-thermalize 3000 --decorrelation-steps 500 \\
+        [--A-start "0,0,0,0"]   # default: zeros
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+
+try:
+    from mpi4py import MPI
+except ImportError as exc:
+    raise ImportError("mpi4py is required for src.mpi.qaqmc_renyi_work_mpi") from exc
+
+# Make repo root importable when launched via `python -m`
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.engines.qaqmc_renyi_work import QAQMCRenyiWorkRydberg
+from src.rydberg.lattices import (
+    generate_1d_chain,
+    generate_kagome_bond_lattice,
+    generate_kagome_bond_triangle_lattice,
+)
+
+
+def _parse_mask(s: str, N: int) -> np.ndarray:
+    bits = [int(b.strip()) for b in s.split(",")]
+    if len(bits) != N:
+        raise ValueError(f"mask {s!r} has {len(bits)} bits, expected {N}")
+    return np.array(bits, dtype=np.uint8)
+
+
+def _ed_s2(N: int, M: int, Omega: float, Rb: float,
+           delta_min: float, delta_max: float, epsilon: float,
+           pos: np.ndarray, A_mask: np.ndarray) -> float:
+    from src.analysis.ed_core import build_qaqmc_midpoint_state
+    psi = build_qaqmc_midpoint_state(
+        N=N, Omega=Omega, delta_min=delta_min, delta_max=delta_max,
+        Rb=Rb, M=M, pos=pos, epsilon=epsilon, neighbor_cutoff=None,
+    )
+    A_sites  = [i for i in range(N) if A_mask[i] == 1]
+    AC_sites = [i for i in range(N) if A_mask[i] == 0]
+    nA, nAC = len(A_sites), len(AC_sites)
+    M_mat = np.zeros((1 << nA, 1 << nAC), dtype=np.float64)
+    for s in range(psi.size):
+        bits = [(s >> i) & 1 for i in range(N)]
+        a  = sum(bits[A_sites[j]]  << j for j in range(nA))
+        ac = sum(bits[AC_sites[j]] << j for j in range(nAC))
+        M_mat[a, ac] = psi[s]
+    rho_A = M_mat @ M_mat.T
+    return -float(np.log(max(np.trace(rho_A @ rho_A), 1e-300)))
+
+
+def _ed_s2_difference(N, M, Omega, Rb, delta_min, delta_max, epsilon,
+                      pos, A_start_mask, A_end_mask) -> float:
+    s2_end   = _ed_s2(N, M, Omega, Rb, delta_min, delta_max, epsilon, pos, A_end_mask)
+    if np.all(A_start_mask == 0):
+        return s2_end
+    s2_start = _ed_s2(N, M, Omega, Rb, delta_min, delta_max, epsilon, pos, A_start_mask)
+    return s2_end - s2_start
+
+
+def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
+                 delta_min: float, delta_max: float, epsilon: float,
+                 pos: np.ndarray, A_start_mask: np.ndarray, A_end_mask: np.ndarray,
+                 K_values: list[int],
+                 n_trajectories: int, n_thermalize: int, decorrelation_steps: int,
+                 neighbor_cutoff: int = -1, delta_groups: int = 200,
+                 seed: int = 7, compute_ed: bool = True,
+                 filepath: str | None = None,
+                 verbose: bool = True) -> dict:
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    n_ranks = comm.Get_size()
+
+    # Partition trajectories across ranks
+    base = n_trajectories // n_ranks
+    rem  = n_trajectories %  n_ranks
+    my_n = base + (1 if rank < rem else 0)
+
+    if rank == 0 and verbose:
+        print(f"[MPI-WORK] N={N}, M={M}, ranks={n_ranks}, total_trajectories={n_trajectories}, "
+              f"per-rank≈{base}, K_values={K_values}", flush=True)
+        print(f"[MPI-WORK]   |A_start|={int(A_start_mask.sum())}, |A_end|={int(A_end_mask.sum())}, "
+              f"|D|={int((A_end_mask & ~A_start_mask).sum())}", flush=True)
+    if rank == 0 and compute_ed and N <= 16:
+        ed_ref = _ed_s2_difference(N, M, Omega, Rb, delta_min, delta_max, epsilon,
+                                   pos, A_start_mask, A_end_mask)
+        if verbose:
+            print(f"[MPI-WORK] ED reference ΔS_2 = {ed_ref:+.6f}", flush=True)
+    else:
+        ed_ref = None
+    ed_ref = comm.bcast(ed_ref, root=0)
+
+    results = {}
+    for K in K_values:
+        comm.Barrier()
+        t0 = time.perf_counter()
+
+        eng = QAQMCRenyiWorkRydberg(
+            N=N, M=M, Omega=Omega, Rb=Rb,
+            delta_min=delta_min, delta_max=delta_max,
+            epsilon=epsilon,
+            seed=seed + 9973 * rank,
+            pos=pos, neighbor_cutoff=neighbor_cutoff,
+            delta_groups=delta_groups,
+        )
+        eng.set_region_pair(A_start_mask, A_end_mask)
+        eng.set_lambda_schedule(np.linspace(0.0, 1.0, K + 1))
+        eng.thermalize(n_thermalize)
+        local = eng.run_trajectories(my_n, decorrelation_steps)
+
+        # Gather per-trajectory arrays to rank 0 and aggregate via log-sum-exp
+        all_w           = comm.gather(local.work_samples,                root=0)
+        all_final_swap  = comm.gather(local.final_swap_counts,           root=0)
+        all_unjoined    = comm.gather(local.unjoined_counts_per_traj,    root=0)
+        all_attempts    = comm.gather(local.topology_attempts_per_traj,  root=0)
+        all_accepts     = comm.gather(local.topology_accepts_per_traj,   root=0)
+        t_elapsed = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
+
+        if rank == 0:
+            w               = np.concatenate(all_w)
+            final_swap      = np.concatenate(all_final_swap).astype(np.int32)
+            unjoined_arr    = np.concatenate(all_unjoined).astype(np.int32)
+            attempts_arr    = np.concatenate(all_attempts).astype(np.int64)
+            accepts_arr     = np.concatenate(all_accepts).astype(np.int64)
+            x = -w
+            x_max = float(x.max())
+            ex_shifted = np.exp(x - x_max)
+            log_mean_exp_minus_w = x_max + np.log(ex_shifted.mean())
+            delta_s2 = -log_mean_exp_minus_w
+            work_mean = float(w.mean())
+            work_var  = float(w.var(ddof=1))
+
+            # bootstrap sd of delta_s2
+            rng = np.random.default_rng(0)
+            boot = []
+            for _ in range(200):
+                idx = rng.integers(0, len(w), len(w))
+                xb = -w[idx]
+                xb_max = float(xb.max())
+                boot.append(-(xb_max + np.log(np.exp(xb - xb_max).mean())))
+            boot_sd = float(np.std(boot, ddof=1))
+
+            # ── Derived diagnostics ──────────────────────────────────────────
+            unjoined_total = int(unjoined_arr.sum())
+            attempts_total = int(attempts_arr.sum())
+            accepts_total  = int(accepts_arr.sum())
+            d_size_local = (
+                int((A_end_mask & ~A_start_mask).sum()))
+            # unjoined fraction = mean over traj of (unjoined / D_size).
+            # =1 ⇒ every traj failed to join at all; 0 ⇒ all fully joined.
+            if d_size_local > 0:
+                unjoined_fraction = float(unjoined_arr.mean() / d_size_local)
+            else:
+                unjoined_fraction = 0.0
+            topo_accept_rate = (accepts_total / attempts_total) if attempts_total > 0 else 0.0
+
+            # Kish's effective sample size for the Jarzynski (importance) mean.
+            # ESS = (Σ exp(-w))² / Σ exp(-2w), in [1, n_traj].  ESS << n_traj
+            # signals that a few rare trajectories dominate <exp(-w)>.
+            ex_shifted_2 = ex_shifted ** 2
+            ess = float(ex_shifted.sum() ** 2 / ex_shifted_2.sum())
+
+            # Work distribution skewness & excess kurtosis (heavy left tail →
+            # Jarzynski estimator unstable).
+            w_c = w - work_mean
+            if work_var > 0:
+                sd = np.sqrt(work_var)
+                work_skew     = float((w_c**3).mean() / sd**3)
+                work_kurtosis = float((w_c**4).mean() / sd**4 - 3.0)
+            else:
+                work_skew = 0.0
+                work_kurtosis = 0.0
+
+            diff_str = ""
+            diff = None
+            if ed_ref is not None:
+                diff = delta_s2 - ed_ref
+                diff_str = (f"diff_vs_ED={diff:+.4f} "
+                            f"({diff/max(boot_sd,1e-12):+.2f}σ) ")
+
+            if verbose:
+                print(f"[MPI-WORK] K={K:4d}: ΔS_2={delta_s2:+.4f} (boot sd {boot_sd:.4f}) "
+                      f"<w>={work_mean:+.3f} var={work_var:.2f} "
+                      f"skew={work_skew:+.2f} kurt={work_kurtosis:+.2f} "
+                      f"ESS={ess:.0f}/{n_trajectories} ({ess/n_trajectories:.1%}) "
+                      f"unjoined_frac={unjoined_fraction:.1%} "
+                      f"topo_acc={topo_accept_rate:.1%} "
+                      f"{diff_str}elapsed={t_elapsed:.1f}s", flush=True)
+
+            results[K] = dict(
+                delta_s2=delta_s2, boot_sd=boot_sd,
+                work_mean=work_mean, work_var=work_var,
+                work_skew=work_skew, work_kurtosis=work_kurtosis,
+                ess=ess, ess_fraction=ess / max(n_trajectories, 1),
+                unjoined=unjoined_total, unjoined_fraction=unjoined_fraction,
+                attempts=attempts_total, accepts=accepts_total,
+                topo_accept_rate=topo_accept_rate,
+                diff_vs_ED=diff if diff is not None else float("nan"),
+                elapsed=t_elapsed,
+                # Per-trajectory arrays for HDF5
+                work_samples=w,
+                final_swap_counts=final_swap,
+                unjoined_counts_per_traj=unjoined_arr,
+                topology_attempts_per_traj=attempts_arr,
+                topology_accepts_per_traj=accepts_arr,
+            )
+
+    if rank == 0:
+        if filepath:
+            _save_hdf5(filepath, dict(
+                N=N, M=M, Omega=Omega, Rb=Rb,
+                delta_min=delta_min, delta_max=delta_max, epsilon=epsilon,
+                neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
+                seed=seed, n_ranks=n_ranks, n_trajectories=n_trajectories,
+                n_thermalize=n_thermalize, decorrelation_steps=decorrelation_steps,
+                A_start_mask=A_start_mask, A_end_mask=A_end_mask,
+                ed_reference=ed_ref, K_values=K_values, results=results,
+            ))
+            if verbose:
+                print(f"[MPI-WORK] saved HDF5 → {filepath}", flush=True)
+        return {"ed_reference": ed_ref, "K_results": results}
+    return None
+
+
+def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
+                       pos, region_pairs, K_values,
+                       n_trajectories, n_thermalize, decorrelation_steps,
+                       neighbor_cutoff=-1, delta_groups=600, seed=7,
+                       compute_ed=True, filepath=None, kp_meta=None,
+                       verbose=True) -> dict | None:
+    """Run the work engine for a list of (region_name, A_start_mask, A_end_mask).
+
+    Each region pair is run independently (separate thermalization).  Results
+    aggregated on rank 0 and (optionally) saved as a single HDF5 grouping by
+    region name -- ready for downstream KP composer (γ = Σ ± S_2).
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    if rank == 0 and verbose:
+        names = [n for n, _, _ in region_pairs]
+        print(f"[MPI-WORK-KP] N={N}, M={M}, regions={names}, K_values={K_values}, "
+              f"n_traj={n_trajectories}", flush=True)
+        if kp_meta is not None:
+            print(f"[MPI-WORK-KP] kp_meta={kp_meta}", flush=True)
+
+    all_results: dict[str, dict] = {}
+    for region_name, A_start_mask, A_end_mask in region_pairs:
+        if rank == 0 and verbose:
+            print(f"\n[MPI-WORK-KP] ─── region {region_name} "
+                  f"(|A_end|={int(A_end_mask.sum())}, "
+                  f"|D|={int((A_end_mask & ~A_start_mask).sum())}) ───",
+                  flush=True)
+        out = run_work_mpi(
+            N=N, M=M, Omega=Omega, Rb=Rb,
+            delta_min=delta_min, delta_max=delta_max, epsilon=epsilon,
+            pos=pos, A_start_mask=A_start_mask, A_end_mask=A_end_mask,
+            K_values=K_values,
+            n_trajectories=n_trajectories,
+            n_thermalize=n_thermalize,
+            decorrelation_steps=decorrelation_steps,
+            neighbor_cutoff=neighbor_cutoff,
+            delta_groups=delta_groups,
+            seed=seed + 7919 * (hash(region_name) & 0xFFFF),
+            compute_ed=compute_ed,
+            filepath=None,    # we write a combined file at the end
+            verbose=verbose,
+        )
+        if rank == 0:
+            all_results[region_name] = dict(
+                A_start_mask=A_start_mask, A_end_mask=A_end_mask,
+                ed_reference=out["ed_reference"], K_results=out["K_results"],
+            )
+
+    if rank == 0:
+        if verbose:
+            print("\n[MPI-WORK-KP] ─── Summary ───", flush=True)
+            # Compact one-line per region per K
+            for region_name, payload in all_results.items():
+                for K, res in payload["K_results"].items():
+                    ed_str = (f"ed={payload['ed_reference']:+.4f}" if payload['ed_reference'] is not None
+                              else "ed=N/A")
+                    print(f"  {region_name:4s} K={K:4d}: ΔS_2={res['delta_s2']:+.4f} "
+                          f"(boot sd {res['boot_sd']:.4f}) {ed_str}", flush=True)
+
+            # If running all 7, also compute γ for each K from work-engine alone
+            present = set(all_results.keys())
+            if {"A","B","C","AB","BC","CA","ABC"}.issubset(present):
+                for K in K_values:
+                    s = {n: all_results[n]["K_results"][K]["delta_s2"]
+                         for n in ("A","B","C","AB","BC","CA","ABC")}
+                    gamma = (s["A"] + s["B"] + s["C"]
+                             - s["AB"] - s["BC"] - s["CA"]
+                             + s["ABC"])
+                    print(f"  γ(K={K}) = S(A)+S(B)+S(C) - S(AB)-S(BC)-S(CA) + S(ABC) "
+                          f"= {gamma:+.4f}", flush=True)
+
+        if filepath is not None:
+            _save_hdf5_kp(filepath, dict(
+                N=N, M=M, Omega=Omega, Rb=Rb,
+                delta_min=delta_min, delta_max=delta_max, epsilon=epsilon,
+                neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
+                seed=seed, n_trajectories=n_trajectories,
+                n_thermalize=n_thermalize, decorrelation_steps=decorrelation_steps,
+                K_values=K_values, kp_meta=kp_meta or {},
+                regions=all_results,
+            ))
+            if verbose:
+                print(f"\n[MPI-WORK-KP] saved HDF5 → {filepath}", flush=True)
+        return {"regions": all_results, "K_values": K_values}
+    return None
+
+
+def _write_K_result_group(sg, res: dict) -> None:
+    """Common writer for a per-K result group.
+
+    Writes scalar diagnostics as attrs and per-trajectory arrays as datasets.
+    """
+    import h5py  # noqa: F401 (h5py group passed in)
+    scalar_keys = ("delta_s2", "boot_sd", "work_mean", "work_var",
+                   "work_skew", "work_kurtosis",
+                   "ess", "ess_fraction",
+                   "unjoined", "unjoined_fraction",
+                   "attempts", "accepts", "topo_accept_rate",
+                   "diff_vs_ED", "elapsed")
+    for key in scalar_keys:
+        if key in res:
+            sg.attrs[key] = res[key]
+    # Per-trajectory arrays (compressed since they can be large).
+    dataset_keys = {
+        "work_samples": "float64",
+        "final_swap_counts": "int32",
+        "unjoined_counts_per_traj": "int32",
+        "topology_attempts_per_traj": "int64",
+        "topology_accepts_per_traj": "int64",
+    }
+    for key, dtype in dataset_keys.items():
+        if key in res:
+            sg.create_dataset(key, data=res[key], dtype=dtype, compression="gzip")
+
+
+def _save_hdf5_kp(path: str, payload: dict) -> None:
+    import datetime
+    import h5py
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with h5py.File(path, "w") as f:
+        pg = f.create_group("params")
+        for k in ("N", "M", "Omega", "Rb", "delta_min", "delta_max", "epsilon",
+                  "neighbor_cutoff", "delta_groups", "seed",
+                  "n_trajectories", "n_thermalize", "decorrelation_steps"):
+            pg.attrs[k] = payload[k]
+        pg.attrs["timestamp"] = datetime.datetime.utcnow().isoformat()
+        for kk, vv in payload["kp_meta"].items():
+            pg.attrs[f"kp_{kk}"] = vv
+
+        rg = f.create_group("regions")
+        rg.attrs["region_names"] = np.array(list(payload["regions"].keys()), dtype="S8")
+        for name, payload_r in payload["regions"].items():
+            ng = rg.create_group(name)
+            ng.create_dataset("A_start_mask", data=payload_r["A_start_mask"], dtype="uint8")
+            ng.create_dataset("A_end_mask",   data=payload_r["A_end_mask"],   dtype="uint8")
+            ng.attrs["A_start_size"] = int(payload_r["A_start_mask"].sum())
+            ng.attrs["A_end_size"]   = int(payload_r["A_end_mask"].sum())
+            ng.attrs["D_size"] = int((payload_r["A_end_mask"] & ~payload_r["A_start_mask"]).sum())
+            if payload_r["ed_reference"] is not None:
+                ng.attrs["ed_reference"] = payload_r["ed_reference"]
+            kg = ng.create_group("K_results")
+            for K, res in payload_r["K_results"].items():
+                sg = kg.create_group(f"K_{K}")
+                _write_K_result_group(sg, res)
+            kg.attrs["K_values"] = np.array(payload["K_values"], dtype=np.int64)
+
+
+def _save_hdf5(path: str, payload: dict) -> None:
+    import datetime
+    import h5py
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with h5py.File(path, "w") as f:
+        pg = f.create_group("params")
+        for k in ("N", "M", "Omega", "Rb", "delta_min", "delta_max", "epsilon",
+                  "neighbor_cutoff", "delta_groups", "seed",
+                  "n_ranks", "n_trajectories", "n_thermalize",
+                  "decorrelation_steps"):
+            pg.attrs[k] = payload[k]
+        pg.attrs["timestamp"] = datetime.datetime.utcnow().isoformat()
+
+        rg = f.create_group("regions")
+        rg.create_dataset("A_start_mask", data=payload["A_start_mask"], dtype="uint8")
+        rg.create_dataset("A_end_mask",   data=payload["A_end_mask"],   dtype="uint8")
+        rg.attrs["A_start_size"] = int(payload["A_start_mask"].sum())
+        rg.attrs["A_end_size"]   = int(payload["A_end_mask"].sum())
+        rg.attrs["D_size"] = int((payload["A_end_mask"] & ~payload["A_start_mask"]).sum())
+        if payload["ed_reference"] is not None:
+            rg.attrs["ed_reference"] = payload["ed_reference"]
+
+        kg = f.create_group("K_results")
+        for K, res in payload["results"].items():
+            sg = kg.create_group(f"K_{K}")
+            _write_K_result_group(sg, res)
+        kg.attrs["K_values"] = np.array(payload["K_values"], dtype=np.int64)
+
+
+def _parse_region_spec(spec: str, N: int) -> np.ndarray:
+    """Parse a region spec as either a comma-separated bit string (len N) or
+    a colon-separated list of site indices (e.g. "0:1:2") into a length-N mask."""
+    if ":" in spec:
+        sites = [int(s.strip()) for s in spec.split(":") if s.strip() != ""]
+        mask = np.zeros(N, dtype=np.uint8)
+        for s in sites:
+            if s < 0 or s >= N:
+                raise ValueError(f"site {s} out of range [0,{N})")
+            mask[s] = 1
+        return mask
+    return _parse_mask(spec, N)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MPI driver for QAQMC Renyi work engine")
+    # Lattice / Hamiltonian
+    parser.add_argument("--lattice", type=str, default="1d_chain",
+                        choices=["1d_chain", "kagome_bond", "kagome_bond_triangle"])
+    parser.add_argument("--N", type=int, default=0,
+                        help="(1d_chain) site count. Ignored for kagome_bond (computed from nx,ny).")
+    parser.add_argument("--nx", type=int, default=6, help="(kagome_bond) cells in x")
+    parser.add_argument("--ny", type=int, default=6, help="(kagome_bond) cells in y")
+    parser.add_argument("--a", type=float, default=1.0, help="lattice constant")
+    parser.add_argument("--M", type=int, default=100)
+    parser.add_argument("--Omega", type=float, default=1.0)
+    parser.add_argument("--Rb", type=float, default=1.2)
+    parser.add_argument("--delta-min", type=float, default=-1.0)
+    parser.add_argument("--delta-max", type=float, default=2.0)
+    parser.add_argument("--epsilon", type=float, default=0.05)
+    parser.add_argument("--neighbor-cutoff", type=int, default=-1)
+    parser.add_argument("--delta-groups", type=int, default=600)
+    # Region pair: either bit string ("1,0,1,0,...") or site index list ("0:2:5")
+    parser.add_argument("--A-end", type=str, default=None,
+                        help='region mask: bit string "1,0,..." or site list "0:2:5". '
+                             "Required unless --kp-regions is given.")
+    parser.add_argument("--A-start", type=str, default=None,
+                        help="region mask; default = zeros. Ignored if --kp-regions given.")
+    # KP convenience: use src/kp/kp_geometry helpers to build region masks
+    parser.add_argument("--kp-regions", type=str, default=None,
+                        help='comma-separated subset of {A,B,C,AB,BC,CA,ABC} or "all" '
+                             "for the standard 7-region KP set. Each region is run "
+                             "as ∅→region. Triggers KP mode, overriding --A-end/--A-start.")
+    parser.add_argument("--kp-start", type=str, default=None,
+                        help="(kp pair mode) starting KP region name, e.g. 'A'. "
+                             "Must be used together with --kp-end. The pair must be "
+                             "nested (start ⊆ end), e.g. A→AB, B→BC, A→ABC.")
+    parser.add_argument("--kp-end", type=str, default=None,
+                        help="(kp pair mode) ending KP region name, e.g. 'AB'.")
+    parser.add_argument("--kp-m", type=int, default=1,
+                        help="(kp) KP construction size; m=1 is the minimal hexagon.")
+    parser.add_argument("--kp-preferred-center", type=str, default=None,
+                        help="(kp) preferred KP center label, e.g. 'C24'; default auto-pick.")
+    # Protocol / sampling
+    parser.add_argument("--K-values", type=str, default="200",
+                        help="comma-separated K values to sweep (use one value for production)")
+    parser.add_argument("--n-trajectories", type=int, default=4000)
+    parser.add_argument("--n-thermalize", type=int, default=3000)
+    parser.add_argument("--decorrelation-steps", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=7)
+    # Output / misc
+    parser.add_argument("--filepath", type=str, default=None,
+                        help="optional HDF5 output path")
+    parser.add_argument("--skip-ed", action="store_true",
+                        help="skip ED reference computation (forced if N > 16)")
+    args = parser.parse_args()
+
+    if args.lattice == "1d_chain":
+        if args.N <= 0:
+            raise ValueError("--N must be >0 for 1d_chain")
+        pos = generate_1d_chain(args.N, args.a)
+        N = args.N
+    elif args.lattice == "kagome_bond":
+        pos = generate_kagome_bond_lattice(args.nx, args.ny, args.a)
+        N = len(pos)
+    elif args.lattice == "kagome_bond_triangle":
+        pos = generate_kagome_bond_triangle_lattice(args.nx, args.ny, args.a)
+        N = len(pos)
+    else:
+        raise ValueError(f"unsupported lattice {args.lattice}")
+
+    K_values = [int(k) for k in args.K_values.split(",")]
+
+    kp_pair_mode  = bool(args.kp_start or args.kp_end)
+    kp_set_mode   = bool(args.kp_regions)
+    if kp_pair_mode and kp_set_mode:
+        raise ValueError(
+            "use either --kp-regions (∅→each) or --kp-start/--kp-end (start→end pair), "
+            "not both"
+        )
+    if kp_pair_mode and (args.kp_start is None or args.kp_end is None):
+        raise ValueError("--kp-start and --kp-end must be given together")
+
+    if kp_set_mode or kp_pair_mode:
+        # ── KP mode: use src.kp.kp_geometry to build masks ───────────────────
+        if args.lattice == "1d_chain":
+            raise ValueError("--kp-regions / --kp-start/end require a kagome lattice")
+        from src.kp.kp_geometry import (
+            KP_REGION_NAMES,
+            build_kp_region_masks_for_lattice,
+        )
+        spec = build_kp_region_masks_for_lattice(
+            args.lattice, args.nx, args.ny, m=args.kp_m, a=args.a,
+            preferred_center_label=args.kp_preferred_center,
+        )
+
+        if kp_pair_mode:
+            for name in (args.kp_start, args.kp_end):
+                if name not in KP_REGION_NAMES:
+                    raise ValueError(
+                        f"unknown KP region {name!r}; valid = {KP_REGION_NAMES}"
+                    )
+            start_mask = spec.region_masks[args.kp_start]
+            end_mask   = spec.region_masks[args.kp_end]
+            # validate nested
+            if np.any(start_mask & ~end_mask):
+                raise ValueError(
+                    f"--kp-start={args.kp_start!r} is NOT a subset of --kp-end={args.kp_end!r}; "
+                    f"start has {int(start_mask.sum())} sites, end has {int(end_mask.sum())}, "
+                    f"sites in start∖end = {int((start_mask & ~end_mask).sum())}"
+                )
+            pair_name = f"{args.kp_start}_to_{args.kp_end}"
+            region_pairs = [(pair_name, start_mask, end_mask)]
+        else:
+            names = (KP_REGION_NAMES if args.kp_regions.strip().lower() == "all"
+                     else tuple(s.strip() for s in args.kp_regions.split(",") if s.strip()))
+            unknown = [n for n in names if n not in KP_REGION_NAMES]
+            if unknown:
+                raise ValueError(f"unknown KP region names: {unknown}; "
+                                 f"valid = {KP_REGION_NAMES}")
+            region_pairs = [(name, np.zeros(N, dtype=np.uint8), spec.region_masks[name])
+                            for name in names]
+
+        run_kp_regions_mpi(
+            N=N, M=args.M, Omega=args.Omega, Rb=args.Rb,
+            delta_min=args.delta_min, delta_max=args.delta_max,
+            epsilon=args.epsilon, pos=pos,
+            region_pairs=region_pairs,
+            K_values=K_values,
+            n_trajectories=args.n_trajectories,
+            n_thermalize=args.n_thermalize,
+            decorrelation_steps=args.decorrelation_steps,
+            neighbor_cutoff=args.neighbor_cutoff,
+            delta_groups=args.delta_groups,
+            seed=args.seed,
+            compute_ed=(not args.skip_ed),
+            filepath=args.filepath,
+            kp_meta=dict(
+                lattice=args.lattice, nx=args.nx, ny=args.ny, a=args.a,
+                m=args.kp_m, center_label=spec.center_label,
+                mode=("pair" if kp_pair_mode else "regions"),
+                start_region=(args.kp_start or ""),
+                end_region=(args.kp_end or ""),
+            ),
+        )
+        return
+
+    if args.A_end is None:
+        raise ValueError("--A-end is required when --kp-regions is not given")
+    A_end   = _parse_region_spec(args.A_end,   N)
+    A_start = _parse_region_spec(args.A_start, N) if args.A_start else np.zeros(N, dtype=np.uint8)
+
+    run_work_mpi(
+        N=N, M=args.M, Omega=args.Omega, Rb=args.Rb,
+        delta_min=args.delta_min, delta_max=args.delta_max,
+        epsilon=args.epsilon, pos=pos,
+        A_start_mask=A_start, A_end_mask=A_end,
+        K_values=K_values,
+        n_trajectories=args.n_trajectories,
+        n_thermalize=args.n_thermalize,
+        decorrelation_steps=args.decorrelation_steps,
+        neighbor_cutoff=args.neighbor_cutoff,
+        delta_groups=args.delta_groups,
+        seed=args.seed,
+        compute_ed=(not args.skip_ed),
+        filepath=args.filepath,
+    )
+
+
+if __name__ == "__main__":
+    main()

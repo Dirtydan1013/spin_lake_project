@@ -13,6 +13,9 @@ public:
     enum class Mode {
         PairToggle = 0,
         Expanded = 1,
+        Work = 2,        // dynamic single-bit topology toggles driven by an outer
+                         // nonequilibrium-work engine; mc_step() skips topology /
+                         // ensemble update so the outer engine owns mask transitions
     };
 
     struct ReplicaState {
@@ -133,6 +136,32 @@ public:
     void topology_toggle();
     void ensemble_switch();
     double log_weight_ratio_for_site(int site, int from_topology, int to_topology) const;
+
+    // ── Single-bit-toggle primitives for Mode::Work ───────────────────────────
+    // These let an outer engine (e.g. QAQMCRenyiWorkEngine) drive dynamic
+    // topology proposals without re-running set_topology_pair's full rebuild.
+    void set_mode(Mode m) { mode_ = m; }
+    // Work-mode counterpart of set_A_mask: switches A_mask_ to the given mask,
+    // **reprojects all site operators** under the new mask (critical, since
+    // diagonal_update preserves offdiag op_types and would otherwise leave
+    // stale -1 slots from a previous boundary), recomputes midpoint states,
+    // and leaves mode_ == Mode::Work.
+    void set_A_mask_for_work(const uint8_t* mask, int len);
+    // log[ Z(A_mask_ ^ {site}) / Z(A_mask_) ], based on current operator strings.
+    double log_weight_ratio_for_toggle(int site) const;
+    // Apply A_mask_[site] ^= 1 and reproject affected site ops at p >= M.
+    // Caller is responsible for the Metropolis accept/reject before calling this.
+    void apply_single_bit_toggle(int site);
+
+    // ── Op-string checkpoint (for the work engine's checkpoint chain) ─────
+    // Save / restore the current operator string for BOTH replicas.  The mask
+    // is NOT saved; the caller is responsible for arranging A_mask_ to match
+    // the mask the checkpoint was saved under (typically A_start) before
+    // restoring.  After restore, state_at_M is recomputed.
+    void save_op_string_checkpoint();
+    void restore_op_string_checkpoint();
+    bool has_op_string_checkpoint() const { return op_ckpt_valid_; }
+    void invalidate_op_string_checkpoint() { op_ckpt_valid_ = false; }
     void set_indicator_site(int site);
     int get_indicator_site() const { return indicator_site_; }
     void reset_indicator();
@@ -168,6 +197,11 @@ private:
 
     std::array<ReplicaState, 2> replicas_;
     std::array<std::mt19937_64, 2> rngs_;
+
+    // Op-string checkpoint (work-engine checkpoint chain).  Not saved by ctor.
+    bool op_ckpt_valid_{false};
+    std::array<std::vector<int32_t>, 2> op_ckpt_types_;
+    std::array<std::vector<int32_t>, 2> op_ckpt_sites_;
 
     Mode mode_{Mode::PairToggle};
     std::vector<uint8_t> A_mask_;
