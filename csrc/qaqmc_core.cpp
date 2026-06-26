@@ -239,6 +239,10 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
     // Build V_ij (with optional neighbor cutoff)
     vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff);
 
+    // Cache positions for downstream observables (dimer structure factor etc.)
+    pos_dim_ = pos_dim;
+    pos_flat_.assign(pos, pos + N * pos_dim);
+
     // Build delta schedule: delta_min -> delta_max -> delta_min
     delta_sched_.resize(M_total_);
     for (int p = 0; p < M_; ++p) {
@@ -496,8 +500,21 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
     prof.density.resize(n_points, 0.0);
     const int n_zg = (int)loop_group_n_copies_.size();
     const int n_cg = (int)string_group_n_copies_.size();
+    const int n_q  = (int)dimer_q_points_.size();
     prof.Z_l_by_size.assign(n_zg,   std::vector<double>(n_points, 0.0));
     prof.C_m_l_by_size.assign(n_cg, std::vector<double>(n_points, 0.0));
+    if (n_q > 0) {
+        prof.s_q_real.assign(n_q, std::vector<double>(n_points, 0.0));
+        prof.s_q_imag.assign(n_q, std::vector<double>(n_points, 0.0));
+        prof.s_q_abs1.assign(n_q, std::vector<double>(n_points, 0.0));
+        prof.s_q_abs2.assign(n_q, std::vector<double>(n_points, 0.0));
+        prof.s_q_abs3.assign(n_q, std::vector<double>(n_points, 0.0));
+        prof.s_q_abs4.assign(n_q, std::vector<double>(n_points, 0.0));
+    }
+    // Snapshot bookkeeping: copy full state at requested profile points.
+    const int n_snap = (int)snapshot_point_indices_.size();
+    if (n_snap > 0) prof.snapshots.assign(n_snap, std::vector<int8_t>(N_, 0));
+    size_t next_snap = 0;  // running pointer into sorted snapshot_point_indices_
 
     // Propagate state from left boundary |0...0>
     std::vector<int32_t> state(N_, 0);
@@ -541,11 +558,199 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
                     prof.C_m_l_by_size[g][out_idx] /= (double)string_group_n_copies_[g];
             }
 
+            // Dimer structure factor s_q = Σ_{i ∈ bulk} n_i e^{i q·r_i}.
+            // Uses bulk_sites_ if non-empty (same convention as density),
+            // else all N sites.  Same snapshot timing as density/Z/C — i.e.,
+            // after applying op at slot p (asymmetric profile observable at
+            // δ_sched_[p+1] in the dimer "before-op" convention).
+            if (n_q > 0) {
+                for (int qi = 0; qi < n_q; ++qi) {
+                    double sx = 0.0, sy = 0.0;
+                    const double* cosq = &dimer_phase_cos_[(size_t)qi * N_];
+                    const double* sinq = &dimer_phase_sin_[(size_t)qi * N_];
+                    if (!bulk_sites_.empty()) {
+                        for (int i : bulk_sites_) {
+                            if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
+                        }
+                    } else {
+                        for (int i = 0; i < N_; ++i) {
+                            if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
+                        }
+                    }
+                    double abs2 = sx * sx + sy * sy;
+                    double abs1 = std::sqrt(abs2);
+                    prof.s_q_real[qi][out_idx] = sx;
+                    prof.s_q_imag[qi][out_idx] = sy;
+                    prof.s_q_abs1[qi][out_idx] = abs1;
+                    prof.s_q_abs2[qi][out_idx] = abs2;
+                    prof.s_q_abs3[qi][out_idx] = abs2 * abs1;
+                    prof.s_q_abs4[qi][out_idx] = abs2 * abs2;
+                }
+            }
+
+            // Snapshot the full state at requested profile points (all N sites,
+            // same "after op p" convention as density/SF above).
+            if (next_snap < snapshot_point_indices_.size()
+                && snapshot_point_indices_[next_snap] == out_idx) {
+                std::vector<int8_t>& snap = prof.snapshots[next_snap];
+                for (int i = 0; i < N_; ++i) snap[i] = (int8_t)state[i];
+                ++next_snap;
+            }
+
             ++out_idx;
         }
     }
 
     return prof;
+}
+
+void QAQMCEngine::set_snapshot_point_indices(const std::vector<int>& point_indices) {
+    snapshot_point_indices_ = point_indices;
+    std::sort(snapshot_point_indices_.begin(), snapshot_point_indices_.end());
+    snapshot_point_indices_.erase(
+        std::unique(snapshot_point_indices_.begin(), snapshot_point_indices_.end()),
+        snapshot_point_indices_.end());
+    for (int idx : snapshot_point_indices_) {
+        if (idx < 0) {
+            throw std::runtime_error(
+                "set_snapshot_point_indices: profile-point index must be >= 0");
+        }
+    }
+}
+
+// ─── Dimer (density-density) structure factor ───────────────────────────────
+
+void QAQMCEngine::set_dimer_sf_q_points(
+        const std::vector<std::vector<double>>& q_points) {
+    if (pos_flat_.empty()) {
+        throw std::runtime_error("set_dimer_sf_q_points: site positions not set");
+    }
+    const int n_q = static_cast<int>(q_points.size());
+    dimer_q_points_ = q_points;
+    dimer_phase_cos_.assign((size_t)n_q * (size_t)N_, 0.0);
+    dimer_phase_sin_.assign((size_t)n_q * (size_t)N_, 0.0);
+
+    for (int qi = 0; qi < n_q; ++qi) {
+        const auto& q = q_points[qi];
+        if ((int)q.size() != pos_dim_) {
+            throw std::runtime_error(
+                "set_dimer_sf_q_points: q vector dim mismatch with site pos_dim");
+        }
+        for (int i = 0; i < N_; ++i) {
+            double qr = 0.0;
+            for (int d = 0; d < pos_dim_; ++d) {
+                qr += q[d] * pos_flat_[i * pos_dim_ + d];
+            }
+            dimer_phase_cos_[(size_t)qi * N_ + i] = std::cos(qr);
+            dimer_phase_sin_[(size_t)qi * N_ + i] = std::sin(qr);
+        }
+    }
+}
+
+void QAQMCEngine::set_dimer_sf_measure_p_indices(
+        const std::vector<int>& p_indices) {
+    dimer_p_indices_.clear();
+    dimer_deltas_used_.clear();
+    if (delta_sched_.empty()) {
+        throw std::runtime_error("set_dimer_sf_measure_p_indices: delta schedule not built");
+    }
+    for (int p : p_indices) {
+        if (p < 0 || p >= M_) {
+            throw std::runtime_error(
+                "set_dimer_sf_measure_p_indices: p must be in forward ramp [0, M)");
+        }
+        dimer_p_indices_.push_back(p);
+    }
+    // Sort ascending so propagation in measure_dimer_sf is a single forward sweep.
+    std::sort(dimer_p_indices_.begin(), dimer_p_indices_.end());
+    for (int p : dimer_p_indices_) {
+        dimer_deltas_used_.push_back(delta_sched_[p]);
+    }
+}
+
+void QAQMCEngine::set_dimer_sf_measure_deltas(
+        const std::vector<double>& target_deltas) {
+    if (delta_sched_.empty()) {
+        throw std::runtime_error("set_dimer_sf_measure_deltas: delta schedule not built");
+    }
+    std::vector<int> p_idx;
+    p_idx.reserve(target_deltas.size());
+    for (double target : target_deltas) {
+        // Forward ramp only: argmin over p ∈ [0, M).
+        int best_p = 0;
+        double best_diff = std::abs(delta_sched_[0] - target);
+        for (int p = 1; p < M_; ++p) {
+            double d = std::abs(delta_sched_[p] - target);
+            if (d < best_diff) { best_diff = d; best_p = p; }
+        }
+        p_idx.push_back(best_p);
+    }
+    set_dimer_sf_measure_p_indices(p_idx);
+}
+
+QAQMCEngine::DimerSFSample QAQMCEngine::measure_dimer_sf() const {
+    const int n_p = static_cast<int>(dimer_p_indices_.size());
+    const int n_q = static_cast<int>(dimer_q_points_.size());
+    DimerSFSample out;
+    out.density.assign(n_p, 0.0);
+    out.s_q_real.assign((size_t)n_p * (size_t)n_q, 0.0);
+    out.s_q_imag.assign((size_t)n_p * (size_t)n_q, 0.0);
+    out.s_q_abs2.assign((size_t)n_p * (size_t)n_q, 0.0);
+    if (n_p == 0 || n_q == 0) return out;
+
+    // Walk forward from p=0, flipping offdiag ops; at each target p, snapshot s_q.
+    std::vector<int32_t> state(N_, 0);
+    size_t next_idx = 0;
+    const int target_max = dimer_p_indices_.back();
+
+    for (int p = 0; p <= target_max; ++p) {
+        // If this p is a measurement point, snapshot BEFORE applying op at p.
+        // (state[i] here is n_i at "just after slice p-1 finished" = entering p.
+        //  Equivalent to "state at p" in the trace boundary convention.)
+        while (next_idx < dimer_p_indices_.size()
+               && dimer_p_indices_[next_idx] == p) {
+            // density (bulk if set, else all sites)
+            const std::vector<int>& site_list =
+                bulk_sites_.empty() ? std::vector<int>() : bulk_sites_;
+            double dens = 0.0;
+            if (!bulk_sites_.empty()) {
+                for (int s : bulk_sites_) dens += state[s];
+                out.density[next_idx] = dens / (double)bulk_sites_.size();
+            } else {
+                for (int i = 0; i < N_; ++i) dens += state[i];
+                out.density[next_idx] = dens / (double)N_;
+            }
+            // s_q = Σ_{i ∈ bulk} n_i e^{i q·r_i} for each q.
+            // If bulk_sites_ is non-empty, restrict the sum to the bulk
+            // (matches the density convention above), so boundary atoms can
+            // be excluded the same way as for ⟨n⟩.  Otherwise sum over all N.
+            for (int qi = 0; qi < n_q; ++qi) {
+                double sx = 0.0, sy = 0.0;
+                const double* cosq = &dimer_phase_cos_[(size_t)qi * N_];
+                const double* sinq = &dimer_phase_sin_[(size_t)qi * N_];
+                if (!bulk_sites_.empty()) {
+                    for (int i : bulk_sites_) {
+                        if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
+                    }
+                } else {
+                    for (int i = 0; i < N_; ++i) {
+                        if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
+                    }
+                }
+                size_t flat = (size_t)next_idx * (size_t)n_q + (size_t)qi;
+                out.s_q_real[flat] = sx;
+                out.s_q_imag[flat] = sy;
+                out.s_q_abs2[flat] = sx * sx + sy * sy;
+            }
+            ++next_idx;
+        }
+        // Apply op at slot p to advance state for the next iteration.
+        if (p < M_total_ && op_types_[p] == -1) {
+            state[op_sites_[p]] ^= 1;
+        }
+    }
+    (void)0;  // silence unused-var warnings if any
+    return out;
 }
 
 // ─── Diagonal Update ─────────────────────────────────────────────────────────

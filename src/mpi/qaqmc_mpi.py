@@ -34,6 +34,63 @@ from src.rydberg.lattices import (kagome_loop_string_translations,
                           kagome_vertex_sites)
 
 
+def _build_sf_q_points(sf_q_points_file=None, sf_q_path=None, sf_q_n=20, a=1.0):
+    """Return q-points array of shape (n_q, 2), or None if SF not requested.
+
+    Sources (first match wins):
+      - sf_q_points_file: path to .npy or .json giving an (n_q, 2) array.
+      - sf_q_path: named high-symmetry path for the kagome BZ
+                   (triangular Bravais, lattice constant `a`).
+        Currently supported:
+          'GammaMKGamma'  : Γ → M → K → Γ
+          'GammaKMGamma'  : Γ → K → M → Γ
+          'GammaM'        : Γ → M
+          'GammaK'        : Γ → K
+        sf_q_n = points per segment (endpoints repeated between segments).
+    """
+    if sf_q_points_file:
+        ext = os.path.splitext(sf_q_points_file)[1].lower()
+        if ext == '.npy':
+            q = np.load(sf_q_points_file)
+        elif ext in ('.json', '.txt'):
+            with open(sf_q_points_file) as f:
+                q = np.array(json.load(f), dtype=np.float64)
+        else:
+            q = np.loadtxt(sf_q_points_file)
+        q = np.atleast_2d(np.asarray(q, dtype=np.float64))
+        if q.shape[1] != 2:
+            raise ValueError(f"sf_q_points file must give (n_q, 2); got {q.shape}")
+        return q
+
+    if not sf_q_path:
+        return None
+
+    # Triangular Bravais lattice (v1=(a,0), v2=(a/2, a√3/2)) reciprocal:
+    #   b1 = (2π/a)(1, -1/√3),   b2 = (2π/a)(0, 2/√3)
+    Gamma = np.array([0.0, 0.0])
+    M_pt  = np.array([np.pi / a, np.pi / (a * np.sqrt(3))])
+    K_pt  = np.array([4.0 * np.pi / (3.0 * a), 0.0])
+
+    paths = {
+        'GammaMKGamma': [Gamma, M_pt, K_pt, Gamma],
+        'GammaKMGamma': [Gamma, K_pt, M_pt, Gamma],
+        'GammaM':       [Gamma, M_pt],
+        'GammaK':       [Gamma, K_pt],
+    }
+    if sf_q_path not in paths:
+        raise ValueError(f"unknown sf_q_path '{sf_q_path}'; choices={list(paths)}")
+    nodes = paths[sf_q_path]
+    n_seg = max(1, int(sf_q_n))
+
+    pts = []
+    for k in range(len(nodes) - 1):
+        q0, q1 = nodes[k], nodes[k + 1]
+        for t in np.linspace(0.0, 1.0, n_seg, endpoint=False):
+            pts.append((1 - t) * q0 + t * q1)
+    pts.append(np.asarray(nodes[-1], dtype=np.float64))
+    return np.asarray(pts, dtype=np.float64)
+
+
 def _parse_measure_every(me, default=1):
     """Parse measure_every into (me_density, me_zl, me_cml).
 
@@ -279,7 +336,7 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                      measure_every=1, filepath='data/qaqmc_onthefly.h5',
                      neighbor_cutoff=None, delta_groups=600, omp_threads=0,
                      nx=6, ny=6,
-                     loop_sizes=(3,), string_sizes=(2,), verbose=True):
+                     loop_sizes=None, string_sizes=None, verbose=True):
     """
     MPI-parallel QAQMC with on-the-fly observable computation.
 
@@ -335,13 +392,22 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     bulk = kagome_bulk_sites(nx, ny)
     engine._cpp_engine.set_bulk_sites(bulk)
 
-    # Set loop/string observable sites (multi-size)
+    # Set loop/string observable sites (multi-size).
+    # Default: enumerate all geometrically valid sizes for this lattice:
+    #   loop sizes   = 2 .. min(nx, ny) - 1
+    #   string sizes = 1 .. min(nx, ny) - 1
+    if loop_sizes is None:
+        loop_sizes = list(range(2, min(nx, ny)))
+    if string_sizes is None:
+        string_sizes = list(range(1, min(nx, ny)))
     loop_sets, string_sets, loop_meta, string_meta = kagome_multi_size_translations(
         nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
     engine._cpp_engine.set_observable_sites(loop_sets, string_sets)
 
     if verbose and rank == 0:
         print(f"[MPI-OTF] bulk sites: {len(bulk)} / {N} (interior atoms only)")
+        print(f"[MPI-OTF] loop sizes auto-selected: {list(loop_sizes)}")
+        print(f"[MPI-OTF] string sizes auto-selected: {list(string_sizes)}")
         for m in loop_meta:
             print(f"[MPI-OTF]   loop size={m['size']}: {m['n_copies']} copies "
                   f"(offset {m['offset']})")
@@ -523,8 +589,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     measure_every=1, profile_step=10000, batch_size=1000,
                     filepath='data/qaqmc_profile.h5',
                     neighbor_cutoff=None,
-                    loop_sizes=(3,), string_sizes=(2,),
-                    delta_groups=600, omp_threads=0, nx=6, ny=6, verbose=True):
+                    loop_sizes=None, string_sizes=None,
+                    delta_groups=600, omp_threads=0, nx=6, ny=6,
+                    sf_q_points=None, sf_delta_points=None,
+                    snapshot_deltas=None, n_snapshots=0,
+                    verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
 
@@ -580,6 +649,13 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     bulk = kagome_bulk_sites(nx, ny)
     engine._cpp_engine.set_bulk_sites(bulk)
 
+    # Default: enumerate all geometrically valid loop/string sizes:
+    #   loop sizes   = 2 .. min(nx, ny) - 1   (n_copies = (nx-s)(ny-s))
+    #   string sizes = 1 .. min(nx, ny) - 1
+    if loop_sizes is None:
+        loop_sizes = list(range(2, min(nx, ny)))
+    if string_sizes is None:
+        string_sizes = list(range(1, min(nx, ny)))
     loop_sets, string_sets, loop_meta, string_meta = kagome_multi_size_translations(
         nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
 
@@ -590,6 +666,31 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     all_loop_sets = loop_sets + vertex_sets
 
     engine._cpp_engine.set_observable_sites(all_loop_sets, string_sets)
+
+    # Optional: dimer structure factor S_d(q).  Setting q-points enables the
+    # SF accumulator inside measure_profile (same forward walk, no extra MC).
+    n_q = 0
+    if sf_q_points is not None and len(sf_q_points) > 0:
+        sf_q_points = np.asarray(sf_q_points, dtype=np.float64)
+        n_q = sf_q_points.shape[0]
+        engine._cpp_engine.set_dimer_sf_q_points(sf_q_points)
+
+    # Profile grid (point k → slice p_indices[k], δ = delta_sched[p_indices[k]])
+    M_total_  = engine._cpp_engine.M_total
+    n_points_ = M_total_ // profile_step
+    delta_sched_full = np.array(engine._cpp_engine.delta_schedule, dtype=np.float64)
+    prof_p_idx   = np.array([(k + 1) * profile_step - 1 for k in range(n_points_)],
+                            dtype=np.int64)
+    prof_delta   = delta_sched_full[prof_p_idx]   # δ at each profile point
+
+    # Optional: full-state snapshots at chosen δ values (snapped to profile grid).
+    snap_pt_indices = np.array([], dtype=np.int32)
+    if snapshot_deltas is not None and len(snapshot_deltas) > 0 and n_snapshots > 0:
+        req = np.asarray(snapshot_deltas, dtype=np.float64)
+        snap_pt_indices = np.unique(np.array(
+            [int(np.argmin(np.abs(prof_delta - d))) for d in req], dtype=np.int32))
+        engine._cpp_engine.set_snapshot_point_indices(snap_pt_indices)
+    n_snap_pts = len(snap_pt_indices)
 
     if verbose and rank == 0:
         M_total  = engine._cpp_engine.M_total
@@ -606,6 +707,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             print(f"[MPI-PROF]   string size={m['size']}: {m['n_copies']} copies "
                   f"(offset {m['offset']})")
         print(f"[MPI-PROF]   A_v vertices: {n_vertex} (offset {vertex_offset})")
+        if n_q > 0:
+            print(f"[MPI-PROF]   dimer SF: {n_q} q-points")
+        if n_snap_pts > 0:
+            print(f"[MPI-PROF]   snapshots: {n_snapshots}/rank at {n_snap_pts} "
+                  f"δ-points (δ≈{np.round(prof_delta[snap_pt_indices], 3).tolist()})")
 
     # Equilibration
     comm.Barrier()
@@ -635,7 +741,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     result = engine._cpp_engine.run_profile(
         0, my_n_samples, me_density, me_zl, me_cml, profile_step,
         batch_size,
-        sa_cb, 1000 if sa_cb is not None else 1)
+        sa_cb, 1000 if sa_cb is not None else 1,
+        n_snapshots if n_snap_pts > 0 else 0)
     if sa_bar is not None:
         sa_bar.close()
 
@@ -651,9 +758,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     n_points   = len(p_indices)
 
     # split Z_l size groups from A_v vertex group.
-    # Regular loop size groups are first (one per entry of loop_meta), vertex group is last.
-    # Vertex sets have set length 4 (distinct from any legal loop_size's set length ≥12),
-    # so they always form a single trailing group.
+    # Regular loop size groups are first (one per entry of loop_meta with n_copies>0),
+    # vertex group is last.  Zero-copy loop_meta entries (e.g. loop_size=4,5 on a
+    # 4x4 lattice → (nx-s)(ny-s)=0 copies) are NOT registered as C++ size groups
+    # because no copies exist, so we filter them out here too.
+    loop_meta = [m for m in loop_meta if m['n_copies'] > 0]
     n_loop_sg = len(loop_meta)
     if engine._cpp_engine.n_loop_size_groups != n_loop_sg + 1:
         raise RuntimeError(
@@ -663,6 +772,26 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     my_z_l = np.ascontiguousarray(my_z_raw[:, :, :n_loop_sg])    # (batches, pts, n_loop_sg)
     my_a_v = np.ascontiguousarray(my_z_raw[:, :, n_loop_sg])     # (batches, pts) — C++ already avg'd vertices
 
+    # Full-state snapshots (only present if snapshot points were set).
+    # Shape per rank: (n_snap_collected, n_snap_pts, N) int8.
+    my_snap = None
+    if n_snap_pts > 0 and 'snapshots' in result:
+        my_snap = np.ascontiguousarray(result['snapshots'], dtype=np.int8)
+
+    # Dimer SF (only present if q-points were set above).  Shape: (batches, pts, n_q).
+    my_sf_re = None; my_sf_im = None
+    my_sf_a1 = None; my_sf_a2 = None; my_sf_a3 = None; my_sf_a4 = None
+    if n_q > 0 and 's_q_real' in result:
+        my_sf_re = np.ascontiguousarray(result['s_q_real'], dtype=np.float64)
+        my_sf_im = np.ascontiguousarray(result['s_q_imag'], dtype=np.float64)
+        my_sf_a1 = np.ascontiguousarray(result['s_q_abs1'], dtype=np.float64)
+        my_sf_a2 = np.ascontiguousarray(result['s_q_abs2'], dtype=np.float64)
+        my_sf_a3 = np.ascontiguousarray(result['s_q_abs3'], dtype=np.float64)
+        my_sf_a4 = np.ascontiguousarray(result['s_q_abs4'], dtype=np.float64)
+
+    # Filter zero-copy string_meta entries for the same reason as loop_meta above:
+    # C++ only registers size groups for sizes with actual copies.
+    string_meta = [m for m in string_meta if m['n_copies'] > 0]
     n_string_sg = engine._cpp_engine.n_string_size_groups
 
     t_sample = time.perf_counter() - t0
@@ -701,6 +830,20 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     n_total_bz = int(batches_z.sum())
     n_total_bc = int(batches_c.sum())
 
+    # Gather full-state snapshots (collective; modest size → pickle gather is fine).
+    all_snap = None
+    all_snap_rank = None
+    if n_snap_pts > 0:
+        gathered = comm.gather(my_snap, root=0)
+        if rank == 0:
+            parts, rank_lbls = [], []
+            for r, g in enumerate(gathered):
+                if g is not None and len(g) > 0:
+                    parts.append(g)
+                    rank_lbls.append(np.full(len(g), r, dtype=np.int16))
+            all_snap      = np.concatenate(parts, axis=0)        # (total_snaps, n_snap_pts, N)
+            all_snap_rank = np.concatenate(rank_lbls)            # (total_snaps,) source rank
+
     if rank == 0:
         os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
 
@@ -708,11 +851,25 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         all_z_l     = np.empty((n_total_bz, n_points, n_loop_sg),       dtype=np.float64)
         all_a_v     = np.empty((n_total_bz, n_points),                  dtype=np.float64)
         all_c_m_l   = np.empty((n_total_bc, n_points, n_string_sg),     dtype=np.float64)
+        if n_q > 0:
+            all_sf_re = np.empty((n_total_bz, n_points, n_q), dtype=np.float64)
+            all_sf_im = np.empty((n_total_bz, n_points, n_q), dtype=np.float64)
+            all_sf_a1 = np.empty((n_total_bz, n_points, n_q), dtype=np.float64)
+            all_sf_a2 = np.empty((n_total_bz, n_points, n_q), dtype=np.float64)
+            all_sf_a3 = np.empty((n_total_bz, n_points, n_q), dtype=np.float64)
+            all_sf_a4 = np.empty((n_total_bz, n_points, n_q), dtype=np.float64)
 
         all_density[off_d[0] :off_d[0] +counts_d[0] ] = my_density
         all_z_l    [off_bz[0]:off_bz[0]+batches_z[0]] = my_z_l
         all_a_v    [off_bz[0]:off_bz[0]+batches_z[0]] = my_a_v
         all_c_m_l  [off_bc[0]:off_bc[0]+batches_c[0]] = my_c_m_l
+        if n_q > 0:
+            all_sf_re[off_bz[0]:off_bz[0]+batches_z[0]] = my_sf_re
+            all_sf_im[off_bz[0]:off_bz[0]+batches_z[0]] = my_sf_im
+            all_sf_a1[off_bz[0]:off_bz[0]+batches_z[0]] = my_sf_a1
+            all_sf_a2[off_bz[0]:off_bz[0]+batches_z[0]] = my_sf_a2
+            all_sf_a3[off_bz[0]:off_bz[0]+batches_z[0]] = my_sf_a3
+            all_sf_a4[off_bz[0]:off_bz[0]+batches_z[0]] = my_sf_a4
 
         for src in range(1, n_ranks):
             buf_d  = np.empty((counts_d[src],  n_points),                dtype=np.float64)
@@ -727,6 +884,25 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             all_z_l    [off_bz[src]:off_bz[src]+batches_z[src]] = buf_z
             all_a_v    [off_bz[src]:off_bz[src]+batches_z[src]] = buf_av
             all_c_m_l  [off_bc[src]:off_bc[src]+batches_c[src]] = buf_c
+            if n_q > 0:
+                buf_sf_re = np.empty((batches_z[src], n_points, n_q), dtype=np.float64)
+                buf_sf_im = np.empty((batches_z[src], n_points, n_q), dtype=np.float64)
+                buf_sf_a1 = np.empty((batches_z[src], n_points, n_q), dtype=np.float64)
+                buf_sf_a2 = np.empty((batches_z[src], n_points, n_q), dtype=np.float64)
+                buf_sf_a3 = np.empty((batches_z[src], n_points, n_q), dtype=np.float64)
+                buf_sf_a4 = np.empty((batches_z[src], n_points, n_q), dtype=np.float64)
+                comm.Recv(buf_sf_re, source=src, tag=600 + src)
+                comm.Recv(buf_sf_im, source=src, tag=700 + src)
+                comm.Recv(buf_sf_a1, source=src, tag=750 + src)
+                comm.Recv(buf_sf_a2, source=src, tag=800 + src)
+                comm.Recv(buf_sf_a3, source=src, tag=820 + src)
+                comm.Recv(buf_sf_a4, source=src, tag=850 + src)
+                all_sf_re[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_re
+                all_sf_im[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_im
+                all_sf_a1[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_a1
+                all_sf_a2[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_a2
+                all_sf_a3[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_a3
+                all_sf_a4[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_a4
 
         delta_sched = np.array(engine._cpp_engine.delta_schedule, dtype=np.float64)
 
@@ -765,15 +941,115 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             sg.create_dataset('p_indices',      data=p_indices)
             sg.create_dataset('delta_sampled',  data=delta_sched[p_indices])
 
+            # ── Provenance: which rank + which within-rank step each row came from ──
+            # Rows of every gathered array are concatenated in rank order, and are
+            # time-ordered within each rank's block. We store explicit per-row rank
+            # ids and within-rank indices so post-processing can drop burn-in
+            # without relying on n_samples being divisible by n_ranks.
+            #
+            # The within-rank sample index k corresponds to MC sampling step
+            #   actual_mc_step = n_equil + (k + 1) * <measure_every for that obs>
+            # i.e. k=0 is the first RECORDED sample, taken AFTER the n_equil warm-up.
+            pv = f.create_group('provenance')
+            pv.attrs['n_ranks']  = n_ranks
+            pv.attrs['n_equil']  = n_equil
+            pv.attrs['me_density'] = me_density
+            pv.attrs['me_zl']      = me_zl
+            pv.attrs['me_cml']     = me_cml
+            # density: per-sample (matches all_density rows)
+            dens_rank = np.concatenate([np.full(int(counts_d[r]), r, dtype=np.int16)
+                                        for r in range(n_ranks)])
+            dens_step = np.concatenate([np.arange(int(counts_d[r]), dtype=np.int32)
+                                        for r in range(n_ranks)])
+            pv.create_dataset('density_rank', data=dens_rank)   # (n_total_d,)
+            pv.create_dataset('density_step', data=dens_step)   # within-rank sample index
+            pv.create_dataset('density_rank_offsets', data=off_d.astype(np.int64))
+            pv.create_dataset('density_rank_counts',  data=counts_d.astype(np.int64))
+            # Z_l / A_v / dimer-SF batches (share the me_zl batch cadence)
+            zb_rank = np.concatenate([np.full(int(batches_z[r]), r, dtype=np.int16)
+                                      for r in range(n_ranks)])
+            zb_idx  = np.concatenate([np.arange(int(batches_z[r]), dtype=np.int32)
+                                      for r in range(n_ranks)])
+            pv.create_dataset('zbatch_rank', data=zb_rank)      # (n_total_bz,)
+            pv.create_dataset('zbatch_index', data=zb_idx)      # within-rank batch index
+            pv.create_dataset('zbatch_rank_offsets', data=off_bz.astype(np.int64))
+            pv.create_dataset('zbatch_rank_counts',  data=batches_z.astype(np.int64))
+            # C_m_l batches (me_cml cadence)
+            cb_rank = np.concatenate([np.full(int(batches_c[r]), r, dtype=np.int16)
+                                      for r in range(n_ranks)])
+            cb_idx  = np.concatenate([np.arange(int(batches_c[r]), dtype=np.int32)
+                                      for r in range(n_ranks)])
+            pv.create_dataset('cbatch_rank', data=cb_rank)      # (n_total_bc,)
+            pv.create_dataset('cbatch_index', data=cb_idx)
+            pv.create_dataset('cbatch_rank_offsets', data=off_bc.astype(np.int64))
+            pv.create_dataset('cbatch_rank_counts',  data=batches_c.astype(np.int64))
+            pv.attrs['batch_size'] = batch_size
+
             og = f.create_group('profiles')
             og.create_dataset('density', data=all_density)  # (n_density, n_points)
             og.create_dataset('Z_l',     data=all_z_l)       # (n_batches, n_points, n_loop_size_groups)
             og.create_dataset('A_v',     data=all_a_v)        # (n_batches, n_points) — mean over vertices (C++)
             og.create_dataset('C_m_l',   data=all_c_m_l)     # (n_batches, n_points, n_string_size_groups)
             og.attrs['n_vertices'] = n_vertex
+            if n_q > 0:
+                # Optional δ-subsetting: keep only the profile points nearest to
+                # the user-specified δ values; otherwise save SF at every profile
+                # point (same δ grid as density/Z/C).
+                delta_at_pts = delta_sched[p_indices]
+                if sf_delta_points is not None and len(sf_delta_points) > 0:
+                    req = np.asarray(sf_delta_points, dtype=np.float64)
+                    pick = np.array([int(np.argmin(np.abs(delta_at_pts - d))) for d in req])
+                    pick = np.unique(pick)  # drop duplicates if two reqs snap to same point
+                    sf_re_out = all_sf_re[:, pick, :]
+                    sf_im_out = all_sf_im[:, pick, :]
+                    sf_a1_out = all_sf_a1[:, pick, :]
+                    sf_a2_out = all_sf_a2[:, pick, :]
+                    sf_a3_out = all_sf_a3[:, pick, :]
+                    sf_a4_out = all_sf_a4[:, pick, :]
+                    sf_delta_used = delta_at_pts[pick]
+                    sf_p_used     = p_indices[pick]
+                else:
+                    sf_re_out = all_sf_re
+                    sf_im_out = all_sf_im
+                    sf_a1_out = all_sf_a1
+                    sf_a2_out = all_sf_a2
+                    sf_a3_out = all_sf_a3
+                    sf_a4_out = all_sf_a4
+                    sf_delta_used = delta_at_pts
+                    sf_p_used     = p_indices
+
+                sfg = f.create_group('dimer_sf')
+                sfg.create_dataset('q_points',  data=sf_q_points)
+                sfg.create_dataset('delta',     data=sf_delta_used)
+                sfg.create_dataset('p_indices', data=sf_p_used)
+                sfg.create_dataset('s_q_real',  data=sf_re_out)  # (n_batches, n_sf_pts, n_q)
+                sfg.create_dataset('s_q_imag',  data=sf_im_out)
+                sfg.create_dataset('s_q_abs1',  data=sf_a1_out)  # per-sample |s_q|
+                sfg.create_dataset('s_q_abs2',  data=sf_a2_out)  # per-sample |s_q|²
+                sfg.create_dataset('s_q_abs3',  data=sf_a3_out)  # per-sample |s_q|³
+                sfg.create_dataset('s_q_abs4',  data=sf_a4_out)  # per-sample |s_q|⁴
+                # Post-processing (let N := N_bulk):
+                #   m_q  = <s_q_abs1>          / N
+                #   m_q² = <s_q_abs2>          / N²
+                #   m_q⁴ = <s_q_abs4>          / N⁴
+                #   χ_q  = N * (m_q² - m_q²)              [Var of |s_q|, per-site]
+                #   U_q  = 1 - <s_q_abs4>/(3 * <s_q_abs2>²)         (Binder cumulant)
+                #   S_q_conn = (<s_q_abs2> - |<s_q>|²)   (connected SF; divide by N_d).
             # Post-processing:
             #   <Z(l)>(δ, size_s)   = all_z_l[..., size_meta_attrs[f'loop_size{s}_index']].mean(axis=0)
             #   <C_m(l)>(δ, size_s) = all_c_m_l[..., size_meta_attrs[f'string_size{s}_index']].mean(axis=0)
+
+            if n_snap_pts > 0 and all_snap is not None and len(all_snap) > 0:
+                # Full-state snapshots for real-space phase visualisation.
+                #   configs[s, k, i] = n_i (0/1) of sample s at snapshot δ-point k
+                # Pair with geometry/pos[i] to plot real-space occupation patterns.
+                sng = f.create_group('snapshots')
+                sng.create_dataset('configs', data=all_snap)              # (n_snaps, n_snap_pts, N) int8
+                sng.create_dataset('delta',     data=prof_delta[snap_pt_indices])
+                sng.create_dataset('p_indices', data=prof_p_idx[snap_pt_indices].astype(np.int32))
+                sng.create_dataset('source_rank', data=all_snap_rank)     # (n_snaps,) which rank
+                sng.attrs['n_snapshots_per_rank'] = n_snapshots
+                sng.attrs['n_snapshots_total']    = int(all_snap.shape[0])
 
             lg = f.create_group('observable_sites')
             for idx, lp in enumerate(loop_sets):
@@ -795,6 +1071,13 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         comm.Send(np.ascontiguousarray(my_z_l),     dest=0, tag=400 + rank)
         comm.Send(np.ascontiguousarray(my_a_v),     dest=0, tag=450 + rank)
         comm.Send(np.ascontiguousarray(my_c_m_l),   dest=0, tag=500 + rank)
+        if n_q > 0:
+            comm.Send(np.ascontiguousarray(my_sf_re), dest=0, tag=600 + rank)
+            comm.Send(np.ascontiguousarray(my_sf_im), dest=0, tag=700 + rank)
+            comm.Send(np.ascontiguousarray(my_sf_a1), dest=0, tag=750 + rank)
+            comm.Send(np.ascontiguousarray(my_sf_a2), dest=0, tag=800 + rank)
+            comm.Send(np.ascontiguousarray(my_sf_a3), dest=0, tag=820 + rank)
+            comm.Send(np.ascontiguousarray(my_sf_a4), dest=0, tag=850 + rank)
 
     comm.Barrier()
     return filepath
@@ -841,14 +1124,34 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1000,
                         help='(profile mode) Number of Z_l/C_m_l samples per batch for '
                              'memory-efficient per-copy storage. Default 1000.')
-    parser.add_argument('--loop_sizes', type=int, nargs='+', default=[3],
-                        help='List of Z(l) loop sizes to measure simultaneously. '
-                             'Each size s: 8s-4 atoms, (nx-s)(ny-s) copies. Min=2. '
-                             'Default: 3. Example: --loop_sizes 2 3')
-    parser.add_argument('--string_sizes', type=int, nargs='+', default=[2],
-                        help='List of C_m(l) string sizes to measure simultaneously. '
-                             'Each size s: 4s atoms, (nx-s)(ny-s) copies. '
-                             'Default: 2. Example: --string_sizes 1 2 3')
+    # Loop / string sizes are auto-selected from (nx, ny):
+    #   loop sizes   = 2 .. min(nx, ny) - 1
+    #   string sizes = 1 .. min(nx, ny) - 1
+    # No CLI knobs.
+    parser.add_argument('--sf_q_points_file', type=str, default=None,
+                        help='(profile mode) Path to .npy/.json/.txt giving an (n_q, 2) '
+                             'array of q-points for dimer S_d(q) measurement. '
+                             'Overrides --sf_q_path if both are set.')
+    parser.add_argument('--sf_q_path', type=str, default=None,
+                        choices=['GammaMKGamma', 'GammaKMGamma', 'GammaM', 'GammaK'],
+                        help='(profile mode) Named high-symmetry path in the kagome BZ '
+                             'for dimer S_d(q). Uses --a for the lattice constant.')
+    parser.add_argument('--sf_q_n', type=int, default=20,
+                        help='(profile mode) Points per segment of --sf_q_path. Default 20.')
+    parser.add_argument('--sf_delta_points', type=float, nargs='+', default=None,
+                        help='(profile mode) Optional list of physical δ values at which to '
+                             'keep the SF in HDF5. Each value is snapped to the nearest '
+                             'profile-grid δ. If omitted, SF is saved at every profile point '
+                             '(same grid as density/Z/C).')
+    parser.add_argument('--snapshot_deltas', type=float, nargs='+', default=None,
+                        help='(profile mode) List of physical δ values at which to dump full '
+                             'spin/occupation configurations for real-space phase visualisation. '
+                             'Each δ is snapped to the nearest profile-grid point. Requires '
+                             '--n_snapshots > 0.')
+    parser.add_argument('--n_snapshots', type=int, default=0,
+                        help='(profile mode) Number of full-state configs to save PER RANK at '
+                             'each --snapshot_deltas point. Total = n_snapshots × n_ranks. '
+                             'Default 0 (disabled).')
     args = parser.parse_args()
 
     # Load config file if provided (overrides CLI args)
@@ -879,6 +1182,12 @@ def main():
     mode = config.get('mode', 'store')
 
     if mode == 'profile':
+        sf_q_points = _build_sf_q_points(
+            sf_q_points_file=config.get('sf_q_points_file'),
+            sf_q_path=config.get('sf_q_path'),
+            sf_q_n=config.get('sf_q_n', 20),
+            a=config.get('a', 1.0),
+        )
         run_mpi_profile(
             N=config['N'], M=config['M'],
             Omega=config['Omega'], Rb=config['Rb'],
@@ -893,8 +1202,10 @@ def main():
             delta_groups=config.get('delta_groups', 600),
             omp_threads=config.get('omp_threads', 1),
             nx=config.get('nx', 1), ny=config.get('ny', 1),
-            loop_sizes=config.get('loop_sizes', [3]),
-            string_sizes=config.get('string_sizes', [2]),
+            sf_q_points=sf_q_points,
+            sf_delta_points=config.get('sf_delta_points'),
+            snapshot_deltas=config.get('snapshot_deltas'),
+            n_snapshots=config.get('n_snapshots', 0),
         )
     elif mode == 'onthefly':
         run_mpi_onthefly(
@@ -909,8 +1220,6 @@ def main():
             delta_groups=config.get('delta_groups', 600),
             omp_threads=config.get('omp_threads', 1),
             nx=config.get('nx', 1), ny=config.get('ny', 1),
-            loop_sizes=config.get('loop_sizes', [3]),
-            string_sizes=config.get('string_sizes', [2]),
         )
     else:
         run_mpi(

@@ -102,9 +102,68 @@ public:
         std::vector<double> density;                       // [n_points]
         std::vector<std::vector<double>> Z_l_by_size;      // [n_loop_size_groups][n_points]
         std::vector<std::vector<double>> C_m_l_by_size;    // [n_string_size_groups][n_points]
+        // Dimer structure factor at the same profile points (only filled if
+        // dimer_q_points_ has been set via set_dimer_sf_q_points; otherwise
+        // these vectors are empty).
+        //   s_q_real[q][pt] = Re Σ_{i ∈ bulk} n_i e^{i q·r_i}
+        //   s_q_imag[q][pt] = Im of same
+        //   s_q_abs1[q][pt] = |Σ_{i ∈ bulk} n_i e^{i q·r_i}|        (m_q numerator)
+        //   s_q_abs2[q][pt] = |Σ_{i ∈ bulk} n_i e^{i q·r_i}|²       (m_q²)
+        //   s_q_abs4[q][pt] = |Σ_{i ∈ bulk} n_i e^{i q·r_i}|⁴       (Binder cumulant)
+        std::vector<std::vector<double>> s_q_real;         // [n_q][n_points]
+        std::vector<std::vector<double>> s_q_imag;         // [n_q][n_points]
+        std::vector<std::vector<double>> s_q_abs1;         // [n_q][n_points]
+        std::vector<std::vector<double>> s_q_abs2;         // [n_q][n_points]
+        std::vector<std::vector<double>> s_q_abs3;         // [n_q][n_points]
+        std::vector<std::vector<double>> s_q_abs4;         // [n_q][n_points]
+        // Raw spin/occupation snapshots at requested profile points (only
+        // filled if snapshot_point_indices_ is non-empty).  Each snapshot is
+        // the full state vector (all N sites, 0/1) at that ramp slice.
+        //   snapshots[k][i] = n_i at profile point snapshot_point_indices_[k]
+        std::vector<std::vector<int8_t>> snapshots;        // [n_snapshot_points][N]
         int n_points;
     };
     ProfileObservables measure_profile(int profile_step) const;
+
+    // ── Snapshot support ──────────────────────────────────────────────────
+    // Request that measure_profile also dump the full state vector (all N
+    // sites) at the given profile-point indices (0-based, into the n_points
+    // grid).  Indices are sorted/deduped.  Empty list disables snapshotting.
+    void set_snapshot_point_indices(const std::vector<int>& point_indices);
+    int  get_n_snapshot_points() const { return (int)snapshot_point_indices_.size(); }
+    const std::vector<int>& get_snapshot_point_indices() const { return snapshot_point_indices_; }
+
+    // ── Dimer (density-density) structure factor measurement ──────────────
+    // S_d(q) = (1/N_d) Σ_ij e^{iq·(r_i-r_j)} [<n_i n_j> - <n_i><n_j>]
+    //       = (1/N_d) [<|s_q|²> - |<s_q>|²]  with  s_q = Σ_i n_i e^{iq·r_i}
+    //
+    // The engine stores precomputed cos(q·r_i)/sin(q·r_i) tables and a list
+    // of slice indices on the forward ramp (p < M) at which to measure s_q.
+    // Per-bin averages of Re(s_q), Im(s_q), and |s_q|² are produced; the
+    // user does the connected-piece subtraction and N_d normalisation in
+    // post-processing.
+    void set_dimer_sf_q_points(const std::vector<std::vector<double>>& q_points);
+    // Convert target delta values into nearest forward-ramp slice indices
+    // (argmin over p ∈ [0, M) of |delta_sched_[p] - target|).
+    void set_dimer_sf_measure_deltas(const std::vector<double>& deltas);
+    // Optional: directly specify p indices on the forward ramp.
+    void set_dimer_sf_measure_p_indices(const std::vector<int>& p_indices);
+    int  get_n_q_points()             const { return (int)dimer_q_points_.size(); }
+    int  get_n_dimer_measure_points() const { return (int)dimer_p_indices_.size(); }
+    const std::vector<int>&     get_dimer_p_indices()  const { return dimer_p_indices_; }
+    const std::vector<double>&  get_dimer_deltas_used() const { return dimer_deltas_used_; }
+
+    // Single-sample measurement: forward-propagate state from p=0 through
+    // all offdiag flips, and at each requested p compute s_q for every q.
+    // Returns flat arrays: s_q_real / s_q_imag are (n_p × n_q) row-major,
+    // density is (n_p,).
+    struct DimerSFSample {
+        std::vector<double> density;          // [n_p]
+        std::vector<double> s_q_real;          // [n_p * n_q] row-major
+        std::vector<double> s_q_imag;          // [n_p * n_q]
+        std::vector<double> s_q_abs2;          // [n_p * n_q]
+    };
+    DimerSFSample measure_dimer_sf() const;
 
     // Profiling
     double get_time_diag() const { return time_diag_; }
@@ -158,6 +217,10 @@ private:
 
     RydbergVij vij_;
     std::vector<double> delta_sched_;
+    // Site coordinates stored row-major (N × pos_dim) for downstream use
+    // (e.g. dimer structure factor q·r_i phases).
+    std::vector<double> pos_flat_;
+    int pos_dim_{0};
 
     // ── Grouped alias tables for O(G) diagonal update ─────────────────────
     struct GroupedAlias {
@@ -191,6 +254,16 @@ private:
     std::vector<int> loop_group_n_copies_;    // [n_loop_size_groups]
     std::vector<int> string_group_of_;        // [n_string_copies] -> group index
     std::vector<int> string_group_n_copies_;  // [n_string_size_groups]
+
+    // ── Dimer structure factor data ──────────────────────────────────────
+    std::vector<std::vector<double>> dimer_q_points_;     // [n_q][pos_dim]
+    std::vector<double> dimer_phase_cos_;                 // [n_q * N] row-major
+    std::vector<double> dimer_phase_sin_;                 // [n_q * N]
+    std::vector<int>    dimer_p_indices_;                 // forward-ramp slices, sorted ascending
+    std::vector<double> dimer_deltas_used_;               // delta_sched_[p] for each p in indices
+
+    // ── Snapshot data ─────────────────────────────────────────────────────
+    std::vector<int> snapshot_point_indices_;             // profile-point indices to snapshot, sorted ascending
 
     // ── Vertex lists for O(M) cluster update ──────────────────────────────
     std::vector<int32_t> site_op_count_;

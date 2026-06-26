@@ -245,7 +245,8 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def("run_profile", [](QAQMCEngine& self, int n_equil, int n_samples,
                                int me_density, int me_zl, int me_cml,
                                int profile_step, int batch_size,
-                               py::object progress_callback, int progress_every) {
+                               py::object progress_callback, int progress_every,
+                               int n_snapshots) {
             if (me_density  <= 0) me_density  = 1;
             if (me_zl       <= 0) me_zl       = 1;
             if (me_cml      <= 0) me_cml      = 1;
@@ -265,7 +266,18 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             int n_points  = M_total / profile_step;
             int n_zg      = self.get_n_loop_size_groups();
             int n_cg      = self.get_n_string_size_groups();
+            int n_q       = self.get_n_q_points();  // 0 if SF not configured
+            int N         = self.get_N();
             int min_me    = std::min({me_density, me_zl, me_cml});
+
+            // Snapshots: collect full state vectors at requested profile points,
+            // up to n_snapshots configs (collected from the first samples).
+            int n_snap_pts     = self.get_n_snapshot_points();   // 0 if not configured
+            int n_snap_collect = (n_snap_pts > 0 && n_snapshots > 0) ? n_snapshots : 0;
+            py::array_t<int8_t> snapshots_out(
+                {std::max(n_snap_collect, 1), std::max(n_snap_pts, 1), N});
+            auto snap_buf = snapshots_out.mutable_unchecked<3>();
+            int snap_count = 0;
 
             // n_samples is defined for the finest observable.
             // We group samples into batches; each batch stores the mean per size group per point.
@@ -286,9 +298,33 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             auto z_buf = z_l_out.mutable_unchecked<3>();
             auto c_buf = c_m_l_out.mutable_unchecked<3>();
 
+            // SF: batched per q-point (n_batches_sf, n_points, n_q).  Shares the
+            // same cadence + batch_size as Z_l (both ride the same forward walk).
+            // Allocate at least size 1 to keep numpy happy even if n_q==0.
+            int n_q_alloc       = std::max(n_q, 1);
+            int n_batches_sf    = (n_q > 0) ? n_batches_z : 1;
+            py::array_t<double> s_q_real_out({n_batches_sf, n_points, n_q_alloc});
+            py::array_t<double> s_q_imag_out({n_batches_sf, n_points, n_q_alloc});
+            py::array_t<double> s_q_abs1_out({n_batches_sf, n_points, n_q_alloc});
+            py::array_t<double> s_q_abs2_out({n_batches_sf, n_points, n_q_alloc});
+            py::array_t<double> s_q_abs3_out({n_batches_sf, n_points, n_q_alloc});
+            py::array_t<double> s_q_abs4_out({n_batches_sf, n_points, n_q_alloc});
+            auto sf_re_buf = s_q_real_out.mutable_unchecked<3>();
+            auto sf_im_buf = s_q_imag_out.mutable_unchecked<3>();
+            auto sf_a1_buf = s_q_abs1_out.mutable_unchecked<3>();
+            auto sf_a2_buf = s_q_abs2_out.mutable_unchecked<3>();
+            auto sf_a3_buf = s_q_abs3_out.mutable_unchecked<3>();
+            auto sf_a4_buf = s_q_abs4_out.mutable_unchecked<3>();
+
             // Batch accumulators: [n_groups][n_points]
             std::vector<std::vector<double>> z_acc(n_zg, std::vector<double>(n_points, 0.0));
             std::vector<std::vector<double>> c_acc(n_cg, std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> sf_re_acc(n_q, std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> sf_im_acc(n_q, std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> sf_a1_acc(n_q, std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> sf_a2_acc(n_q, std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> sf_a3_acc(n_q, std::vector<double>(n_points, 0.0));
+            std::vector<std::vector<double>> sf_a4_acc(n_q, std::vector<double>(n_points, 0.0));
             int idx_d = 0;
             int z_in_batch = 0, c_in_batch = 0;
             int batch_z = 0, batch_c = 0;
@@ -302,6 +338,18 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
                 if (need_d || need_z || need_c) {
                     auto prof = self.measure_profile(profile_step);
+                    // Collect full-state snapshots spread evenly across the run:
+                    // the k-th snapshot is taken at step ≈ (k+1)/n_snap_collect of
+                    // total_steps, so all are post-thermalization and mutually
+                    // decorrelated (with n_snap_collect=1 → the final sample).
+                    if (n_snap_collect > 0 && snap_count < n_snap_collect &&
+                        (int64_t)step * n_snap_collect
+                            >= (int64_t)(snap_count + 1) * total_steps) {
+                        for (int k = 0; k < n_snap_pts; ++k)
+                            for (int i = 0; i < N; ++i)
+                                snap_buf(snap_count, k, i) = prof.snapshots[k][i];
+                        ++snap_count;
+                    }
                     if (need_d && idx_d < n_density) {
                         for (int k = 0; k < n_points; ++k) d_buf(idx_d, k) = prof.density[k];
                         ++idx_d;
@@ -310,6 +358,16 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                         for (int g = 0; g < n_zg; ++g)
                             for (int pt = 0; pt < n_points; ++pt)
                                 z_acc[g][pt] += prof.Z_l_by_size[g][pt];
+                        // SF rides same cadence as Z_l.
+                        for (int qi = 0; qi < n_q; ++qi)
+                            for (int pt = 0; pt < n_points; ++pt) {
+                                sf_re_acc[qi][pt] += prof.s_q_real[qi][pt];
+                                sf_im_acc[qi][pt] += prof.s_q_imag[qi][pt];
+                                sf_a1_acc[qi][pt] += prof.s_q_abs1[qi][pt];
+                                sf_a2_acc[qi][pt] += prof.s_q_abs2[qi][pt];
+                                sf_a3_acc[qi][pt] += prof.s_q_abs3[qi][pt];
+                                sf_a4_acc[qi][pt] += prof.s_q_abs4[qi][pt];
+                            }
                         ++z_in_batch;
                         if (z_in_batch >= batch_size && batch_z < n_batches_z) {
                             double inv = 1.0 / z_in_batch;
@@ -317,6 +375,21 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                                 for (int pt = 0; pt < n_points; ++pt) {
                                     z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
                                     z_acc[g][pt] = 0.0;
+                                }
+                            for (int qi = 0; qi < n_q; ++qi)
+                                for (int pt = 0; pt < n_points; ++pt) {
+                                    sf_re_buf(batch_z, pt, qi) = sf_re_acc[qi][pt] * inv;
+                                    sf_im_buf(batch_z, pt, qi) = sf_im_acc[qi][pt] * inv;
+                                    sf_a1_buf(batch_z, pt, qi) = sf_a1_acc[qi][pt] * inv;
+                                    sf_a2_buf(batch_z, pt, qi) = sf_a2_acc[qi][pt] * inv;
+                                    sf_a3_buf(batch_z, pt, qi) = sf_a3_acc[qi][pt] * inv;
+                                    sf_a4_buf(batch_z, pt, qi) = sf_a4_acc[qi][pt] * inv;
+                                    sf_re_acc[qi][pt] = 0.0;
+                                    sf_im_acc[qi][pt] = 0.0;
+                                    sf_a1_acc[qi][pt] = 0.0;
+                                    sf_a2_acc[qi][pt] = 0.0;
+                                    sf_a3_acc[qi][pt] = 0.0;
+                                    sf_a4_acc[qi][pt] = 0.0;
                                 }
                             ++batch_z;
                             z_in_batch = 0;
@@ -352,6 +425,15 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                 for (int g = 0; g < n_zg; ++g)
                     for (int pt = 0; pt < n_points; ++pt)
                         z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
+                for (int qi = 0; qi < n_q; ++qi)
+                    for (int pt = 0; pt < n_points; ++pt) {
+                        sf_re_buf(batch_z, pt, qi) = sf_re_acc[qi][pt] * inv;
+                        sf_im_buf(batch_z, pt, qi) = sf_im_acc[qi][pt] * inv;
+                        sf_a1_buf(batch_z, pt, qi) = sf_a1_acc[qi][pt] * inv;
+                        sf_a2_buf(batch_z, pt, qi) = sf_a2_acc[qi][pt] * inv;
+                        sf_a3_buf(batch_z, pt, qi) = sf_a3_acc[qi][pt] * inv;
+                        sf_a4_buf(batch_z, pt, qi) = sf_a4_acc[qi][pt] * inv;
+                    }
             }
             if (c_in_batch > 0 && batch_c < n_batches_c) {
                 double inv = 1.0 / c_in_batch;
@@ -372,6 +454,19 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             result["C_m_l"]      = c_m_l_out;     // (n_batches_c, n_points, n_string_size_groups)
             result["p_indices"]  = p_indices;
             result["batch_size"] = py::int_(batch_size);
+            if (n_q > 0) {
+                result["s_q_real"] = s_q_real_out;  // (n_batches_z, n_points, n_q)
+                result["s_q_imag"] = s_q_imag_out;
+                result["s_q_abs1"] = s_q_abs1_out;
+                result["s_q_abs2"] = s_q_abs2_out;
+                result["s_q_abs3"] = s_q_abs3_out;
+                result["s_q_abs4"] = s_q_abs4_out;
+                result["n_q"]      = py::int_(n_q);
+            }
+            if (n_snap_collect > 0) {
+                result["snapshots"] = snapshots_out;  // (n_snapshots, n_snap_pts, N) int8
+                result["n_snapshots_collected"] = py::int_(snap_count);
+            }
             return result;
         },
         py::arg("n_equil"), py::arg("n_samples"),
@@ -382,6 +477,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         py::arg("batch_size")    = 1000,
         py::arg("progress_callback") = py::none(),
         py::arg("progress_every") = 1000,
+        py::arg("n_snapshots")    = 0,
         "Asymmetric profile with batched per-size-group storage.\n"
         "density: (n_density, n_points) per-sample.\n"
         "Z_l:     (n_batches, n_points, n_loop_size_groups)   — batch means of size-group means (signed).\n"
@@ -423,6 +519,21 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         },
         py::arg("p_indices"),
         "Directly specify forward-ramp slice indices for dimer SF measurements.")
+
+        .def("set_snapshot_point_indices", [](QAQMCEngine& self, py::array_t<int> idx_arr) {
+            auto buf = idx_arr.request();
+            std::vector<int> idx(static_cast<const int*>(buf.ptr),
+                                 static_cast<const int*>(buf.ptr) + buf.shape[0]);
+            self.set_snapshot_point_indices(idx);
+        },
+        py::arg("point_indices"),
+        "Request full-state snapshots at the given profile-point indices "
+        "(0-based into the n_points grid). Set empty to disable.")
+        .def_property_readonly("n_snapshot_points", &QAQMCEngine::get_n_snapshot_points)
+        .def_property_readonly("snapshot_point_indices", [](const QAQMCEngine& self) {
+            const auto& v = self.get_snapshot_point_indices();
+            return py::array_t<int>(v.size(), v.data());
+        })
 
         .def_property_readonly("n_q_points",            &QAQMCEngine::get_n_q_points)
         .def_property_readonly("n_dimer_measure_points",&QAQMCEngine::get_n_dimer_measure_points)
