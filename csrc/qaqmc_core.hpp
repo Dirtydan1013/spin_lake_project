@@ -121,6 +121,20 @@ public:
         // the full state vector (all N sites, 0/1) at that ramp slice.
         //   snapshots[k][i] = n_i at profile point snapshot_point_indices_[k]
         std::vector<std::vector<int8_t>> snapshots;        // [n_snapshot_points][N]
+
+        // Sublattice-resolved occupation structure factor inputs (only filled
+        // if occ-SF q-points + geometry are set).  At each requested occ-SF
+        // profile point we return the per-sublattice Fourier vectors
+        //   s_{q,α} = Σ_{cells R in set} n_{R,α} e^{i q·R}
+        // for BOTH the full lattice and the bulk-complete-cell subset, plus the
+        // raw state (for the per-site ⟨n_i⟩ one-point profile).  The binding
+        // accumulates the outer products s_α s*_β into batch matrices.
+        // Layout: occ_*[pt][q*n_basis + α]
+        std::vector<std::vector<double>> occ_s_full_re;    // [n_occ_pts][n_q*n_basis]
+        std::vector<std::vector<double>> occ_s_full_im;
+        std::vector<std::vector<double>> occ_s_bulk_re;
+        std::vector<std::vector<double>> occ_s_bulk_im;
+        std::vector<std::vector<int8_t>> occ_state;        // [n_occ_pts][N]
         int n_points;
     };
     ProfileObservables measure_profile(int profile_step) const;
@@ -132,6 +146,23 @@ public:
     void set_snapshot_point_indices(const std::vector<int>& point_indices);
     int  get_n_snapshot_points() const { return (int)snapshot_point_indices_.size(); }
     const std::vector<int>& get_snapshot_point_indices() const { return snapshot_point_indices_; }
+
+    // ── Sublattice-resolved occupation structure factor ────────────────────
+    // q-points (each length pos_dim) for the matrix SF S_αβ(q).
+    void set_occ_sf_q_points(const std::vector<std::vector<double>>& q_points);
+    // Geometry: for each site i, the Bravais cell position R_i (length pos_dim),
+    // its sublattice/basis index α_i ∈ [0, n_basis), and whether it belongs to a
+    // bulk-complete cell.  Phases use the CELL position R (not the atom position).
+    void set_occ_sf_site_map(const std::vector<std::vector<double>>& site_cell_R,
+                             const std::vector<int>& site_basis,
+                             const std::vector<int>& site_in_bulk_cell,
+                             int n_basis);
+    // Profile-point indices (into the n_points grid) at which to measure occ-SF.
+    void set_occ_sf_point_indices(const std::vector<int>& point_indices);
+    int  get_n_occ_q_points()     const { return (int)occ_q_points_.size(); }
+    int  get_occ_n_basis()        const { return occ_n_basis_; }
+    int  get_n_occ_sf_points()    const { return (int)occ_sf_point_indices_.size(); }
+    const std::vector<int>& get_occ_sf_point_indices() const { return occ_sf_point_indices_; }
 
     // ── Dimer (density-density) structure factor measurement ──────────────
     // S_d(q) = (1/N_d) Σ_ij e^{iq·(r_i-r_j)} [<n_i n_j> - <n_i><n_j>]
@@ -264,6 +295,16 @@ private:
 
     // ── Snapshot data ─────────────────────────────────────────────────────
     std::vector<int> snapshot_point_indices_;             // profile-point indices to snapshot, sorted ascending
+
+    // ── Sublattice-resolved occupation SF data ────────────────────────────
+    std::vector<std::vector<double>> occ_q_points_;       // [n_q][pos_dim]
+    std::vector<double> occ_phase_cos_;                   // [n_q * N] cos(q·R_cell(i))
+    std::vector<double> occ_phase_sin_;                   // [n_q * N] sin(q·R_cell(i))
+    std::vector<int>    occ_site_basis_;                  // [N] sublattice index α_i
+    std::vector<int8_t> occ_site_in_bulk_;                // [N] 1 if site in a bulk-complete cell
+    std::vector<double> occ_cell_R_flat_;                 // [N * pos_dim] cell Bravais pos per site
+    int occ_n_basis_{0};
+    std::vector<int>    occ_sf_point_indices_;            // profile points, sorted ascending
 
     // ── Vertex lists for O(M) cluster update ──────────────────────────────
     std::vector<int32_t> site_op_count_;

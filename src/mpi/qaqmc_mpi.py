@@ -34,6 +34,44 @@ from src.rydberg.lattices import (kagome_loop_string_translations,
                           kagome_vertex_sites)
 
 
+def _build_occ_sf_geometry(nx, ny, a):
+    """Per-site (cell Bravais position R, sublattice α, bulk-complete-cell flag)
+    for the kagome bond lattice.  site = (j*nx+i)*6+k → α=k, cell (i,j).
+    A cell is 'bulk' if ALL 6 of its atoms are in kagome_bulk_sites."""
+    from src.rydberg.lattices import kagome_bulk_sites
+    v1 = np.array([a, 0.0]); v2 = np.array([a/2.0, a*np.sqrt(3)/2.0])
+    N = 6 * nx * ny
+    basis = np.empty(N, dtype=np.int32)
+    cell_R = np.empty((N, 2), dtype=np.float64)
+    for s in range(N):
+        k = s % 6; cell = s // 6; i = cell % nx; j = cell // nx
+        basis[s] = k
+        cell_R[s] = i * v1 + j * v2
+    bulk = set(kagome_bulk_sites(nx, ny))
+    # cell (i,j) is bulk-complete iff all 6 atoms are bulk
+    in_bulk = np.zeros(N, dtype=np.int32)
+    for cell in range(nx * ny):
+        atoms = [cell*6 + k for k in range(6)]
+        if all(s in bulk for s in atoms):
+            for s in atoms:
+                in_bulk[s] = 1
+    return cell_R, basis, in_bulk
+
+
+def _build_occ_q_grid(grid_n, a):
+    """2D q-grid over one BZ of the triangular Bravais lattice.
+    Returns (q_points (grid_n², 2), frac (grid_n², 2) fractional coords for plotting)."""
+    b1 = (2*np.pi/a) * np.array([1.0, -1.0/np.sqrt(3)])
+    b2 = (2*np.pi/a) * np.array([0.0,  2.0/np.sqrt(3)])
+    qs = []; frac = []
+    for m in range(grid_n):
+        for n in range(grid_n):
+            fm, fn = m/grid_n, n/grid_n
+            qs.append(fm*b1 + fn*b2)
+            frac.append((fm, fn))
+    return np.array(qs, dtype=np.float64), np.array(frac, dtype=np.float64)
+
+
 def _build_sf_q_points(sf_q_points_file=None, sf_q_path=None, sf_q_n=20, a=1.0):
     """Return q-points array of shape (n_q, 2), or None if SF not requested.
 
@@ -593,6 +631,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     delta_groups=600, omp_threads=0, nx=6, ny=6,
                     sf_q_points=None, sf_delta_points=None,
                     snapshot_deltas=None, n_snapshots=0,
+                    occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
                     verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
@@ -692,6 +731,25 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         engine._cpp_engine.set_snapshot_point_indices(snap_pt_indices)
     n_snap_pts = len(snap_pt_indices)
 
+    # Optional: sublattice-resolved occupation SF matrix at chosen δ on a 2D q-grid.
+    occ_pt_indices = np.array([], dtype=np.int32)
+    occ_q_points = None; occ_q_frac = None
+    occ_cell_R = occ_basis = occ_in_bulk = None
+    do_occ = (occ_sf_delta_points is not None and len(occ_sf_delta_points) > 0
+              and occ_sf_grid_n > 0 and occ_sf_nbatch > 0)
+    if do_occ:
+        # q·R phases are dimensionless (the lattice constant cancels between the
+        # reciprocal vectors and the cell positions), so use a=1.0 internally.
+        occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry(nx, ny, 1.0)
+        occ_q_points, occ_q_frac = _build_occ_q_grid(int(occ_sf_grid_n), 1.0)
+        req = np.asarray(occ_sf_delta_points, dtype=np.float64)
+        occ_pt_indices = np.unique(np.array(
+            [int(np.argmin(np.abs(prof_delta - d))) for d in req], dtype=np.int32))
+        engine._cpp_engine.set_occ_sf_site_map(occ_cell_R, occ_basis, occ_in_bulk, 6)
+        engine._cpp_engine.set_occ_sf_q_points(occ_q_points)
+        engine._cpp_engine.set_occ_sf_point_indices(occ_pt_indices)
+    n_occ_pts = len(occ_pt_indices)
+
     if verbose and rank == 0:
         M_total  = engine._cpp_engine.M_total
         n_points = M_total // profile_step
@@ -712,6 +770,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         if n_snap_pts > 0:
             print(f"[MPI-PROF]   snapshots: {n_snapshots}/rank at {n_snap_pts} "
                   f"δ-points (δ≈{np.round(prof_delta[snap_pt_indices], 3).tolist()})")
+        if do_occ:
+            n_bulk_cells = int(occ_in_bulk.sum() // 6)
+            print(f"[MPI-PROF]   occ-SF matrix: {occ_sf_grid_n}×{occ_sf_grid_n} q-grid, "
+                  f"{n_occ_pts} δ-points (δ≈{np.round(prof_delta[occ_pt_indices],3).tolist()}), "
+                  f"{occ_sf_nbatch} super-bins/rank, bulk cells={n_bulk_cells}/{nx*ny}")
 
     # Equilibration
     comm.Barrier()
@@ -742,11 +805,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         0, my_n_samples, me_density, me_zl, me_cml, profile_step,
         batch_size,
         sa_cb, 1000 if sa_cb is not None else 1,
-        n_snapshots if n_snap_pts > 0 else 0)
+        n_snapshots if n_snap_pts > 0 else 0,
+        occ_sf_nbatch if do_occ else 0)
     if sa_bar is not None:
         sa_bar.close()
 
-    # density: (n_density_rank, n_points)
+    # density: (n_batches_d_rank, n_points)  — batch means (was per-sample)
     # Z_l:     (n_batches_z_rank, n_points, n_loop_size_groups + 1)
     #          last group = A_v vertices (set length 4, distinct from loop set lengths
     #          so it always forms its own trailing size group).
@@ -777,6 +841,14 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     my_snap = None
     if n_snap_pts > 0 and 'snapshots' in result:
         my_snap = np.ascontiguousarray(result['snapshots'], dtype=np.int8)
+
+    # Occupation-SF matrices (only if configured). Shapes per rank:
+    #   occ_S_*: (occ_nbatch, n_occ_pt, n_q, 6, 6),  occ_nprof: (occ_nbatch, n_occ_pt, N)
+    my_occ = None
+    if do_occ and 'occ_S_full_re' in result:
+        my_occ = {k: np.ascontiguousarray(result[k], dtype=np.float64)
+                  for k in ('occ_S_full_re','occ_S_full_im','occ_S_bulk_re',
+                            'occ_S_bulk_im','occ_nprof')}
 
     # Dimer SF (only present if q-points were set above).  Shape: (batches, pts, n_q).
     my_sf_re = None; my_sf_im = None
@@ -819,7 +891,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             off[r] = off[r-1] + counts_arr[r-1]
         return off
 
-    counts_d  = _obs_counts(me_density)
+    # density is now BATCHED (same batch_size as Z_l/C_m_l), so it uses a batch count.
+    counts_d  = _batch_counts(me_density)
     batches_z = _batch_counts(me_zl)
     batches_c = _batch_counts(me_cml)
     off_d  = _obs_offsets(counts_d)
@@ -843,6 +916,17 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     rank_lbls.append(np.full(len(g), r, dtype=np.int16))
             all_snap      = np.concatenate(parts, axis=0)        # (total_snaps, n_snap_pts, N)
             all_snap_rank = np.concatenate(rank_lbls)            # (total_snaps,) source rank
+
+    # Gather occ-SF matrices (super-bins concatenate along axis 0 across ranks).
+    all_occ = None
+    if do_occ:
+        gathered_occ = comm.gather(my_occ, root=0)
+        if rank == 0:
+            all_occ = {}
+            for key in ('occ_S_full_re','occ_S_full_im','occ_S_bulk_re',
+                        'occ_S_bulk_im','occ_nprof'):
+                all_occ[key] = np.concatenate(
+                    [g[key] for g in gathered_occ if g is not None], axis=0)
 
     if rank == 0:
         os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
@@ -947,22 +1031,26 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             # ids and within-rank indices so post-processing can drop burn-in
             # without relying on n_samples being divisible by n_ranks.
             #
-            # The within-rank sample index k corresponds to MC sampling step
-            #   actual_mc_step = n_equil + (k + 1) * <measure_every for that obs>
-            # i.e. k=0 is the first RECORDED sample, taken AFTER the n_equil warm-up.
+            # All gathered arrays (density, Z_l, A_v, C_m_l, SF) are now BATCH means
+            # concatenated in rank order, time-ordered within each rank's block.
+            # We store explicit per-row rank ids and within-rank batch indices so
+            # post-processing can drop burn-in without relying on divisibility.
+            # batch b of rank r spans recorded samples [b*batch_size, (b+1)*batch_size),
+            # i.e. MC steps n_equil + (b*batch_size + 1 .. (b+1)*batch_size) * measure_every.
             pv = f.create_group('provenance')
             pv.attrs['n_ranks']  = n_ranks
             pv.attrs['n_equil']  = n_equil
             pv.attrs['me_density'] = me_density
             pv.attrs['me_zl']      = me_zl
             pv.attrs['me_cml']     = me_cml
-            # density: per-sample (matches all_density rows)
+            pv.attrs['batch_size'] = batch_size
+            # density: batch-level (matches all_density rows, which are batch means)
             dens_rank = np.concatenate([np.full(int(counts_d[r]), r, dtype=np.int16)
                                         for r in range(n_ranks)])
             dens_step = np.concatenate([np.arange(int(counts_d[r]), dtype=np.int32)
                                         for r in range(n_ranks)])
-            pv.create_dataset('density_rank', data=dens_rank)   # (n_total_d,)
-            pv.create_dataset('density_step', data=dens_step)   # within-rank sample index
+            pv.create_dataset('density_rank', data=dens_rank)   # (n_total_d,) source rank
+            pv.create_dataset('density_batch_index', data=dens_step)  # within-rank batch index
             pv.create_dataset('density_rank_offsets', data=off_d.astype(np.int64))
             pv.create_dataset('density_rank_counts',  data=counts_d.astype(np.int64))
             # Z_l / A_v / dimer-SF batches (share the me_zl batch cadence)
@@ -983,10 +1071,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             pv.create_dataset('cbatch_index', data=cb_idx)
             pv.create_dataset('cbatch_rank_offsets', data=off_bc.astype(np.int64))
             pv.create_dataset('cbatch_rank_counts',  data=batches_c.astype(np.int64))
-            pv.attrs['batch_size'] = batch_size
 
             og = f.create_group('profiles')
-            og.create_dataset('density', data=all_density)  # (n_density, n_points)
+            og.create_dataset('density', data=all_density)  # (n_batches_d, n_points) batch means
             og.create_dataset('Z_l',     data=all_z_l)       # (n_batches, n_points, n_loop_size_groups)
             og.create_dataset('A_v',     data=all_a_v)        # (n_batches, n_points) — mean over vertices (C++)
             og.create_dataset('C_m_l',   data=all_c_m_l)     # (n_batches, n_points, n_string_size_groups)
@@ -1050,6 +1137,31 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 sng.create_dataset('source_rank', data=all_snap_rank)     # (n_snaps,) which rank
                 sng.attrs['n_snapshots_per_rank'] = n_snapshots
                 sng.attrs['n_snapshots_total']    = int(all_snap.shape[0])
+
+            if do_occ and all_occ is not None:
+                # Sublattice-resolved occupation structure-factor matrix S_αβ(q).
+                #   S_*_re/im: (n_superbins, n_δ, n_q, 6, 6) UNCONNECTED ⟨s_α s*_β⟩
+                #   nprof: (n_superbins, n_δ, N) per-site ⟨n_i⟩ (for connected subtraction)
+                # Connected (post): S^c_αβ = S_αβ - (1/N_c) F_α F*_β,
+                #   F_α(q) = Σ_{cells in set} e^{iq·R} ⟨n_{R,α}⟩  (built from nprof + geometry).
+                # Two cell sets: 'full' (all cells) and 'bulk' (bulk-complete cells).
+                ocg = f.create_group('occ_sf')
+                ocg.create_dataset('q_points',  data=occ_q_points)      # (n_q, 2) cartesian (a=1)
+                ocg.create_dataset('q_frac',    data=occ_q_frac)        # (n_q, 2) fractional (m/G, n/G)
+                ocg.create_dataset('delta',     data=prof_delta[occ_pt_indices])
+                ocg.create_dataset('p_indices', data=prof_p_idx[occ_pt_indices].astype(np.int32))
+                ocg.create_dataset('S_full_re', data=all_occ['occ_S_full_re'])
+                ocg.create_dataset('S_full_im', data=all_occ['occ_S_full_im'])
+                ocg.create_dataset('S_bulk_re', data=all_occ['occ_S_bulk_re'])
+                ocg.create_dataset('S_bulk_im', data=all_occ['occ_S_bulk_im'])
+                ocg.create_dataset('nprof',     data=all_occ['occ_nprof'])  # (n_sb, n_δ, N) all sites
+                # geometry for reconstructing F_α(q)
+                ocg.create_dataset('cell_R',       data=occ_cell_R)      # (N,2) per-site cell pos (a=1)
+                ocg.create_dataset('site_basis',   data=occ_basis)       # (N,) α index
+                ocg.create_dataset('site_in_bulk', data=occ_in_bulk)     # (N,) bulk-cell flag
+                ocg.attrs['grid_n']  = int(occ_sf_grid_n)
+                ocg.attrs['n_basis'] = 6
+                ocg.attrs['nbatch_per_rank'] = int(occ_sf_nbatch)
 
             lg = f.create_group('observable_sites')
             for idx, lp in enumerate(loop_sets):
@@ -1152,6 +1264,15 @@ def main():
                         help='(profile mode) Number of full-state configs to save PER RANK at '
                              'each --snapshot_deltas point. Total = n_snapshots × n_ranks. '
                              'Default 0 (disabled).')
+    parser.add_argument('--occ_sf_delta_points', type=float, nargs='+', default=None,
+                        help='(profile mode) δ values at which to measure the sublattice-resolved '
+                             'occupation structure-factor matrix S_αβ(q). Snapped to profile grid.')
+    parser.add_argument('--occ_sf_grid_n', type=int, default=0,
+                        help='(profile mode) Side length of the 2D BZ q-grid (grid_n × grid_n) for '
+                             'the occ-SF matrix. 0 = disabled.')
+    parser.add_argument('--occ_sf_nbatch', type=int, default=4,
+                        help='(profile mode) Coarse super-bins PER RANK for the occ-SF matrix '
+                             '(controls storage; total = nbatch × n_ranks). Default 4.')
     args = parser.parse_args()
 
     # Load config file if provided (overrides CLI args)
@@ -1206,6 +1327,9 @@ def main():
             sf_delta_points=config.get('sf_delta_points'),
             snapshot_deltas=config.get('snapshot_deltas'),
             n_snapshots=config.get('n_snapshots', 0),
+            occ_sf_delta_points=config.get('occ_sf_delta_points'),
+            occ_sf_grid_n=config.get('occ_sf_grid_n', 0),
+            occ_sf_nbatch=config.get('occ_sf_nbatch', 4),
         )
     elif mode == 'onthefly':
         run_mpi_onthefly(

@@ -516,6 +516,20 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
     if (n_snap > 0) prof.snapshots.assign(n_snap, std::vector<int8_t>(N_, 0));
     size_t next_snap = 0;  // running pointer into sorted snapshot_point_indices_
 
+    // Occupation-SF bookkeeping: at requested points compute s_{q,α} (full+bulk).
+    const int n_occ_pt = (int)occ_sf_point_indices_.size();
+    const int n_occ_q  = (int)occ_q_points_.size();
+    const int n_basis  = occ_n_basis_;
+    if (n_occ_pt > 0 && n_occ_q > 0 && n_basis > 0) {
+        const size_t vlen = (size_t)n_occ_q * n_basis;
+        prof.occ_s_full_re.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
+        prof.occ_s_full_im.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
+        prof.occ_s_bulk_re.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
+        prof.occ_s_bulk_im.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
+        prof.occ_state.assign(n_occ_pt, std::vector<int8_t>(N_, 0));
+    }
+    size_t next_occ = 0;  // running pointer into sorted occ_sf_point_indices_
+
     // Propagate state from left boundary |0...0>
     std::vector<int32_t> state(N_, 0);
     int out_idx = 0;
@@ -597,6 +611,32 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
                 ++next_snap;
             }
 
+            // Occupation-SF: at requested points, compute the sublattice-resolved
+            // Fourier vectors s_{q,α} = Σ_{i:α(i)=α} n_i e^{i q·R_cell(i)} for the
+            // full lattice and the bulk-complete-cell subset; also stash state.
+            if (next_occ < occ_sf_point_indices_.size()
+                && occ_sf_point_indices_[next_occ] == out_idx) {
+                std::vector<double>& sfr = prof.occ_s_full_re[next_occ];
+                std::vector<double>& sfi = prof.occ_s_full_im[next_occ];
+                std::vector<double>& sbr = prof.occ_s_bulk_re[next_occ];
+                std::vector<double>& sbi = prof.occ_s_bulk_im[next_occ];
+                for (int qi = 0; qi < n_occ_q; ++qi) {
+                    const double* cosq = &occ_phase_cos_[(size_t)qi * N_];
+                    const double* sinq = &occ_phase_sin_[(size_t)qi * N_];
+                    const size_t base = (size_t)qi * n_basis;
+                    for (int i = 0; i < N_; ++i) {
+                        if (!state[i]) continue;
+                        int a = occ_site_basis_[i];
+                        double c = cosq[i], s = sinq[i];
+                        sfr[base + a] += c; sfi[base + a] += s;
+                        if (occ_site_in_bulk_[i]) { sbr[base + a] += c; sbi[base + a] += s; }
+                    }
+                }
+                std::vector<int8_t>& st = prof.occ_state[next_occ];
+                for (int i = 0; i < N_; ++i) st[i] = (int8_t)state[i];
+                ++next_occ;
+            }
+
             ++out_idx;
         }
     }
@@ -645,6 +685,64 @@ void QAQMCEngine::set_dimer_sf_q_points(
             dimer_phase_sin_[(size_t)qi * N_ + i] = std::sin(qr);
         }
     }
+}
+
+// ─── Sublattice-resolved occupation structure factor ────────────────────────
+
+void QAQMCEngine::set_occ_sf_site_map(
+        const std::vector<std::vector<double>>& site_cell_R,
+        const std::vector<int>& site_basis,
+        const std::vector<int>& site_in_bulk_cell,
+        int n_basis) {
+    if ((int)site_cell_R.size() != N_ || (int)site_basis.size() != N_ ||
+        (int)site_in_bulk_cell.size() != N_) {
+        throw std::runtime_error("set_occ_sf_site_map: arrays must have length N");
+    }
+    occ_n_basis_ = n_basis;
+    occ_site_basis_ = site_basis;
+    occ_site_in_bulk_.assign(N_, 0);
+    for (int i = 0; i < N_; ++i) occ_site_in_bulk_[i] = (int8_t)(site_in_bulk_cell[i] ? 1 : 0);
+    // Stash cell positions for phase-table build when q-points are set.
+    occ_cell_R_flat_.assign((size_t)N_ * pos_dim_, 0.0);
+    for (int i = 0; i < N_; ++i) {
+        if ((int)site_cell_R[i].size() != pos_dim_)
+            throw std::runtime_error("set_occ_sf_site_map: cell_R dim mismatch");
+        for (int d = 0; d < pos_dim_; ++d)
+            occ_cell_R_flat_[(size_t)i * pos_dim_ + d] = site_cell_R[i][d];
+    }
+}
+
+void QAQMCEngine::set_occ_sf_q_points(
+        const std::vector<std::vector<double>>& q_points) {
+    if (occ_cell_R_flat_.empty()) {
+        throw std::runtime_error("set_occ_sf_q_points: call set_occ_sf_site_map first");
+    }
+    const int n_q = static_cast<int>(q_points.size());
+    occ_q_points_ = q_points;
+    occ_phase_cos_.assign((size_t)n_q * (size_t)N_, 0.0);
+    occ_phase_sin_.assign((size_t)n_q * (size_t)N_, 0.0);
+    for (int qi = 0; qi < n_q; ++qi) {
+        const auto& q = q_points[qi];
+        if ((int)q.size() != pos_dim_)
+            throw std::runtime_error("set_occ_sf_q_points: q dim mismatch with pos_dim");
+        for (int i = 0; i < N_; ++i) {
+            double qr = 0.0;  // phase uses the CELL Bravais position R, not r_i
+            for (int d = 0; d < pos_dim_; ++d)
+                qr += q[d] * occ_cell_R_flat_[(size_t)i * pos_dim_ + d];
+            occ_phase_cos_[(size_t)qi * N_ + i] = std::cos(qr);
+            occ_phase_sin_[(size_t)qi * N_ + i] = std::sin(qr);
+        }
+    }
+}
+
+void QAQMCEngine::set_occ_sf_point_indices(const std::vector<int>& point_indices) {
+    occ_sf_point_indices_ = point_indices;
+    std::sort(occ_sf_point_indices_.begin(), occ_sf_point_indices_.end());
+    occ_sf_point_indices_.erase(
+        std::unique(occ_sf_point_indices_.begin(), occ_sf_point_indices_.end()),
+        occ_sf_point_indices_.end());
+    for (int idx : occ_sf_point_indices_)
+        if (idx < 0) throw std::runtime_error("set_occ_sf_point_indices: index < 0");
 }
 
 void QAQMCEngine::set_dimer_sf_measure_p_indices(

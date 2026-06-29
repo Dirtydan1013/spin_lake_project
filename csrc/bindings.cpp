@@ -246,7 +246,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                                int me_density, int me_zl, int me_cml,
                                int profile_step, int batch_size,
                                py::object progress_callback, int progress_every,
-                               int n_snapshots) {
+                               int n_snapshots, int occ_nbatch) {
             if (me_density  <= 0) me_density  = 1;
             if (me_zl       <= 0) me_zl       = 1;
             if (me_cml      <= 0) me_cml      = 1;
@@ -282,14 +282,48 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             // n_samples is defined for the finest observable.
             // We group samples into batches; each batch stores the mean per size group per point.
             int total_steps = n_samples * min_me;
-            int n_density   = total_steps / me_density;  // total density samples
+
+            // ── Occupation-SF matrices: accumulate outer products s_α s*_β into
+            //    `occ_nbatch` coarse super-bins (decoupled from batch_size to keep
+            //    the 6×6-matrix storage small). Measured at occ-SF profile points.
+            int n_occ_pt = self.get_n_occ_sf_points();
+            int n_occ_q  = self.get_n_occ_q_points();
+            int nb       = self.get_occ_n_basis();
+            bool do_occ  = (n_occ_pt > 0 && n_occ_q > 0 && nb > 0 && occ_nbatch > 0);
+            int occ_nb   = do_occ ? occ_nbatch : 1;
+            int occ_pt_a = std::max(n_occ_pt, 1);
+            int occ_q_a  = std::max(n_occ_q, 1);
+            int nb_a     = std::max(nb, 1);
+            // 5D matrix outputs (occ_nb, n_occ_pt, n_occ_q, nb, nb) + nprof (occ_nb, n_occ_pt, N)
+            py::array_t<double> occ_full_re({occ_nb, occ_pt_a, occ_q_a, nb_a, nb_a});
+            py::array_t<double> occ_full_im({occ_nb, occ_pt_a, occ_q_a, nb_a, nb_a});
+            py::array_t<double> occ_bulk_re({occ_nb, occ_pt_a, occ_q_a, nb_a, nb_a});
+            py::array_t<double> occ_bulk_im({occ_nb, occ_pt_a, occ_q_a, nb_a, nb_a});
+            py::array_t<double> occ_nprof  ({occ_nb, occ_pt_a, N});
+            auto ofr = occ_full_re.mutable_unchecked<5>();
+            auto ofi = occ_full_im.mutable_unchecked<5>();
+            auto obr = occ_bulk_re.mutable_unchecked<5>();
+            auto obi = occ_bulk_im.mutable_unchecked<5>();
+            auto onp = occ_nprof.mutable_unchecked<3>();
+            // Flat super-bin accumulators
+            size_t occ_msz = (size_t)occ_pt_a * occ_q_a * nb_a * nb_a;
+            size_t occ_nsz = (size_t)occ_pt_a * N;
+            std::vector<double> aFr(do_occ?occ_msz:0,0.0), aFi(do_occ?occ_msz:0,0.0);
+            std::vector<double> aBr(do_occ?occ_msz:0,0.0), aBi(do_occ?occ_msz:0,0.0);
+            std::vector<double> aN (do_occ?occ_nsz:0,0.0);
+            long occ_count = 0, occ_bin = 0;
+            long occ_bin_size = do_occ ? std::max<long>(1, total_steps / occ_nb) : 1;
+
+            int n_batches_d = (total_steps / me_density) / batch_size;
             int n_batches_z = (total_steps / me_zl)  / batch_size;
             int n_batches_c = (total_steps / me_cml) / batch_size;
+            if (n_batches_d < 1) n_batches_d = 1;
             if (n_batches_z < 1) n_batches_z = 1;
             if (n_batches_c < 1) n_batches_c = 1;
 
-            // density: still per-sample (n_density, n_points)
-            py::array_t<double> density_out({n_density, n_points});
+            // density: batched per point (n_batches_d, n_points) — batch means,
+            // same batch_size as Z_l/C_m_l (was per-sample; batched to save storage).
+            py::array_t<double> density_out({n_batches_d, n_points});
             auto d_buf = density_out.mutable_unchecked<2>();
 
             // Z_l, C_m_l: batched per size group (n_batches, n_points, n_size_groups)
@@ -325,9 +359,33 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             std::vector<std::vector<double>> sf_a2_acc(n_q, std::vector<double>(n_points, 0.0));
             std::vector<std::vector<double>> sf_a3_acc(n_q, std::vector<double>(n_points, 0.0));
             std::vector<std::vector<double>> sf_a4_acc(n_q, std::vector<double>(n_points, 0.0));
-            int idx_d = 0;
+            std::vector<double> d_acc(n_points, 0.0);
+            int d_in_batch = 0, batch_d = 0;
             int z_in_batch = 0, c_in_batch = 0;
             int batch_z = 0, batch_c = 0;
+
+            // occ-SF super-bin flush: write current accumulators (mean over occ_count
+            // occ-samples) into super-bin occ_bin, then reset.
+            auto occ_flush = [&]() {
+                if (!do_occ || occ_count <= 0 || occ_bin >= occ_nb) return;
+                double inv = 1.0 / (double)occ_count;
+                for (int pt = 0; pt < n_occ_pt; ++pt)
+                  for (int qi = 0; qi < n_occ_q; ++qi)
+                    for (int a = 0; a < nb; ++a)
+                      for (int b = 0; b < nb; ++b) {
+                        size_t k = (((size_t)pt*occ_q_a + qi)*nb_a + a)*nb_a + b;
+                        ofr(occ_bin,pt,qi,a,b) = aFr[k]*inv; aFr[k]=0.0;
+                        ofi(occ_bin,pt,qi,a,b) = aFi[k]*inv; aFi[k]=0.0;
+                        obr(occ_bin,pt,qi,a,b) = aBr[k]*inv; aBr[k]=0.0;
+                        obi(occ_bin,pt,qi,a,b) = aBi[k]*inv; aBi[k]=0.0;
+                      }
+                for (int pt = 0; pt < n_occ_pt; ++pt)
+                  for (int i = 0; i < N; ++i) {
+                    size_t k = (size_t)pt*N + i;
+                    onp(occ_bin,pt,i) = aN[k]*inv; aN[k]=0.0;
+                  }
+                ++occ_bin; occ_count = 0;
+            };
 
             for (int i = 0; i < total_steps; ++i) {
                 self.mc_step();
@@ -350,9 +408,49 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                                 snap_buf(snap_count, k, i) = prof.snapshots[k][i];
                         ++snap_count;
                     }
-                    if (need_d && idx_d < n_density) {
-                        for (int k = 0; k < n_points; ++k) d_buf(idx_d, k) = prof.density[k];
-                        ++idx_d;
+                    // occ-SF: accumulate outer products s_α s*_β (full + bulk) and
+                    // the per-site occupation, into the current super-bin.
+                    if (do_occ) {
+                        for (int pt = 0; pt < n_occ_pt; ++pt) {
+                            const double* fr = prof.occ_s_full_re[pt].data();
+                            const double* fi = prof.occ_s_full_im[pt].data();
+                            const double* br = prof.occ_s_bulk_re[pt].data();
+                            const double* bi = prof.occ_s_bulk_im[pt].data();
+                            for (int qi = 0; qi < n_occ_q; ++qi) {
+                                size_t vb = (size_t)qi * nb;
+                                size_t mb = (((size_t)pt*occ_q_a + qi)*nb_a)*nb_a;
+                                for (int a = 0; a < nb; ++a) {
+                                    double far=fr[vb+a], fai=fi[vb+a], bar=br[vb+a], bai=bi[vb+a];
+                                    for (int b = 0; b < nb; ++b) {
+                                        size_t k = mb + (size_t)a*nb_a + b;
+                                        double fbr=fr[vb+b], fbi=fi[vb+b];
+                                        double bbr=br[vb+b], bbi=bi[vb+b];
+                                        aFr[k] += far*fbr + fai*fbi;
+                                        aFi[k] += fai*fbr - far*fbi;
+                                        aBr[k] += bar*bbr + bai*bbi;
+                                        aBi[k] += bai*bbr - bar*bbi;
+                                    }
+                                }
+                            }
+                            const int8_t* st = prof.occ_state[pt].data();
+                            size_t nbase = (size_t)pt * N;
+                            for (int i = 0; i < N; ++i) aN[nbase + i] += st[i];
+                        }
+                        ++occ_count;
+                        if (occ_count >= occ_bin_size && occ_bin < occ_nb - 1) occ_flush();
+                    }
+                    if (need_d) {
+                        for (int k = 0; k < n_points; ++k) d_acc[k] += prof.density[k];
+                        ++d_in_batch;
+                        if (d_in_batch >= batch_size && batch_d < n_batches_d) {
+                            double inv = 1.0 / d_in_batch;
+                            for (int k = 0; k < n_points; ++k) {
+                                d_buf(batch_d, k) = d_acc[k] * inv;
+                                d_acc[k] = 0.0;
+                            }
+                            ++batch_d;
+                            d_in_batch = 0;
+                        }
                     }
                     if (need_z) {
                         for (int g = 0; g < n_zg; ++g)
@@ -419,7 +517,14 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                         progress_callback(finest_done, n_samples, "sample");
                 }
             }
+            // Flush the last occ-SF super-bin (absorbs all remaining occ-samples).
+            if (do_occ) occ_flush();
             // Flush remaining partial batch
+            if (d_in_batch > 0 && batch_d < n_batches_d) {
+                double inv = 1.0 / d_in_batch;
+                for (int k = 0; k < n_points; ++k)
+                    d_buf(batch_d, k) = d_acc[k] * inv;
+            }
             if (z_in_batch > 0 && batch_z < n_batches_z) {
                 double inv = 1.0 / z_in_batch;
                 for (int g = 0; g < n_zg; ++g)
@@ -467,6 +572,15 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                 result["snapshots"] = snapshots_out;  // (n_snapshots, n_snap_pts, N) int8
                 result["n_snapshots_collected"] = py::int_(snap_count);
             }
+            if (do_occ) {
+                // (occ_nbatch, n_occ_pt, n_occ_q, n_basis, n_basis) — unconnected ⟨s_α s*_β⟩
+                result["occ_S_full_re"] = occ_full_re;
+                result["occ_S_full_im"] = occ_full_im;
+                result["occ_S_bulk_re"] = occ_bulk_re;
+                result["occ_S_bulk_im"] = occ_bulk_im;
+                result["occ_nprof"]     = occ_nprof;  // (occ_nbatch, n_occ_pt, N) ⟨n_i⟩ per super-bin
+                result["occ_nbatch"]    = py::int_(occ_nb);
+            }
             return result;
         },
         py::arg("n_equil"), py::arg("n_samples"),
@@ -478,6 +592,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         py::arg("progress_callback") = py::none(),
         py::arg("progress_every") = 1000,
         py::arg("n_snapshots")    = 0,
+        py::arg("occ_nbatch")     = 0,
         "Asymmetric profile with batched per-size-group storage.\n"
         "density: (n_density, n_points) per-sample.\n"
         "Z_l:     (n_batches, n_points, n_loop_size_groups)   — batch means of size-group means (signed).\n"
@@ -534,6 +649,50 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             const auto& v = self.get_snapshot_point_indices();
             return py::array_t<int>(v.size(), v.data());
         })
+
+        // ── Occupation structure-factor matrix (sublattice-resolved) ────────
+        .def("set_occ_sf_site_map", [](QAQMCEngine& self,
+                                       py::array_t<double> cell_R,
+                                       py::array_t<int> basis,
+                                       py::array_t<int> in_bulk, int n_basis) {
+            auto rb = cell_R.request();
+            if (rb.ndim != 2) throw std::runtime_error("cell_R must be (N, pos_dim)");
+            int N = (int)rb.shape[0]; int pd = (int)rb.shape[1];
+            const double* rp = static_cast<const double*>(rb.ptr);
+            std::vector<std::vector<double>> R(N, std::vector<double>(pd));
+            for (int i = 0; i < N; ++i) for (int d = 0; d < pd; ++d) R[i][d] = rp[i*pd+d];
+            auto bb = basis.request(); auto ib = in_bulk.request();
+            std::vector<int> bas(static_cast<const int*>(bb.ptr),
+                                 static_cast<const int*>(bb.ptr) + bb.shape[0]);
+            std::vector<int> ibk(static_cast<const int*>(ib.ptr),
+                                 static_cast<const int*>(ib.ptr) + ib.shape[0]);
+            self.set_occ_sf_site_map(R, bas, ibk, n_basis);
+        },
+        py::arg("cell_R"), py::arg("basis"), py::arg("in_bulk_cell"), py::arg("n_basis"),
+        "Set per-site cell Bravais position R, sublattice index α, and bulk-cell "
+        "membership for the occupation SF matrix.")
+        .def("set_occ_sf_q_points", [](QAQMCEngine& self, py::array_t<double> q_arr) {
+            auto buf = q_arr.request();
+            if (buf.ndim != 2) throw std::runtime_error("q_points must be (n_q, pos_dim)");
+            int n_q = (int)buf.shape[0]; int pd = (int)buf.shape[1];
+            const double* p = static_cast<const double*>(buf.ptr);
+            std::vector<std::vector<double>> q(n_q, std::vector<double>(pd));
+            for (int qi = 0; qi < n_q; ++qi) for (int d = 0; d < pd; ++d) q[qi][d] = p[qi*pd+d];
+            self.set_occ_sf_q_points(q);
+        },
+        py::arg("q_points"),
+        "Set q-points (n_q, pos_dim) for the occupation SF matrix (phases use cell R).")
+        .def("set_occ_sf_point_indices", [](QAQMCEngine& self, py::array_t<int> idx_arr) {
+            auto buf = idx_arr.request();
+            std::vector<int> idx(static_cast<const int*>(buf.ptr),
+                                 static_cast<const int*>(buf.ptr) + buf.shape[0]);
+            self.set_occ_sf_point_indices(idx);
+        },
+        py::arg("point_indices"),
+        "Profile-point indices at which to measure the occupation SF matrix.")
+        .def_property_readonly("n_occ_q_points",  &QAQMCEngine::get_n_occ_q_points)
+        .def_property_readonly("occ_n_basis",     &QAQMCEngine::get_occ_n_basis)
+        .def_property_readonly("n_occ_sf_points", &QAQMCEngine::get_n_occ_sf_points)
 
         .def_property_readonly("n_q_points",            &QAQMCEngine::get_n_q_points)
         .def_property_readonly("n_dimer_measure_points",&QAQMCEngine::get_n_dimer_measure_points)
