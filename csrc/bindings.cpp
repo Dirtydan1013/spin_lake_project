@@ -311,6 +311,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             std::vector<double> aFr(do_occ?occ_msz:0,0.0), aFi(do_occ?occ_msz:0,0.0);
             std::vector<double> aBr(do_occ?occ_msz:0,0.0), aBi(do_occ?occ_msz:0,0.0);
             std::vector<double> aN (do_occ?occ_nsz:0,0.0);
+            // Second (triangle) unit-cell matrix: single version, same super-bins.
+            bool do_occ2 = (do_occ && self.get_occ2_active());
+            py::array_t<double> occ2_re({occ_nb, occ_pt_a, occ_q_a, nb_a, nb_a});
+            py::array_t<double> occ2_im({occ_nb, occ_pt_a, occ_q_a, nb_a, nb_a});
+            auto o2r = occ2_re.mutable_unchecked<5>();
+            auto o2i = occ2_im.mutable_unchecked<5>();
+            std::vector<double> a2r(do_occ2?occ_msz:0,0.0), a2i(do_occ2?occ_msz:0,0.0);
             long occ_count = 0, occ_bin = 0;
             long occ_bin_size = do_occ ? std::max<long>(1, total_steps / occ_nb) : 1;
 
@@ -350,6 +357,20 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             auto sf_a3_buf = s_q_abs3_out.mutable_unchecked<3>();
             auto sf_a4_buf = s_q_abs4_out.mutable_unchecked<3>();
 
+            // VBS/SS: per-sample scalar at each profile point → batched means of
+            // M_vbs, M_ss and their squares (ride the me_zl batch cadence).
+            bool do_vbs = (self.get_n_vbs_triangles() > 0);
+            py::array_t<double> mvbs_out ({do_vbs?n_batches_z:1, n_points});
+            py::array_t<double> mss_out  ({do_vbs?n_batches_z:1, n_points});
+            py::array_t<double> mvbs2_out({do_vbs?n_batches_z:1, n_points});
+            py::array_t<double> mss2_out ({do_vbs?n_batches_z:1, n_points});
+            auto mvb_buf  = mvbs_out.mutable_unchecked<2>();
+            auto mss_buf  = mss_out.mutable_unchecked<2>();
+            auto mvb2_buf = mvbs2_out.mutable_unchecked<2>();
+            auto mss2_buf = mss2_out.mutable_unchecked<2>();
+            std::vector<double> mvb_acc (n_points, 0.0), mss_acc (n_points, 0.0);
+            std::vector<double> mvb2_acc(n_points, 0.0), mss2_acc(n_points, 0.0);
+
             // Batch accumulators: [n_groups][n_points]
             std::vector<std::vector<double>> z_acc(n_zg, std::vector<double>(n_points, 0.0));
             std::vector<std::vector<double>> c_acc(n_cg, std::vector<double>(n_points, 0.0));
@@ -378,6 +399,8 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                         ofi(occ_bin,pt,qi,a,b) = aFi[k]*inv; aFi[k]=0.0;
                         obr(occ_bin,pt,qi,a,b) = aBr[k]*inv; aBr[k]=0.0;
                         obi(occ_bin,pt,qi,a,b) = aBi[k]*inv; aBi[k]=0.0;
+                        if (do_occ2) { o2r(occ_bin,pt,qi,a,b)=a2r[k]*inv; a2r[k]=0.0;
+                                       o2i(occ_bin,pt,qi,a,b)=a2i[k]*inv; a2i[k]=0.0; }
                       }
                 for (int pt = 0; pt < n_occ_pt; ++pt)
                   for (int i = 0; i < N; ++i) {
@@ -435,6 +458,23 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                             const int8_t* st = prof.occ_state[pt].data();
                             size_t nbase = (size_t)pt * N;
                             for (int i = 0; i < N; ++i) aN[nbase + i] += st[i];
+                            if (do_occ2) {
+                                const double* r2 = prof.occ2_s_re[pt].data();
+                                const double* i2 = prof.occ2_s_im[pt].data();
+                                for (int qi = 0; qi < n_occ_q; ++qi) {
+                                    size_t vb = (size_t)qi * nb;
+                                    size_t mb = (((size_t)pt*occ_q_a + qi)*nb_a)*nb_a;
+                                    for (int a = 0; a < nb; ++a) {
+                                        double ar=r2[vb+a], ai=i2[vb+a];
+                                        for (int b = 0; b < nb; ++b) {
+                                            size_t k = mb + (size_t)a*nb_a + b;
+                                            double br=r2[vb+b], bi=i2[vb+b];
+                                            a2r[k] += ar*br + ai*bi;
+                                            a2i[k] += ai*br - ar*bi;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         ++occ_count;
                         if (occ_count >= occ_bin_size && occ_bin < occ_nb - 1) occ_flush();
@@ -456,6 +496,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                         for (int g = 0; g < n_zg; ++g)
                             for (int pt = 0; pt < n_points; ++pt)
                                 z_acc[g][pt] += prof.Z_l_by_size[g][pt];
+                        // VBS/SS rides same cadence as Z_l.
+                        if (do_vbs)
+                            for (int pt = 0; pt < n_points; ++pt) {
+                                double mv = prof.M_vbs[pt], ms = prof.M_ss[pt];
+                                mvb_acc[pt]  += mv;      mss_acc[pt]  += ms;
+                                mvb2_acc[pt] += mv * mv; mss2_acc[pt] += ms * ms;
+                            }
                         // SF rides same cadence as Z_l.
                         for (int qi = 0; qi < n_q; ++qi)
                             for (int pt = 0; pt < n_points; ++pt) {
@@ -473,6 +520,14 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                                 for (int pt = 0; pt < n_points; ++pt) {
                                     z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
                                     z_acc[g][pt] = 0.0;
+                                }
+                            if (do_vbs)
+                                for (int pt = 0; pt < n_points; ++pt) {
+                                    mvb_buf (batch_z, pt) = mvb_acc[pt]  * inv;
+                                    mss_buf (batch_z, pt) = mss_acc[pt]  * inv;
+                                    mvb2_buf(batch_z, pt) = mvb2_acc[pt] * inv;
+                                    mss2_buf(batch_z, pt) = mss2_acc[pt] * inv;
+                                    mvb_acc[pt]=mss_acc[pt]=mvb2_acc[pt]=mss2_acc[pt]=0.0;
                                 }
                             for (int qi = 0; qi < n_q; ++qi)
                                 for (int pt = 0; pt < n_points; ++pt) {
@@ -530,6 +585,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                 for (int g = 0; g < n_zg; ++g)
                     for (int pt = 0; pt < n_points; ++pt)
                         z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
+                if (do_vbs)
+                    for (int pt = 0; pt < n_points; ++pt) {
+                        mvb_buf (batch_z, pt) = mvb_acc[pt]  * inv;
+                        mss_buf (batch_z, pt) = mss_acc[pt]  * inv;
+                        mvb2_buf(batch_z, pt) = mvb2_acc[pt] * inv;
+                        mss2_buf(batch_z, pt) = mss2_acc[pt] * inv;
+                    }
                 for (int qi = 0; qi < n_q; ++qi)
                     for (int pt = 0; pt < n_points; ++pt) {
                         sf_re_buf(batch_z, pt, qi) = sf_re_acc[qi][pt] * inv;
@@ -572,6 +634,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                 result["snapshots"] = snapshots_out;  // (n_snapshots, n_snap_pts, N) int8
                 result["n_snapshots_collected"] = py::int_(snap_count);
             }
+            if (do_vbs) {
+                // (n_batches_z, n_points) batched means of M and M²
+                result["M_vbs"]  = mvbs_out;
+                result["M_ss"]   = mss_out;
+                result["M_vbs2"] = mvbs2_out;
+                result["M_ss2"]  = mss2_out;
+            }
             if (do_occ) {
                 // (occ_nbatch, n_occ_pt, n_occ_q, n_basis, n_basis) — unconnected ⟨s_α s*_β⟩
                 result["occ_S_full_re"] = occ_full_re;
@@ -580,6 +649,10 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                 result["occ_S_bulk_im"] = occ_bulk_im;
                 result["occ_nprof"]     = occ_nprof;  // (occ_nbatch, n_occ_pt, N) ⟨n_i⟩ per super-bin
                 result["occ_nbatch"]    = py::int_(occ_nb);
+                if (do_occ2) {
+                    result["occ2_S_re"] = occ2_re;    // (occ_nbatch, n_occ_pt, n_q, nb, nb) triangle unit cell
+                    result["occ2_S_im"] = occ2_im;
+                }
             }
             return result;
         },
@@ -690,9 +763,50 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         },
         py::arg("point_indices"),
         "Profile-point indices at which to measure the occupation SF matrix.")
+        .def("set_occ2_sf_site_map", [](QAQMCEngine& self,
+                                        py::array_t<double> cell_R, py::array_t<int> basis, int n_basis) {
+            auto rb = cell_R.request();
+            int N = (int)rb.shape[0]; int pd = (int)rb.shape[1];
+            const double* rp = static_cast<const double*>(rb.ptr);
+            std::vector<std::vector<double>> R(N, std::vector<double>(pd));
+            for (int i = 0; i < N; ++i) for (int d = 0; d < pd; ++d) R[i][d] = rp[i*pd+d];
+            auto bb = basis.request();
+            std::vector<int> bas(static_cast<const int*>(bb.ptr),
+                                 static_cast<const int*>(bb.ptr) + bb.shape[0]);
+            self.set_occ2_sf_site_map(R, bas, n_basis);
+        },
+        py::arg("cell_R"), py::arg("basis"), py::arg("n_basis"),
+        "Set the second (triangle-pair) unit-cell map for the occ-SF matrix "
+        "(basis=-1 marks sites excluded from the triangle tiling).")
+        .def_property_readonly("occ2_active", &QAQMCEngine::get_occ2_active)
+
         .def_property_readonly("n_occ_q_points",  &QAQMCEngine::get_n_occ_q_points)
         .def_property_readonly("occ_n_basis",     &QAQMCEngine::get_occ_n_basis)
         .def_property_readonly("n_occ_sf_points", &QAQMCEngine::get_n_occ_sf_points)
+
+        // ── VBS / SS order parameters ───────────────────────────────────────
+        .def("set_vbs_triangles", [](QAQMCEngine& self,
+                                     py::array_t<int> corners, py::array_t<int> n1_parity,
+                                     py::array_t<int> vbs_sign, py::array_t<int> ss_sign,
+                                     int ref00, int ref10) {
+            auto cb = corners.request();
+            std::vector<int> cf(static_cast<const int*>(cb.ptr),
+                                static_cast<const int*>(cb.ptr) + cb.size);
+            auto pb = n1_parity.request();
+            std::vector<int> par(static_cast<const int*>(pb.ptr),
+                                 static_cast<const int*>(pb.ptr) + pb.shape[0]);
+            auto vb = vbs_sign.request();
+            std::vector<int> vs(static_cast<const int*>(vb.ptr),
+                                static_cast<const int*>(vb.ptr) + vb.shape[0]);
+            auto sb = ss_sign.request();
+            std::vector<int> ss(static_cast<const int*>(sb.ptr),
+                                static_cast<const int*>(sb.ptr) + sb.shape[0]);
+            self.set_vbs_triangles(cf, par, vs, ss, ref00, ref10);
+        },
+        py::arg("corners"), py::arg("n1_parity"), py::arg("vbs_sign"), py::arg("ss_sign"),
+        py::arg("ref00"), py::arg("ref10"),
+        "Configure up-triangles for the VBS/SS order parameters (paper Eq. 5-6).")
+        .def_property_readonly("n_vbs_triangles", &QAQMCEngine::get_n_vbs_triangles)
 
         .def_property_readonly("n_q_points",            &QAQMCEngine::get_n_q_points)
         .def_property_readonly("n_dimer_measure_points",&QAQMCEngine::get_n_dimer_measure_points)

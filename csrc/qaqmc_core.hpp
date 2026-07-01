@@ -135,6 +135,16 @@ public:
         std::vector<std::vector<double>> occ_s_bulk_re;
         std::vector<std::vector<double>> occ_s_bulk_im;
         std::vector<std::vector<int8_t>> occ_state;        // [n_occ_pts][N]
+        // Second unit-cell version (triangle-pair), single matrix (its cells are
+        // the natural bulk tiling). Same q-points/points; shares occ_state/nprof.
+        std::vector<std::vector<double>> occ2_s_re;        // [n_occ_pts][n_q*n_basis]
+        std::vector<std::vector<double>> occ2_s_im;
+
+        // VBS / SS order parameters (paper Eq. 5-6), per-sample scalar at every
+        // profile point (only filled if up-triangles are configured).
+        //   M_vbs[pt] = (1/N_tri) Σ (-1)^{n1+n2} u ; M_ss[pt] = (1/N_tri) Σ (-1)^{n1} u
+        std::vector<double> M_vbs;                         // [n_points]
+        std::vector<double> M_ss;                          // [n_points]
         int n_points;
     };
     ProfileObservables measure_profile(int profile_step) const;
@@ -163,6 +173,25 @@ public:
     int  get_occ_n_basis()        const { return occ_n_basis_; }
     int  get_n_occ_sf_points()    const { return (int)occ_sf_point_indices_.size(); }
     const std::vector<int>& get_occ_sf_point_indices() const { return occ_sf_point_indices_; }
+
+    // Second occ-SF unit cell (triangle-pair). site_basis has α∈[0,n_basis) or
+    // -1 for sites not belonging to any complete triangle cell (excluded).
+    // Uses the same occ q-points; call set_occ_sf_q_points BEFORE this.
+    void set_occ2_sf_site_map(const std::vector<std::vector<double>>& site_cell_R,
+                              const std::vector<int>& site_basis, int n_basis);
+    int  get_occ2_active() const { return occ2_active_ ? 1 : 0; }
+
+    // ── VBS / SS order parameters (paper Eq. 5-6) ─────────────────────────
+    // corners_flat: [n_tri*3] the 3 corner site indices per up-triangle.
+    // n1_parity:    [n_tri] (n1 mod 2) for the even/odd branch of u.
+    // vbs_sign/ss_sign: [n_tri] the (-1)^{n1+n2} and (-1)^{n1} signs.
+    // ref00/ref10:  indices (into the triangle list) of triangles (0,0),(1,0).
+    void set_vbs_triangles(const std::vector<int>& corners_flat,
+                           const std::vector<int>& n1_parity,
+                           const std::vector<int>& vbs_sign,
+                           const std::vector<int>& ss_sign,
+                           int ref00, int ref10);
+    int  get_n_vbs_triangles() const { return vbs_n_tri_; }
 
     // ── Dimer (density-density) structure factor measurement ──────────────
     // S_d(q) = (1/N_d) Σ_ij e^{iq·(r_i-r_j)} [<n_i n_j> - <n_i><n_j>]
@@ -305,6 +334,20 @@ private:
     std::vector<double> occ_cell_R_flat_;                 // [N * pos_dim] cell Bravais pos per site
     int occ_n_basis_{0};
     std::vector<int>    occ_sf_point_indices_;            // profile points, sorted ascending
+
+    // ── Second occ-SF unit cell (triangle-pair) ───────────────────────────
+    std::vector<double> occ2_phase_cos_;                  // [n_q * N] cos(q·R_tri(i))
+    std::vector<double> occ2_phase_sin_;                  // [n_q * N]
+    std::vector<int>    occ2_site_basis_;                 // [N] α, or -1 if excluded
+    bool occ2_active_{false};
+
+    // ── VBS / SS up-triangle data ─────────────────────────────────────────
+    std::vector<int>    vbs_tri_corners_;                 // [n_tri*3] corner site indices
+    std::vector<int8_t> vbs_n1_parity_;                   // [n_tri]
+    std::vector<double> vbs_sign_;                        // [n_tri] (-1)^{n1+n2}
+    std::vector<double> ss_sign_;                         // [n_tri] (-1)^{n1}
+    int vbs_ref00_{-1}, vbs_ref10_{-1};
+    int vbs_n_tri_{0};
 
     // ── Vertex lists for O(M) cluster update ──────────────────────────────
     std::vector<int32_t> site_op_count_;

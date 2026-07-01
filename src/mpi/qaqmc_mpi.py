@@ -34,6 +34,31 @@ from src.rydberg.lattices import (kagome_loop_string_translations,
                           kagome_vertex_sites)
 
 
+def _build_vbs_triangles(nx, ny):
+    """Up-triangles for the VBS/SS order parameters (paper Eq. 5-6).
+    Triangle (n1,n2)=(i,j) has corners {(i,j)k0, (i+1,j)k2, (i,j+1)k4},
+    for i in 0..nx-2, j in 0..ny-2.  Returns (corners_flat, n1_parity,
+    vbs_sign, ss_sign, ref00, ref10) or None if the lattice is too small."""
+    if nx < 3 or ny < 2:
+        return None
+    def site(i, j, k): return (j * nx + i) * 6 + k
+    corners = []; par = []; vbs = []; ss = []
+    idx_by_ij = {}
+    t = 0
+    for j in range(ny - 1):
+        for i in range(nx - 1):
+            corners += [site(i, j, 0), site(i + 1, j, 2), site(i, j + 1, 4)]
+            par.append(i % 2)
+            vbs.append((-1) ** (i + j))
+            ss.append((-1) ** i)
+            idx_by_ij[(i, j)] = t
+            t += 1
+    ref00 = idx_by_ij[(0, 0)]
+    ref10 = idx_by_ij[(1, 0)]
+    return (np.array(corners, np.int32), np.array(par, np.int32),
+            np.array(vbs, np.int32), np.array(ss, np.int32), ref00, ref10)
+
+
 def _build_occ_sf_geometry(nx, ny, a):
     """Per-site (cell Bravais position R, sublattice α, bulk-complete-cell flag)
     for the kagome bond lattice.  site = (j*nx+i)*6+k → α=k, cell (i,j).
@@ -56,6 +81,31 @@ def _build_occ_sf_geometry(nx, ny, a):
             for s in atoms:
                 in_bulk[s] = 1
     return cell_R, basis, in_bulk
+
+
+def _build_occ2_sf_geometry(nx, ny, a):
+    """Alternate occ-SF unit cell: an up+down triangle pair (6 atoms) tiling
+    the *bulk* of the kagome bond lattice.  Cell (I,J), I∈0..nx-2, J∈0..ny-2:
+        up-triangle   : {(I,J)k0, (I+1,J)k2, (I,J+1)k4}   → α=0,1,2
+        down-triangle : {(I+1,J)k1, (I,J+1)k5, (I+1,J+1)k3} → α=3,4,5
+    Same triangular Bravais lattice as the hexagon cell (cell_R = I·v1 + J·v2),
+    so it is gauge-comparable, but covers (nx-1)(ny-1) cells using every bulk
+    atom (25 cells / 150 atoms for 6×6).  Atoms not in any pair get basis=-1.
+    Returns (cell_R (N,2), basis (N,))."""
+    v1 = np.array([a, 0.0]); v2 = np.array([a/2.0, a*np.sqrt(3)/2.0])
+    N = 6 * nx * ny
+    basis = np.full(N, -1, dtype=np.int32)
+    cell_R = np.zeros((N, 2), dtype=np.float64)
+    def site(i, j, k): return (j * nx + i) * 6 + k
+    for J in range(ny - 1):
+        for I in range(nx - 1):
+            R = I * v1 + J * v2
+            members = [site(I, J, 0), site(I + 1, J, 2), site(I, J + 1, 4),
+                       site(I + 1, J, 1), site(I, J + 1, 5), site(I + 1, J + 1, 3)]
+            for alpha, s in enumerate(members):
+                basis[s] = alpha
+                cell_R[s] = R
+    return cell_R, basis
 
 
 def _build_occ_q_grid(grid_n, a):
@@ -706,6 +756,14 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
     engine._cpp_engine.set_observable_sites(all_loop_sets, string_sets)
 
+    # VBS/SS order parameters (paper Eq. 5-6): measured at every profile point,
+    # batched like Z_l.  Always on for kagome_bond lattices large enough.
+    vbs_tri = _build_vbs_triangles(nx, ny)
+    do_vbs = vbs_tri is not None
+    if do_vbs:
+        corners, par, vsign, ssign, ref00, ref10 = vbs_tri
+        engine._cpp_engine.set_vbs_triangles(corners, par, vsign, ssign, ref00, ref10)
+
     # Optional: dimer structure factor S_d(q).  Setting q-points enables the
     # SF accumulator inside measure_profile (same forward walk, no extra MC).
     n_q = 0
@@ -735,6 +793,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     occ_pt_indices = np.array([], dtype=np.int32)
     occ_q_points = None; occ_q_frac = None
     occ_cell_R = occ_basis = occ_in_bulk = None
+    occ2_cell_R = occ2_basis = None
     do_occ = (occ_sf_delta_points is not None and len(occ_sf_delta_points) > 0
               and occ_sf_grid_n > 0 and occ_sf_nbatch > 0)
     if do_occ:
@@ -748,6 +807,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         engine._cpp_engine.set_occ_sf_site_map(occ_cell_R, occ_basis, occ_in_bulk, 6)
         engine._cpp_engine.set_occ_sf_q_points(occ_q_points)
         engine._cpp_engine.set_occ_sf_point_indices(occ_pt_indices)
+        # Second unit cell: up+down triangle pair (bulk tiling), same q-grid.
+        occ2_cell_R, occ2_basis = _build_occ2_sf_geometry(nx, ny, 1.0)
+        engine._cpp_engine.set_occ2_sf_site_map(occ2_cell_R, occ2_basis, 6)
     n_occ_pts = len(occ_pt_indices)
 
     if verbose and rank == 0:
@@ -836,6 +898,14 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     my_z_l = np.ascontiguousarray(my_z_raw[:, :, :n_loop_sg])    # (batches, pts, n_loop_sg)
     my_a_v = np.ascontiguousarray(my_z_raw[:, :, n_loop_sg])     # (batches, pts) — C++ already avg'd vertices
 
+    # VBS/SS order parameters (batched (batches, pts) means of M and M²).
+    my_mvbs = my_mss = my_mvbs2 = my_mss2 = None
+    if do_vbs and 'M_vbs' in result:
+        my_mvbs  = np.ascontiguousarray(result['M_vbs'],  dtype=np.float64)
+        my_mss   = np.ascontiguousarray(result['M_ss'],   dtype=np.float64)
+        my_mvbs2 = np.ascontiguousarray(result['M_vbs2'], dtype=np.float64)
+        my_mss2  = np.ascontiguousarray(result['M_ss2'],  dtype=np.float64)
+
     # Full-state snapshots (only present if snapshot points were set).
     # Shape per rank: (n_snap_collected, n_snap_pts, N) int8.
     my_snap = None
@@ -846,9 +916,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     #   occ_S_*: (occ_nbatch, n_occ_pt, n_q, 6, 6),  occ_nprof: (occ_nbatch, n_occ_pt, N)
     my_occ = None
     if do_occ and 'occ_S_full_re' in result:
+        keys = ['occ_S_full_re','occ_S_full_im','occ_S_bulk_re',
+                'occ_S_bulk_im','occ_nprof']
+        if 'occ2_S_re' in result:      # triangle-pair unit cell present
+            keys += ['occ2_S_re','occ2_S_im']
         my_occ = {k: np.ascontiguousarray(result[k], dtype=np.float64)
-                  for k in ('occ_S_full_re','occ_S_full_im','occ_S_bulk_re',
-                            'occ_S_bulk_im','occ_nprof')}
+                  for k in keys}
 
     # Dimer SF (only present if q-points were set above).  Shape: (batches, pts, n_q).
     my_sf_re = None; my_sf_im = None
@@ -923,10 +996,22 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         gathered_occ = comm.gather(my_occ, root=0)
         if rank == 0:
             all_occ = {}
-            for key in ('occ_S_full_re','occ_S_full_im','occ_S_bulk_re',
-                        'occ_S_bulk_im','occ_nprof'):
-                all_occ[key] = np.concatenate(
-                    [g[key] for g in gathered_occ if g is not None], axis=0)
+            present = [g for g in gathered_occ if g is not None]
+            keys = ['occ_S_full_re','occ_S_full_im','occ_S_bulk_re',
+                    'occ_S_bulk_im','occ_nprof']
+            if present and 'occ2_S_re' in present[0]:
+                keys += ['occ2_S_re','occ2_S_im']
+            for key in keys:
+                all_occ[key] = np.concatenate([g[key] for g in present], axis=0)
+
+    # Gather VBS/SS (batched (batches_z, n_points), concatenate along axis 0).
+    all_vbs = None
+    if do_vbs:
+        my_v = dict(M_vbs=my_mvbs, M_ss=my_mss, M_vbs2=my_mvbs2, M_ss2=my_mss2)
+        gathered_v = comm.gather(my_v, root=0)
+        if rank == 0:
+            all_vbs = {k: np.concatenate([g[k] for g in gathered_v if g is not None], axis=0)
+                       for k in ('M_vbs','M_ss','M_vbs2','M_ss2')}
 
     if rank == 0:
         os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
@@ -1078,6 +1163,14 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             og.create_dataset('A_v',     data=all_a_v)        # (n_batches, n_points) — mean over vertices (C++)
             og.create_dataset('C_m_l',   data=all_c_m_l)     # (n_batches, n_points, n_string_size_groups)
             og.attrs['n_vertices'] = n_vertex
+            if do_vbs and all_vbs is not None:
+                # VBS/SS order parameters (paper Eq. 5-6), batched (n_batches, n_points).
+                # Post-process:  M_order = sqrt(<M²>),  <M²> = mean over batches of M_vbs2.
+                og.create_dataset('M_vbs',  data=all_vbs['M_vbs'])   # batch means of M_VBS
+                og.create_dataset('M_ss',   data=all_vbs['M_ss'])
+                og.create_dataset('M_vbs2', data=all_vbs['M_vbs2'])  # batch means of M_VBS²
+                og.create_dataset('M_ss2',  data=all_vbs['M_ss2'])
+                og.attrs['n_up_triangles'] = int(vbs_tri[0].shape[0] // 3)
             if n_q > 0:
                 # Optional δ-subsetting: keep only the profile points nearest to
                 # the user-specified δ values; otherwise save SF at every profile
@@ -1162,6 +1255,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 ocg.attrs['grid_n']  = int(occ_sf_grid_n)
                 ocg.attrs['n_basis'] = 6
                 ocg.attrs['nbatch_per_rank'] = int(occ_sf_nbatch)
+                # Alternate triangle-pair unit cell (bulk tiling), same q-grid/δ.
+                if 'occ2_S_re' in all_occ:
+                    ocg.create_dataset('S_tri_re',   data=all_occ['occ2_S_re'])
+                    ocg.create_dataset('S_tri_im',   data=all_occ['occ2_S_im'])
+                    ocg.create_dataset('tri_cell_R', data=occ2_cell_R)    # (N,2) per-site cell pos
+                    ocg.create_dataset('tri_basis',  data=occ2_basis)     # (N,) α (−1 if excluded)
 
             lg = f.create_group('observable_sites')
             for idx, lp in enumerate(loop_sets):

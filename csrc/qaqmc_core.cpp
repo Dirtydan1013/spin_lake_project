@@ -516,6 +516,12 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
     if (n_snap > 0) prof.snapshots.assign(n_snap, std::vector<int8_t>(N_, 0));
     size_t next_snap = 0;  // running pointer into sorted snapshot_point_indices_
 
+    // VBS/SS order parameters at every profile point (if triangles configured).
+    if (vbs_n_tri_ > 0) {
+        prof.M_vbs.assign(n_points, 0.0);
+        prof.M_ss.assign(n_points, 0.0);
+    }
+
     // Occupation-SF bookkeeping: at requested points compute s_{q,α} (full+bulk).
     const int n_occ_pt = (int)occ_sf_point_indices_.size();
     const int n_occ_q  = (int)occ_q_points_.size();
@@ -527,6 +533,10 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
         prof.occ_s_bulk_re.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
         prof.occ_s_bulk_im.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
         prof.occ_state.assign(n_occ_pt, std::vector<int8_t>(N_, 0));
+        if (occ2_active_) {
+            prof.occ2_s_re.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
+            prof.occ2_s_im.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
+        }
     }
     size_t next_occ = 0;  // running pointer into sorted occ_sf_point_indices_
 
@@ -632,9 +642,49 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
                         if (occ_site_in_bulk_[i]) { sbr[base + a] += c; sbi[base + a] += s; }
                     }
                 }
+                // Second unit cell (triangle-pair): s_{q,α} over triangle cells.
+                if (occ2_active_) {
+                    std::vector<double>& s2r = prof.occ2_s_re[next_occ];
+                    std::vector<double>& s2i = prof.occ2_s_im[next_occ];
+                    for (int qi = 0; qi < n_occ_q; ++qi) {
+                        const double* cosq = &occ2_phase_cos_[(size_t)qi * N_];
+                        const double* sinq = &occ2_phase_sin_[(size_t)qi * N_];
+                        const size_t base = (size_t)qi * n_basis;
+                        for (int i = 0; i < N_; ++i) {
+                            if (!state[i]) continue;
+                            int a = occ2_site_basis_[i];
+                            if (a < 0) continue;
+                            s2r[base + a] += cosq[i];
+                            s2i[base + a] += sinq[i];
+                        }
+                    }
+                }
                 std::vector<int8_t>& st = prof.occ_state[next_occ];
                 for (int i = 0; i < N_; ++i) st[i] = (int8_t)state[i];
                 ++next_occ;
+            }
+
+            // VBS/SS order parameters (diagonal, at every profile point).
+            if (vbs_n_tri_ > 0) {
+                auto tri_state = [&](int t) -> int {
+                    const int* cc = &vbs_tri_corners_[3 * t];
+                    return 4 * state[cc[0]] + 2 * state[cc[1]] + state[cc[2]];
+                };
+                int s00 = tri_state(vbs_ref00_);
+                int s10 = tri_state(vbs_ref10_);
+                double g = (s10 == s00) ? 1.0 : -1.0;
+                double mv = 0.0, ms = 0.0;
+                for (int t = 0; t < vbs_n_tri_; ++t) {
+                    int s = tri_state(t);
+                    double u = (vbs_n1_parity_[t] == 0)
+                                   ? ((s == s00) ? 1.0 : -1.0)
+                                   : (((s == s10) ? 1.0 : -1.0) * g);
+                    mv += vbs_sign_[t] * u;
+                    ms += ss_sign_[t]  * u;
+                }
+                double inv = 1.0 / (double)vbs_n_tri_;
+                prof.M_vbs[out_idx] = mv * inv;
+                prof.M_ss[out_idx]  = ms * inv;
             }
 
             ++out_idx;
@@ -743,6 +793,52 @@ void QAQMCEngine::set_occ_sf_point_indices(const std::vector<int>& point_indices
         occ_sf_point_indices_.end());
     for (int idx : occ_sf_point_indices_)
         if (idx < 0) throw std::runtime_error("set_occ_sf_point_indices: index < 0");
+}
+
+void QAQMCEngine::set_occ2_sf_site_map(
+        const std::vector<std::vector<double>>& site_cell_R,
+        const std::vector<int>& site_basis, int n_basis) {
+    if ((int)site_cell_R.size() != N_ || (int)site_basis.size() != N_)
+        throw std::runtime_error("set_occ2_sf_site_map: arrays must have length N");
+    if (occ_q_points_.empty())
+        throw std::runtime_error("set_occ2_sf_site_map: call set_occ_sf_q_points first");
+    if (n_basis != occ_n_basis_)
+        throw std::runtime_error("set_occ2_sf_site_map: n_basis must match occ n_basis");
+    occ2_site_basis_ = site_basis;
+    const int n_q = (int)occ_q_points_.size();
+    occ2_phase_cos_.assign((size_t)n_q * N_, 0.0);
+    occ2_phase_sin_.assign((size_t)n_q * N_, 0.0);
+    for (int qi = 0; qi < n_q; ++qi) {
+        const auto& q = occ_q_points_[qi];
+        for (int i = 0; i < N_; ++i) {
+            if (site_basis[i] < 0) continue;      // excluded site
+            double qr = 0.0;
+            for (int d = 0; d < pos_dim_; ++d)
+                qr += q[d] * site_cell_R[i][d];
+            occ2_phase_cos_[(size_t)qi * N_ + i] = std::cos(qr);
+            occ2_phase_sin_[(size_t)qi * N_ + i] = std::sin(qr);
+        }
+    }
+    occ2_active_ = true;
+}
+
+void QAQMCEngine::set_vbs_triangles(const std::vector<int>& corners_flat,
+                                    const std::vector<int>& n1_parity,
+                                    const std::vector<int>& vbs_sign,
+                                    const std::vector<int>& ss_sign,
+                                    int ref00, int ref10) {
+    int n_tri = (int)n1_parity.size();
+    if ((int)corners_flat.size() != 3 * n_tri || (int)vbs_sign.size() != n_tri ||
+        (int)ss_sign.size() != n_tri)
+        throw std::runtime_error("set_vbs_triangles: array length mismatch");
+    vbs_n_tri_ = n_tri;
+    vbs_tri_corners_ = corners_flat;
+    vbs_n1_parity_.assign(n_tri, 0);
+    for (int t = 0; t < n_tri; ++t) vbs_n1_parity_[t] = (int8_t)(n1_parity[t] & 1);
+    vbs_sign_.assign(n_tri, 1.0);
+    ss_sign_.assign(n_tri, 1.0);
+    for (int t = 0; t < n_tri; ++t) { vbs_sign_[t] = vbs_sign[t]; ss_sign_[t] = ss_sign[t]; }
+    vbs_ref00_ = ref00; vbs_ref10_ = ref10;
 }
 
 void QAQMCEngine::set_dimer_sf_measure_p_indices(
