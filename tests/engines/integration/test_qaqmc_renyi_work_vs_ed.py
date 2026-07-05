@@ -6,9 +6,10 @@ Verifies:
   2. Nested pair (A → AB) case: delta_s2 matches S_2(AB) − S_2(A).
   3. Sum across a chain of nested rungs matches end-to-end S_2 (KP workflow integration).
 
-Uses a small 1D Rydberg chain (N=4) where ED is feasible and a coarse λ schedule
-(K=4) where the Jarzynski estimator has manageable variance. Tolerances account
-for finite-trajectory Jarzynski noise + "multiply by 1" prescription bias.
+Uses a small 1D Rydberg chain (N=4) where ED is feasible and a K=50 λ schedule
+where the Jarzynski "multiply by 1" prescription bias stays well under the
+tolerance. Tolerances account for finite-trajectory Jarzynski noise + the
+residual prescription bias.
 """
 import os
 import sys
@@ -108,7 +109,12 @@ def test_nested_pair_matches_ed():
         neighbor_cutoff=-1, delta_groups=200,
     )
     eng.set_region_pair(A, AB)
-    eng.set_lambda_schedule(np.linspace(0.0, 1.0, 5))
+    # K = 50, same as the ∅ → A test.  A coarse K=4 schedule leaves ~37% of
+    # trajectories with the site unjoined at λ=1, and the "multiply by 1"
+    # prescription bias then reaches ~+0.27 for this rung (measured; the
+    # engine converges monotonically to ED as K grows: +0.27 @ K=4,
+    # +0.04 @ K=50, +0.02 @ K=200) — far outside the 0.15 tolerance.
+    eng.set_lambda_schedule(np.linspace(0.0, 1.0, 51))
     eng.thermalize(3000)
     res = eng.run_trajectories(n_trajectories=2000, decorrelation_steps=200)
 
