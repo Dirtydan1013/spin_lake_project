@@ -69,6 +69,12 @@ RydbergVij build_rydberg_vij(int N, double Omega, double Rb,
         res.coord_number[res.bonds_i[b]]++;
         res.coord_number[res.bonds_j[b]]++;
     }
+    // Reciprocal coordination (delta_i = delta * inv_coord[i]) so the hot
+    // paths trade a division for a multiply.
+    res.inv_coord.assign(N, 0.0);
+    for (int i = 0; i < N; ++i) {
+        if (res.coord_number[i] > 0) res.inv_coord[i] = 1.0 / res.coord_number[i];
+    }
 
     int n_bonds_pad = std::max(res.n_bonds, 1);
     res.bond_sites_flat.resize(n_bonds_pad * 2, 0);
@@ -102,6 +108,7 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
     // Allocate flat arrays — sized for p_count slices, not M_total
     res.bond_W_all.assign(p_count * n_bonds_pad * 4, 0.0);
     res.bond_W_max_all.assign(p_count * n_bonds_pad, 0.0);
+    res.bond_W_rmax_all.assign(p_count * n_bonds_pad, 0.0);
     res.n_alias_all.resize(p_count, 0);
     res.alias_prob_all.assign(p_count * max_alias, 0.0);
     res.alias_idx_all.assign(p_count * max_alias, 0);
@@ -139,8 +146,10 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
             double vij = bond_vij[b];
             int si = bond_si[b];
             int sj = bond_sj[b];
-            double delta_i = (coord_number[si] > 0) ? delta / coord_number[si] : 0.0;
-            double delta_j = (coord_number[sj] > 0) ? delta / coord_number[sj] : 0.0;
+            double inv_zi = (coord_number[si] > 0) ? 1.0 / coord_number[si] : 0.0;
+            double inv_zj = (coord_number[sj] > 0) ? 1.0 / coord_number[sj] : 0.0;
+            double delta_i = delta * inv_zi;
+            double delta_j = delta * inv_zj;
 
             double W[4], bmax;
             QAQMCEngine::compute_bond_W_inline(delta_i, delta_j, vij, epsilon, W, bmax);
@@ -152,6 +161,7 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
             res.bond_W_all[base + 3] = W[3];
 
             res.bond_W_max_all[pi * n_bonds_pad + b] = bmax;
+            res.bond_W_rmax_all[pi * n_bonds_pad + b] = (bmax > 0.0) ? 1.0 / bmax : 0.0;
 
             weights[n_a] = bmax;
             op_kind[n_a] = 1;
@@ -251,28 +261,20 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
         const int* bond_si = vij_.bonds_i.data();
         const int* bond_sj = vij_.bonds_j.data();
         const double* bond_vij = vij_.vij_list.data();
-        const int* coord_num = vij_.coord_number.data();
+        const double* inv_coord = vij_.inv_coord.data();
 
         grp_alias_.n_groups = G;
         grp_alias_.max_alias = max_alias;
         grp_alias_.n_bonds_pad = n_bonds_pad;
-        grp_alias_.slice_to_group.resize(M_total_);
-
-        // Assign each slice to a group (uniform partition)
-        for (int p = 0; p < M_total_; ++p) {
-            int g = (int)((int64_t)p * G / M_total_);
-            if (g >= G) g = G - 1;
-            grp_alias_.slice_to_group[p] = g;
-        }
+        // (slice -> group is computed incrementally in diagonal_update; no
+        //  4-byte-per-slice map is materialised.)
 
         // For each group, find the range of delta values and compute
         // envelope W_max (upper bound) for rejection sampling.
         grp_alias_.bond_W_max_all.assign(G * n_bonds_pad, 0.0);
+        grp_alias_.bond_W_rmax_all.assign(G * n_bonds_pad, 0.0);
         grp_alias_.n_alias_all.resize(G, 0);
-        grp_alias_.alias_prob_all.assign(G * max_alias, 0.0);
-        grp_alias_.alias_idx_all.assign(G * max_alias, 0);
-        grp_alias_.op_map_kind_all.assign(G * max_alias, 0);
-        grp_alias_.op_map_loc_all.assign(G * max_alias, 0);
+        grp_alias_.entries.assign((size_t)G * max_alias, AliasEntry{0.0, 0, 0});
 
 #ifdef QAQMC_USE_OPENMP
         #pragma omp parallel for schedule(static)
@@ -294,17 +296,19 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
             std::vector<double> env_W_max(n_bonds, 0.0);
             for (double delta : sample_deltas) {
                 for (int b = 0; b < n_bonds; ++b) {
-                    double di = (coord_num[bond_si[b]] > 0) ? delta / coord_num[bond_si[b]] : 0.0;
-                    double dj = (coord_num[bond_sj[b]] > 0) ? delta / coord_num[bond_sj[b]] : 0.0;
+                    double di = delta * inv_coord[bond_si[b]];
+                    double dj = delta * inv_coord[bond_sj[b]];
                     double W[4], wmax;
                     compute_bond_W_inline(di, dj, bond_vij[b], epsilon_, W, wmax);
                     if (wmax > env_W_max[b]) env_W_max[b] = wmax;
                 }
             }
 
-            // Store envelope W_max
+            // Store envelope W_max (+ reciprocal for the acceptance test)
             for (int b = 0; b < n_bonds; ++b) {
                 grp_alias_.bond_W_max_all[g * n_bonds_pad + b] = env_W_max[b];
+                grp_alias_.bond_W_rmax_all[g * n_bonds_pad + b] =
+                    (env_W_max[b] > 0.0) ? 1.0 / env_W_max[b] : 0.0;
             }
 
             // Build alias table for this group
@@ -327,10 +331,6 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
             }
 
             grp_alias_.n_alias_all[g] = n_a;
-            for (int i = 0; i < n_a; ++i) {
-                grp_alias_.op_map_kind_all[g * max_alias + i] = op_kind[i];
-                grp_alias_.op_map_loc_all[g * max_alias + i] = op_loc[i];
-            }
 
             // Vose's alias method
             double total = 0.0;
@@ -357,9 +357,11 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
                 else large_buf.push_back(l);
             }
 
+            AliasEntry* tab = &grp_alias_.entries[(size_t)g * max_alias];
             for (int i = 0; i < n_a; ++i) {
-                grp_alias_.alias_prob_all[g * max_alias + i] = prob_arr[i];
-                grp_alias_.alias_idx_all[g * max_alias + i] = alias_arr[i];
+                tab[i].prob = prob_arr[i];
+                tab[i].alias = (int32_t)alias_arr[i];
+                tab[i].loc_kind = (op_loc[i] << 1) | op_kind[i];
             }
         }
     }
@@ -397,6 +399,9 @@ void QAQMCEngine::set_op_string(const int32_t* types, const int32_t* sites, int 
     if (len != M_total_) return;
     std::memcpy(op_types_.data(), types, len * sizeof(int32_t));
     std::memcpy(op_sites_.data(), sites, len * sizeof(int32_t));
+    // Externally-replaced ops invalidate the counts fused into the last
+    // diagonal sweep; build_vertex_lists will re-count.
+    vertex_counts_valid_ = false;
 }
 
 // Off-diagonal string (X_C) seam/half-line/topology_sweep methods
@@ -485,14 +490,14 @@ QAQMCEngine::MidpointObservables QAQMCEngine::measure_at_midpoint() const {
 }
 
 // ─── Asymmetric profile measurement ──────────────────────────────────────────
+//
+// Split into profile_alloc / profile_measure_point so the same measurement
+// code serves both the standalone measure_profile() sweep and the fused
+// capture inside diagonal_update_profiled().
 
-QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) const {
-    if (profile_step <= 0) profile_step = 1;
-    int n_points = M_total_ / profile_step;
-
-    ProfileObservables prof;
+void QAQMCEngine::profile_alloc(ProfileObservables& prof, int n_points) const {
     prof.n_points = n_points;
-    prof.density.resize(n_points, 0.0);
+    prof.density.assign(n_points, 0.0);
     const int n_zg = (int)loop_group_n_copies_.size();
     const int n_cg = (int)string_group_n_copies_.size();
     const int n_q  = (int)dimer_q_points_.size();
@@ -506,10 +511,8 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
         prof.s_q_abs3.assign(n_q, std::vector<double>(n_points, 0.0));
         prof.s_q_abs4.assign(n_q, std::vector<double>(n_points, 0.0));
     }
-    // Snapshot bookkeeping: copy full state at requested profile points.
     const int n_snap = (int)snapshot_point_indices_.size();
     if (n_snap > 0) prof.snapshots.assign(n_snap, std::vector<int8_t>(N_, 0));
-    size_t next_snap = 0;  // running pointer into sorted snapshot_point_indices_
 
     // VBS/SS order parameters at every profile point (if triangles configured).
     if (vbs_n_tri_ > 0) {
@@ -533,7 +536,164 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
             prof.occ2_s_im.assign(n_occ_pt, std::vector<double>(vlen, 0.0));
         }
     }
-    size_t next_occ = 0;  // running pointer into sorted occ_sf_point_indices_
+}
+
+void QAQMCEngine::profile_measure_point(const std::vector<int32_t>& state, int out_idx,
+                                        ProfileObservables& prof,
+                                        size_t& next_snap, size_t& next_occ) const {
+    const int n_zg = (int)loop_group_n_copies_.size();
+    const int n_cg = (int)string_group_n_copies_.size();
+    const int n_q  = (int)dimer_q_points_.size();
+    const int n_occ_q = (int)occ_q_points_.size();
+    const int n_basis = occ_n_basis_;
+
+    // Density (bulk if set, else all sites)
+    if (!bulk_sites_.empty()) {
+        double s = 0.0;
+        for (int si : bulk_sites_) s += state[si];
+        prof.density[out_idx] = s / (double)bulk_sites_.size();
+    } else {
+        double s = 0.0;
+        for (int i = 0; i < N_; ++i) s += state[i];
+        prof.density[out_idx] = s / N_;
+    }
+
+    // Z_l: mean over copies per size group (signed, no |·|)
+    for (size_t k = 0; k < loop_site_sets_.size(); ++k) {
+        double prod = 1.0;
+        for (int s : loop_site_sets_[k]) prod *= (1 - 2 * state[s]);
+        prof.Z_l_by_size[loop_group_of_[k]][out_idx] += prod;
+    }
+    for (int g = 0; g < n_zg; ++g) {
+        if (loop_group_n_copies_[g] > 0)
+            prof.Z_l_by_size[g][out_idx] /= (double)loop_group_n_copies_[g];
+    }
+
+    // C_m_l: mean over copies per size group
+    for (size_t k = 0; k < string_site_sets_.size(); ++k) {
+        double prod = 1.0;
+        for (int s : string_site_sets_[k]) prod *= (1 - 2 * state[s]);
+        prof.C_m_l_by_size[string_group_of_[k]][out_idx] += prod;
+    }
+    for (int g = 0; g < n_cg; ++g) {
+        if (string_group_n_copies_[g] > 0)
+            prof.C_m_l_by_size[g][out_idx] /= (double)string_group_n_copies_[g];
+    }
+
+    // Dimer structure factor s_q = Σ_{i ∈ bulk} n_i e^{i q·r_i}.
+    // Uses bulk_sites_ if non-empty (same convention as density),
+    // else all N sites.  Same snapshot timing as density/Z/C — i.e.,
+    // after applying op at slot p (asymmetric profile observable at
+    // δ_sched_[p+1] in the dimer "before-op" convention).
+    if (n_q > 0) {
+        for (int qi = 0; qi < n_q; ++qi) {
+            double sx = 0.0, sy = 0.0;
+            const double* cosq = &dimer_phase_cos_[(size_t)qi * N_];
+            const double* sinq = &dimer_phase_sin_[(size_t)qi * N_];
+            if (!bulk_sites_.empty()) {
+                for (int i : bulk_sites_) {
+                    if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
+                }
+            } else {
+                for (int i = 0; i < N_; ++i) {
+                    if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
+                }
+            }
+            double abs2 = sx * sx + sy * sy;
+            double abs1 = std::sqrt(abs2);
+            prof.s_q_real[qi][out_idx] = sx;
+            prof.s_q_imag[qi][out_idx] = sy;
+            prof.s_q_abs1[qi][out_idx] = abs1;
+            prof.s_q_abs2[qi][out_idx] = abs2;
+            prof.s_q_abs3[qi][out_idx] = abs2 * abs1;
+            prof.s_q_abs4[qi][out_idx] = abs2 * abs2;
+        }
+    }
+
+    // Snapshot the full state at requested profile points (all N sites,
+    // same "after op p" convention as density/SF above).
+    if (next_snap < snapshot_point_indices_.size()
+        && snapshot_point_indices_[next_snap] == out_idx) {
+        std::vector<int8_t>& snap = prof.snapshots[next_snap];
+        for (int i = 0; i < N_; ++i) snap[i] = (int8_t)state[i];
+        ++next_snap;
+    }
+
+    // Occupation-SF: at requested points, compute the sublattice-resolved
+    // Fourier vectors s_{q,α} = Σ_{i:α(i)=α} n_i e^{i q·R_cell(i)} for the
+    // full lattice and the bulk-complete-cell subset; also stash state.
+    if (next_occ < occ_sf_point_indices_.size()
+        && occ_sf_point_indices_[next_occ] == out_idx) {
+        std::vector<double>& sfr = prof.occ_s_full_re[next_occ];
+        std::vector<double>& sfi = prof.occ_s_full_im[next_occ];
+        std::vector<double>& sbr = prof.occ_s_bulk_re[next_occ];
+        std::vector<double>& sbi = prof.occ_s_bulk_im[next_occ];
+        for (int qi = 0; qi < n_occ_q; ++qi) {
+            const double* cosq = &occ_phase_cos_[(size_t)qi * N_];
+            const double* sinq = &occ_phase_sin_[(size_t)qi * N_];
+            const size_t base = (size_t)qi * n_basis;
+            for (int i = 0; i < N_; ++i) {
+                if (!state[i]) continue;
+                int a = occ_site_basis_[i];
+                double c = cosq[i], s = sinq[i];
+                sfr[base + a] += c; sfi[base + a] += s;
+                if (occ_site_in_bulk_[i]) { sbr[base + a] += c; sbi[base + a] += s; }
+            }
+        }
+        // Second unit cell (triangle-pair): s_{q,α} over triangle cells.
+        if (occ2_active_) {
+            std::vector<double>& s2r = prof.occ2_s_re[next_occ];
+            std::vector<double>& s2i = prof.occ2_s_im[next_occ];
+            for (int qi = 0; qi < n_occ_q; ++qi) {
+                const double* cosq = &occ2_phase_cos_[(size_t)qi * N_];
+                const double* sinq = &occ2_phase_sin_[(size_t)qi * N_];
+                const size_t base = (size_t)qi * n_basis;
+                for (int i = 0; i < N_; ++i) {
+                    if (!state[i]) continue;
+                    int a = occ2_site_basis_[i];
+                    if (a < 0) continue;
+                    s2r[base + a] += cosq[i];
+                    s2i[base + a] += sinq[i];
+                }
+            }
+        }
+        std::vector<int8_t>& st = prof.occ_state[next_occ];
+        for (int i = 0; i < N_; ++i) st[i] = (int8_t)state[i];
+        ++next_occ;
+    }
+
+    // VBS/SS order parameters (diagonal, at every profile point).
+    if (vbs_n_tri_ > 0) {
+        auto tri_state = [&](int t) -> int {
+            const int* cc = &vbs_tri_corners_[3 * t];
+            return 4 * state[cc[0]] + 2 * state[cc[1]] + state[cc[2]];
+        };
+        int s00 = tri_state(vbs_ref00_);
+        int s10 = tri_state(vbs_ref10_);
+        double g = (s10 == s00) ? 1.0 : -1.0;
+        double mv = 0.0, ms = 0.0;
+        for (int t = 0; t < vbs_n_tri_; ++t) {
+            int s = tri_state(t);
+            double u = (vbs_n1_parity_[t] == 0)
+                           ? ((s == s00) ? 1.0 : -1.0)
+                           : (((s == s10) ? 1.0 : -1.0) * g);
+            mv += vbs_sign_[t] * u;
+            ms += ss_sign_[t]  * u;
+        }
+        double inv = 1.0 / (double)vbs_n_tri_;
+        prof.M_vbs[out_idx] = mv * inv;
+        prof.M_ss[out_idx]  = ms * inv;
+    }
+}
+
+QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) const {
+    if (profile_step <= 0) profile_step = 1;
+    int n_points = M_total_ / profile_step;
+
+    ProfileObservables prof;
+    profile_alloc(prof, n_points);
+    size_t next_snap = 0;  // running pointer into sorted snapshot_point_indices_
+    size_t next_occ = 0;   // running pointer into sorted occ_sf_point_indices_
 
     // Propagate state from left boundary |0...0>
     std::vector<int32_t> state(N_, 0);
@@ -544,144 +704,7 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
         if (op_types_[p] == -1) state[op_sites_[p]] ^= 1;
 
         if ((p + 1) % profile_step == 0) {
-            // Density (bulk if set, else all sites)
-            if (!bulk_sites_.empty()) {
-                double s = 0.0;
-                for (int si : bulk_sites_) s += state[si];
-                prof.density[out_idx] = s / (double)bulk_sites_.size();
-            } else {
-                double s = 0.0;
-                for (int i = 0; i < N_; ++i) s += state[i];
-                prof.density[out_idx] = s / N_;
-            }
-
-            // Z_l: mean over copies per size group (signed, no |·|)
-            for (size_t k = 0; k < loop_site_sets_.size(); ++k) {
-                double prod = 1.0;
-                for (int s : loop_site_sets_[k]) prod *= (1 - 2 * state[s]);
-                prof.Z_l_by_size[loop_group_of_[k]][out_idx] += prod;
-            }
-            for (int g = 0; g < n_zg; ++g) {
-                if (loop_group_n_copies_[g] > 0)
-                    prof.Z_l_by_size[g][out_idx] /= (double)loop_group_n_copies_[g];
-            }
-
-            // C_m_l: mean over copies per size group
-            for (size_t k = 0; k < string_site_sets_.size(); ++k) {
-                double prod = 1.0;
-                for (int s : string_site_sets_[k]) prod *= (1 - 2 * state[s]);
-                prof.C_m_l_by_size[string_group_of_[k]][out_idx] += prod;
-            }
-            for (int g = 0; g < n_cg; ++g) {
-                if (string_group_n_copies_[g] > 0)
-                    prof.C_m_l_by_size[g][out_idx] /= (double)string_group_n_copies_[g];
-            }
-
-            // Dimer structure factor s_q = Σ_{i ∈ bulk} n_i e^{i q·r_i}.
-            // Uses bulk_sites_ if non-empty (same convention as density),
-            // else all N sites.  Same snapshot timing as density/Z/C — i.e.,
-            // after applying op at slot p (asymmetric profile observable at
-            // δ_sched_[p+1] in the dimer "before-op" convention).
-            if (n_q > 0) {
-                for (int qi = 0; qi < n_q; ++qi) {
-                    double sx = 0.0, sy = 0.0;
-                    const double* cosq = &dimer_phase_cos_[(size_t)qi * N_];
-                    const double* sinq = &dimer_phase_sin_[(size_t)qi * N_];
-                    if (!bulk_sites_.empty()) {
-                        for (int i : bulk_sites_) {
-                            if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
-                        }
-                    } else {
-                        for (int i = 0; i < N_; ++i) {
-                            if (state[i]) { sx += cosq[i]; sy += sinq[i]; }
-                        }
-                    }
-                    double abs2 = sx * sx + sy * sy;
-                    double abs1 = std::sqrt(abs2);
-                    prof.s_q_real[qi][out_idx] = sx;
-                    prof.s_q_imag[qi][out_idx] = sy;
-                    prof.s_q_abs1[qi][out_idx] = abs1;
-                    prof.s_q_abs2[qi][out_idx] = abs2;
-                    prof.s_q_abs3[qi][out_idx] = abs2 * abs1;
-                    prof.s_q_abs4[qi][out_idx] = abs2 * abs2;
-                }
-            }
-
-            // Snapshot the full state at requested profile points (all N sites,
-            // same "after op p" convention as density/SF above).
-            if (next_snap < snapshot_point_indices_.size()
-                && snapshot_point_indices_[next_snap] == out_idx) {
-                std::vector<int8_t>& snap = prof.snapshots[next_snap];
-                for (int i = 0; i < N_; ++i) snap[i] = (int8_t)state[i];
-                ++next_snap;
-            }
-
-            // Occupation-SF: at requested points, compute the sublattice-resolved
-            // Fourier vectors s_{q,α} = Σ_{i:α(i)=α} n_i e^{i q·R_cell(i)} for the
-            // full lattice and the bulk-complete-cell subset; also stash state.
-            if (next_occ < occ_sf_point_indices_.size()
-                && occ_sf_point_indices_[next_occ] == out_idx) {
-                std::vector<double>& sfr = prof.occ_s_full_re[next_occ];
-                std::vector<double>& sfi = prof.occ_s_full_im[next_occ];
-                std::vector<double>& sbr = prof.occ_s_bulk_re[next_occ];
-                std::vector<double>& sbi = prof.occ_s_bulk_im[next_occ];
-                for (int qi = 0; qi < n_occ_q; ++qi) {
-                    const double* cosq = &occ_phase_cos_[(size_t)qi * N_];
-                    const double* sinq = &occ_phase_sin_[(size_t)qi * N_];
-                    const size_t base = (size_t)qi * n_basis;
-                    for (int i = 0; i < N_; ++i) {
-                        if (!state[i]) continue;
-                        int a = occ_site_basis_[i];
-                        double c = cosq[i], s = sinq[i];
-                        sfr[base + a] += c; sfi[base + a] += s;
-                        if (occ_site_in_bulk_[i]) { sbr[base + a] += c; sbi[base + a] += s; }
-                    }
-                }
-                // Second unit cell (triangle-pair): s_{q,α} over triangle cells.
-                if (occ2_active_) {
-                    std::vector<double>& s2r = prof.occ2_s_re[next_occ];
-                    std::vector<double>& s2i = prof.occ2_s_im[next_occ];
-                    for (int qi = 0; qi < n_occ_q; ++qi) {
-                        const double* cosq = &occ2_phase_cos_[(size_t)qi * N_];
-                        const double* sinq = &occ2_phase_sin_[(size_t)qi * N_];
-                        const size_t base = (size_t)qi * n_basis;
-                        for (int i = 0; i < N_; ++i) {
-                            if (!state[i]) continue;
-                            int a = occ2_site_basis_[i];
-                            if (a < 0) continue;
-                            s2r[base + a] += cosq[i];
-                            s2i[base + a] += sinq[i];
-                        }
-                    }
-                }
-                std::vector<int8_t>& st = prof.occ_state[next_occ];
-                for (int i = 0; i < N_; ++i) st[i] = (int8_t)state[i];
-                ++next_occ;
-            }
-
-            // VBS/SS order parameters (diagonal, at every profile point).
-            if (vbs_n_tri_ > 0) {
-                auto tri_state = [&](int t) -> int {
-                    const int* cc = &vbs_tri_corners_[3 * t];
-                    return 4 * state[cc[0]] + 2 * state[cc[1]] + state[cc[2]];
-                };
-                int s00 = tri_state(vbs_ref00_);
-                int s10 = tri_state(vbs_ref10_);
-                double g = (s10 == s00) ? 1.0 : -1.0;
-                double mv = 0.0, ms = 0.0;
-                for (int t = 0; t < vbs_n_tri_; ++t) {
-                    int s = tri_state(t);
-                    double u = (vbs_n1_parity_[t] == 0)
-                                   ? ((s == s00) ? 1.0 : -1.0)
-                                   : (((s == s10) ? 1.0 : -1.0) * g);
-                    mv += vbs_sign_[t] * u;
-                    ms += ss_sign_[t]  * u;
-                }
-                double inv = 1.0 / (double)vbs_n_tri_;
-                prof.M_vbs[out_idx] = mv * inv;
-                prof.M_ss[out_idx]  = ms * inv;
-            }
-
+            profile_measure_point(state, out_idx, prof, next_snap, next_occ);
             ++out_idx;
         }
     }
@@ -943,8 +966,26 @@ QAQMCEngine::DimerSFSample QAQMCEngine::measure_dimer_sf() const {
 }
 
 // ─── Diagonal Update ─────────────────────────────────────────────────────────
+//
+// diagonal_update_profiled fuses three formerly-separate O(M) passes into the
+// one forward sweep it already does:
+//   1. the diagonal op re-insertion itself,
+//   2. the per-site op/bond counting that build_vertex_lists' first pass used
+//      to redo (counts are valid because each slot's op is final once this
+//      sweep passes it, and cluster_update's 1 <-> -1 toggles are
+//      count-neutral),
+//   3. (optional, prof != nullptr) the asymmetric-profile measurement that
+//      run_profile used to obtain via a separate measure_profile() sweep.
+//      The diagonal update never changes off-diagonal ops, so the state
+//      trajectory here is IDENTICAL to the one measure_profile would walk
+//      after the previous cluster_update: capturing during this sweep yields
+//      exactly the sample of the previous completed MC step.
 
 void QAQMCEngine::diagonal_update() {
+    diagonal_update_profiled(nullptr, 0);
+}
+
+void QAQMCEngine::diagonal_update_profiled(ProfileObservables* prof, int profile_step) {
     std::vector<int32_t> state(N_, 0); // boundary |0...0>
     const int* bond_sites = vij_.bond_sites_flat.data();
 
@@ -952,6 +993,27 @@ void QAQMCEngine::diagonal_update() {
     // real per-slice delta for rejection against the group envelope.
     int max_alias = grp_alias_.max_alias;
     int n_bonds_pad = grp_alias_.n_bonds_pad;
+
+    // Incremental group tracker: reproduces g = floor(p*G/M_total) exactly
+    // (g increments when p reaches ceil((g+1)*M_total/G)) without the
+    // 4-byte-per-slice slice_to_group array.
+    const int G = grp_alias_.n_groups;
+    int g = 0;
+    int64_t g_next = ((int64_t)M_total_ + G - 1) / G;
+
+    // Fused vertex-list counting (build_vertex_lists' former first pass).
+    std::fill(site_op_count_.begin(), site_op_count_.end(), 0);
+    std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
+
+    // Fused profile capture bookkeeping.
+    int out_idx = 0;
+    int n_points = 0;
+    size_t next_snap = 0, next_occ = 0;
+    if (prof != nullptr) {
+        if (profile_step <= 0) profile_step = 1;
+        n_points = M_total_ / profile_step;
+        profile_alloc(*prof, n_points);
+    }
 
     for (int p = 0; p < M_total_; ++p) {
         // Capture state at symmetry point
@@ -962,29 +1024,37 @@ void QAQMCEngine::diagonal_update() {
         // for the seam capture/XOR convention.
         off_diag_.on_diagonal_slice(p, state);
 
+        while (p >= g_next) {
+            ++g;
+            g_next = ((int64_t)(g + 1) * M_total_ + G - 1) / G;
+        }
+
         int ot = op_types_[p];
         if (ot == -1) {
-            state[op_sites_[p]] ^= 1;
+            int s = op_sites_[p];
+            state[s] ^= 1;
+            site_op_count_[s]++;
         } else if (ot == 1 || ot == 2) {
-            int g = grp_alias_.slice_to_group[p];
             int n_alias_g = grp_alias_.n_alias_all[g];
+            const AliasEntry* tab = &grp_alias_.entries[(size_t)g * max_alias];
+            const double* rmax_g = &grp_alias_.bond_W_rmax_all[(size_t)g * n_bonds_pad];
+            // delta depends only on the slice: hoist out of the rejection loop.
+            // Sequential array read — cheaper than recomputing per attempt.
+            const double delta = delta_sched_[p];
 
             bool inserted = false;
             while (!inserted) {
                 int i = randint(rng_, n_alias_g);
-                int idx;
-                if (uniform01(rng_) < grp_alias_.alias_prob_all[g * max_alias + i])
-                    idx = i;
-                else
-                    idx = (int)grp_alias_.alias_idx_all[g * max_alias + i];
+                const AliasEntry& e = tab[i];
+                int idx = (uniform01(rng_) < e.prob) ? i : (int)e.alias;
+                int lk = tab[idx].loc_kind;
+                int loc = lk >> 1;
 
-                int kind = grp_alias_.op_map_kind_all[g * max_alias + idx];
-                int loc  = grp_alias_.op_map_loc_all[g * max_alias + idx];
-
-                if (kind == 0) {
+                if ((lk & 1) == 0) {
                     // Site op: always accept
                     op_types_[p] = 1;
                     op_sites_[p] = loc;
+                    site_op_count_[loc]++;
                     inserted = true;
                 } else {
                     // Bond op: rejection with real per-slice weights
@@ -994,44 +1064,59 @@ void QAQMCEngine::diagonal_update() {
                     int w_idx = state[si] * 2 + state[sj];
 
                     // Compute actual weight for this slice's delta
-                    double delta = delta_sched_[p];
-                    double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
-                    double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
+                    double di = delta * vij_.inv_coord[si];
+                    double dj = delta * vij_.inv_coord[sj];
                     double W[4], wmax_actual;
                     compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax_actual);
 
-                    // Reject against group envelope W_max
-                    double w_max_env = grp_alias_.bond_W_max_all[g * n_bonds_pad + b];
-                    if (w_max_env > 0.0 && uniform01(rng_) < W[w_idx] / w_max_env) {
+                    // Reject against group envelope W_max (precomputed reciprocal;
+                    // rmax == 0 when the envelope is <= 0, making the test false).
+                    if (uniform01(rng_) < W[w_idx] * rmax_g[b]) {
                         op_types_[p] = 2;
                         op_sites_[p] = b;
+                        site_bond_count_[si]++;
+                        site_bond_count_[sj]++;
                         inserted = true;
                     }
                 }
             }
         }
+
+        // Fused profile measurement: same "after applying op at slot p"
+        // convention as measure_profile().
+        if (prof != nullptr && out_idx < n_points && (p + 1) % profile_step == 0) {
+            profile_measure_point(state, out_idx, *prof, next_snap, next_occ);
+            ++out_idx;
+        }
     }
+    vertex_counts_valid_ = true;
 }
 
-// ─── build_vertex_lists  —  O(M + N) two-pass counting sort ─────────────────
+// ─── build_vertex_lists  —  O(M + N) counting sort ──────────────────────────
+//
+// The counting pass is normally fused into diagonal_update_profiled (the op
+// at each slot is final once the diagonal sweep passes it, and the cluster
+// update's 1 <-> -1 toggles are count-neutral), so this only re-counts when
+// the operator string was replaced externally (set_op_string).  The fill
+// pass here is additionally fused with the former cluster Phase B: it
+// propagates spin_now_ and records bond_spin_[p] in the same sweep.
 
 void QAQMCEngine::build_vertex_lists() {
     const int M = M_total_, N = N_;
     const int* bond_sites = vij_.bond_sites_flat.data();
 
-    std::fill(site_op_count_.begin(), site_op_count_.end(), 0);
-    std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
-
-    for (int p = 0; p < M; ++p) {
-        int ot = op_types_[p];
-        if (ot == 1 || ot == -1) {
-            site_op_count_[op_sites_[p]]++;
-        } else if (ot == 2) {
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            int sj = bond_sites[b * 2 + 1];
-            site_bond_count_[si]++;
-            site_bond_count_[sj]++;
+    if (!vertex_counts_valid_) {
+        std::fill(site_op_count_.begin(), site_op_count_.end(), 0);
+        std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
+        for (int p = 0; p < M; ++p) {
+            int ot = op_types_[p];
+            if (ot == 1 || ot == -1) {
+                site_op_count_[op_sites_[p]]++;
+            } else if (ot == 2) {
+                int b  = op_sites_[p];
+                site_bond_count_[bond_sites[b * 2 + 0]]++;
+                site_bond_count_[bond_sites[b * 2 + 1]]++;
+            }
         }
     }
 
@@ -1050,17 +1135,26 @@ void QAQMCEngine::build_vertex_lists() {
     std::vector<int32_t> cur_op(N, 0);
     std::vector<int32_t> cur_bond(N, 0);
 
+    // Fill pass + former Phase B (bond_spin_ from |0...0> propagation).
+    std::fill(spin_now_.begin(), spin_now_.end(), 0);
+
     for (int p = 0; p < M; ++p) {
+        // Off-diagonal string seam: same convention as diagonal_update(), so
+        // bond_spin_[p] for p >= m_star_ reflects the post-seam occupation.
+        off_diag_.on_cluster_slice(p, spin_now_);
+
         int ot = op_types_[p];
         if (ot == 1 || ot == -1) {
             int s = op_sites_[p];
             site_op_list_[site_op_head_[s] + cur_op[s]++] = p;
+            if (ot == -1) spin_now_[s] ^= 1;
         } else if (ot == 2) {
             int b  = op_sites_[p];
             int si = bond_sites[b * 2 + 0];
             int sj = bond_sites[b * 2 + 1];
-            site_bond_list_[site_bond_head_[si] + cur_bond[si]++] = p;
-            site_bond_list_[site_bond_head_[sj] + cur_bond[sj]++] = p;
+            bond_spin_[p] = spin_now_[si] * 2 + spin_now_[sj];
+            site_bond_list_[site_bond_head_[si] + cur_bond[si]++] = pack_bond_entry(p, b, 0);
+            site_bond_list_[site_bond_head_[sj] + cur_bond[sj]++] = pack_bond_entry(p, b, 1);
         }
     }
 }
@@ -1082,77 +1176,75 @@ void QAQMCEngine::cluster_update() {
     const int* bond_sites = vij_.bond_sites_flat.data();
     const int  M = M_total_, N = N_;
 
-    // ── Phase A ──────────────────────────────────────────────────────────────
+    // ── Phase A (+ fused former Phase B: bond_spin_ fill) ───────────────────
     build_vertex_lists();
-
-    // ── Phase B: compute bond_spin_[p] ───────────────────────────────────────
-    //   Propagate from |0...0> boundary at tau=0
-    std::fill(spin_now_.begin(), spin_now_.end(), 0);  // |0...0>
-    for (int p = 0; p < M; ++p) {
-        // Off-diagonal string seam: same convention as diagonal_update(), so
-        // bond_spin_[p] for p >= m_star_ reflects the post-seam occupation.
-        off_diag_.on_cluster_slice(p, spin_now_);
-
-        int ot = op_types_[p];
-        if (ot == 2) {
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            int sj = bond_sites[b * 2 + 1];
-            bond_spin_[p] = spin_now_[si] * 2 + spin_now_[sj];
-        } else if (ot == -1) {
-            spin_now_[op_sites_[p]] ^= 1;
-        }
-    }
 
     // ── Phase C: per-site segment processing ─────────────────────────────────
 
-    // Helper: compute log(W_new/W_old) for bond ops in [j_begin, j_end)
-    auto lr_for_range = [&](int site_i, int bop_base, int j_begin, int j_end) -> double {
-        double lr = 0.0;
+    // Metropolis accept test for flipping the segment: accumulates the plain
+    // product of weight ratios Π w_new/w_old (no std::log in the hot loop —
+    // exactly the same accept probability as the previous log-sum form).
+    // Zero weights are tallied separately so "excluded → allowed" (inf) and
+    // "allowed → excluded" (0) factors can't produce inf*0 = NaN; the running
+    // product is renormalised by 1e±100 so long segments can't over/underflow.
+    auto accept_for_range = [&](int bop_base, int j_begin, int j_end) -> bool {
+        double ratio = 1.0;
+        int shift = 0;      // ratio_total = ratio * 1e100^shift
+        int inf_ct = 0;     // factors with w_old == 0 < w_new  (force-accept)
+        int zero_ct = 0;    // factors with w_new == 0 < w_old  (force-reject)
         for (int j = j_begin; j < j_end; ++j) {
-            int p  = site_bond_list_[bop_base + j];
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            int sj = bond_sites[b * 2 + 1];
-            int w_idx = bond_spin_[p];
-            int ni = w_idx >> 1, nj = w_idx & 1;
+            const int64_t e = site_bond_list_[bop_base + j];
+            const int p  = bond_entry_p(e);
+            const int b  = bond_entry_b(e);
+            const int ep = bond_entry_endpoint(e);
+            const int si = bond_sites[b * 2 + 0];
+            const int sj = bond_sites[b * 2 + 1];
+            const int w_idx = bond_spin_[p];
+            const int new_idx = w_idx ^ (ep == 0 ? 2 : 1);
 
-            double w_old, w_new;
-            {
-                double delta = delta_sched_[p];
-                double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
-                double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
-                double W[4], wmax;
-                compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
-                w_old = W[w_idx];
-                if (si == site_i)
-                    w_new = W[(1 - ni) * 2 + nj];
-                else
-                    w_new = W[ni * 2 + (1 - nj)];
+            double delta = delta_at(p);
+            double di = delta * vij_.inv_coord[si];
+            double dj = delta * vij_.inv_coord[sj];
+            double W[4], wmax;
+            compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
+            const double w_old = W[w_idx];
+            const double w_new = W[new_idx];
+
+            if (w_new > 1e-300) {
+                if (w_old > 1e-300) {
+                    ratio *= w_new / w_old;
+                    if (ratio > 1e100)       { ratio *= 1e-100; ++shift; }
+                    else if (ratio < 1e-100) { ratio *= 1e100;  --shift; }
+                } else {
+                    ++inf_ct;
+                }
+            } else if (w_old > 1e-300) {
+                ++zero_ct;
             }
-
-            lr += ((w_new > 1e-300) ? std::log(w_new) : -1e30)
-                - ((w_old > 1e-300) ? std::log(w_old) : -1e30);
+            // w_new == w_old == 0: neutral factor (matches the old
+            // (-1e30) - (-1e30) = 0 convention).
         }
-        return lr;
+        if (inf_ct != zero_ct) return inf_ct > zero_ct;
+        if (shift >= 1) return true;
+        if (shift <= -2) return false;
+        const double r = (shift == -1) ? ratio * 1e-100 : ratio;
+        return (r >= 1.0) || (uniform01(rng_) < r);
     };
 
-    // Helper: flip site_i bit in bond_spin_[p] for range [j_begin, j_end)
-    auto flip_bond_range = [&](int site_i, int bop_base, int j_begin, int j_end) {
+    // Helper: flip site_i's bit in bond_spin_[p] for range [j_begin, j_end)
+    auto flip_bond_range = [&](int bop_base, int j_begin, int j_end) {
         for (int j = j_begin; j < j_end; ++j) {
-            int p  = site_bond_list_[bop_base + j];
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            if (si == site_i)
-                bond_spin_[p] ^= 2;
-            else
-                bond_spin_[p] ^= 1;
+            const int64_t e = site_bond_list_[bop_base + j];
+            bond_spin_[bond_entry_p(e)] ^= (bond_entry_endpoint(e) == 0 ? 2 : 1);
         }
     };
 
     auto upper_bound_idx = [&](int bop_base, int n_bops, int val) -> int {
-        const int32_t* base = site_bond_list_.data() + bop_base;
-        return (int)(std::upper_bound(base, base + n_bops, val) - base);
+        const int64_t* base = site_bond_list_.data() + bop_base;
+        // Entries are packed [p:32][b:31][endpoint:1] in ascending p order;
+        // the key below is the largest packed value with entry_p == val.
+        const int64_t key = (static_cast<int64_t>(val) << 32) | 0xFFFFFFFFll;
+        return (int)(std::upper_bound(base, base + n_bops, key) - base);
     };
 
     for (int site_i = 0; site_i < N; ++site_i) {
@@ -1179,11 +1271,8 @@ void QAQMCEngine::cluster_update() {
             int j0 = upper_bound_idx(bop_base, n_bops, p_start);
             int j1 = upper_bound_idx(bop_base, n_bops, p_end);
 
-            double lr = lr_for_range(site_i, bop_base, j0, j1);
-            bool do_flip = (lr >= 0.0) || (uniform01(rng_) < std::exp(lr));
-
-            if (do_flip) {
-                flip_bond_range(site_i, bop_base, j0, j1);
+            if (accept_for_range(bop_base, j0, j1)) {
+                flip_bond_range(bop_base, j0, j1);
                 seg_flipped_[seg] = 1;
             }
         }
@@ -1217,4 +1306,26 @@ void QAQMCEngine::mc_step() {
     time_diag_ += std::chrono::duration<double>(t1 - t0).count();
     time_clus_ += std::chrono::duration<double>(t2 - t1).count();
     mc_steps_++;
+}
+
+QAQMCEngine::ProfileObservables QAQMCEngine::mc_step_profiled(int profile_step) {
+    // Fused mc_step + profile measurement.  The capture rides the diagonal
+    // sweep, and since diagonal_update never touches off-diagonal ops, the
+    // measured trajectory is exactly the configuration left by the PREVIOUS
+    // completed mc_step — i.e. this returns the sample that
+    //   mc_step(); measure_profile(profile_step);
+    // of the previous iteration would have produced, at the cost of zero
+    // extra O(M) passes.  (One-step lag; statistically identical for
+    // equilibrium sampling.)
+    ProfileObservables prof;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    diagonal_update_profiled(&prof, profile_step);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    cluster_update();
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    time_diag_ += std::chrono::duration<double>(t1 - t0).count();
+    time_clus_ += std::chrono::duration<double>(t2 - t1).count();
+    mc_steps_++;
+    return prof;
 }

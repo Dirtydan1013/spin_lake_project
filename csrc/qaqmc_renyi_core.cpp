@@ -10,14 +10,14 @@
 
 namespace {
 
+// Same fast RNG helpers as qaqmc_core.hpp (uniform01/randint): branch-free
+// top-53-bit u01 and Lemire's unbiased bounded integer (no per-call division).
 inline double renyi_u01(std::mt19937_64& rng) {
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    return dist(rng);
+    return uniform01(rng);
 }
 
 inline int renyi_randi(std::mt19937_64& rng, int n) {
-    std::uniform_int_distribution<int> dist(0, n - 1);
-    return dist(rng);
+    return randint(rng, n);
 }
 
 }  // namespace
@@ -95,7 +95,7 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
     ch_site_bond_count_.assign(ch_sites, 0);
     ch_site_bond_head_.assign(ch_sites, 0);
     bond_spin_by_replica_.assign(static_cast<size_t>(2) * M_total_, 0);
-    log_W_by_op_.assign(static_cast<size_t>(2) * M_total_ * 4, 0.0);
+    W_by_op_.assign(static_cast<size_t>(2) * M_total_ * 4, 0.0);
 }
 
 void QAQMCRenyiEngine::compute_site_coloring() {
@@ -144,25 +144,17 @@ void QAQMCRenyiEngine::build_grouped_alias_tables() {
     const int max_alias = N_ + n_bonds;
     const int* bond_si = vij_.bonds_i.data();
     const int* bond_sj = vij_.bonds_j.data();
-    const int* coord_num = vij_.coord_number.data();
+    const double* inv_coord = vij_.inv_coord.data();
 
     grp_alias_.n_groups = G;
     grp_alias_.max_alias = max_alias;
     grp_alias_.n_bonds_pad = n_bonds_pad;
-    grp_alias_.slice_to_group.resize(M_total_);
-
-    for (int p = 0; p < M_total_; ++p) {
-        int g = static_cast<int>((static_cast<int64_t>(p) * G) / M_total_);
-        if (g >= G) g = G - 1;
-        grp_alias_.slice_to_group[p] = g;
-    }
+    // (slice -> group is computed incrementally in diagonal_update.)
 
     grp_alias_.bond_W_max_all.assign(G * n_bonds_pad, 0.0);
+    grp_alias_.bond_W_rmax_all.assign(G * n_bonds_pad, 0.0);
     grp_alias_.n_alias_all.assign(G, 0);
-    grp_alias_.alias_prob_all.assign(G * max_alias, 0.0);
-    grp_alias_.alias_idx_all.assign(G * max_alias, 0);
-    grp_alias_.op_map_kind_all.assign(G * max_alias, 0);
-    grp_alias_.op_map_loc_all.assign(G * max_alias, 0);
+    grp_alias_.entries.assign((size_t)G * max_alias, AliasEntry{0.0, 0, 0});
 
 #ifdef QAQMC_USE_OPENMP
     #pragma omp parallel for schedule(static)
@@ -178,8 +170,8 @@ void QAQMCRenyiEngine::build_grouped_alias_tables() {
             for (int b = 0; b < n_bonds; ++b) {
                 const int si = bond_si[b];
                 const int sj = bond_sj[b];
-                const double di = (coord_num[si] > 0) ? delta / coord_num[si] : 0.0;
-                const double dj = (coord_num[sj] > 0) ? delta / coord_num[sj] : 0.0;
+                const double di = delta * inv_coord[si];
+                const double dj = delta * inv_coord[sj];
                 double W[4], wmax;
                 compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
                 if (wmax > env_W_max[b]) env_W_max[b] = wmax;
@@ -188,6 +180,8 @@ void QAQMCRenyiEngine::build_grouped_alias_tables() {
 
         for (int b = 0; b < n_bonds; ++b) {
             grp_alias_.bond_W_max_all[g * n_bonds_pad + b] = env_W_max[b];
+            grp_alias_.bond_W_rmax_all[g * n_bonds_pad + b] =
+                (env_W_max[b] > 0.0) ? 1.0 / env_W_max[b] : 0.0;
         }
 
         std::vector<double> weights(max_alias);
@@ -209,10 +203,6 @@ void QAQMCRenyiEngine::build_grouped_alias_tables() {
         }
 
         grp_alias_.n_alias_all[g] = n_a;
-        for (int i = 0; i < n_a; ++i) {
-            grp_alias_.op_map_kind_all[g * max_alias + i] = op_kind[i];
-            grp_alias_.op_map_loc_all[g * max_alias + i] = op_loc[i];
-        }
 
         double total = 0.0;
         for (int i = 0; i < n_a; ++i) total += weights[i];
@@ -238,9 +228,11 @@ void QAQMCRenyiEngine::build_grouped_alias_tables() {
             else large_buf.push_back(l);
         }
 
+        AliasEntry* tab = &grp_alias_.entries[(size_t)g * max_alias];
         for (int i = 0; i < n_a; ++i) {
-            grp_alias_.alias_prob_all[g * max_alias + i] = prob_arr[i];
-            grp_alias_.alias_idx_all[g * max_alias + i] = alias_arr[i];
+            tab[i].prob = prob_arr[i];
+            tab[i].alias = static_cast<int32_t>(alias_arr[i]);
+            tab[i].loc_kind = (op_loc[i] << 1) | op_kind[i];
         }
     }
 }
@@ -620,7 +612,12 @@ double QAQMCRenyiEngine::log_weight_for_site_with_paths(
     }
 
     const int* bond_sites = vij_.bond_sites_flat.data();
-    double log_weight = 0.0;
+    // Accumulate the plain product Π w (renormalised by 1e±100) and take a
+    // single std::log at the end — one log per call instead of one per
+    // touching bond op.
+    double prod = 1.0;
+    int shift = 0;  // total = prod * 1e100^shift
+    static const double LOG_1E100 = std::log(1e100);
     for (int replica = 0; replica < 2; ++replica) {
         for (int p = 0; p < M_total_; ++p) {
             if (replicas_[replica].op_types[p] != 2) continue;
@@ -637,10 +634,12 @@ double QAQMCRenyiEngine::log_weight_for_site_with_paths(
             if (w <= 1e-300) {
                 return -1e30;
             }
-            log_weight += std::log(w);
+            prod *= w;
+            if (prod > 1e100)       { prod *= 1e-100; ++shift; }
+            else if (prod < 1e-100) { prod *= 1e100;  --shift; }
         }
     }
-    return log_weight;
+    return std::log(prod) + shift * LOG_1E100;
 }
 
 void QAQMCRenyiEngine::reproject_site_ops_for_mask_with_paths(
@@ -686,8 +685,8 @@ double QAQMCRenyiEngine::actual_bond_weight(int p, int b, int w_idx) const {
     const int si = bond_sites[b * 2 + 0];
     const int sj = bond_sites[b * 2 + 1];
     const double delta = delta_sched_[p];
-    const double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
-    const double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
+    const double di = delta * vij_.inv_coord[si];
+    const double dj = delta * vij_.inv_coord[sj];
     double W[4], wmax;
     compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
     return W[w_idx];
@@ -884,7 +883,17 @@ void QAQMCRenyiEngine::diagonal_update() {
         return channel * N_ + site;
     };
 
+    // Incremental group tracker: reproduces g = floor(p*G/M_total) exactly
+    // without a per-slice map (only meaningful when delta_groups_ > 0).
+    const int G = (delta_groups_ > 0) ? grp_alias_.n_groups : 1;
+    int cur_g = 0;
+    int64_t g_next = ((int64_t)M_total_ + G - 1) / G;
+
     for (int p = 0; p < M_total_; ++p) {
+        while (p >= g_next) {
+            ++cur_g;
+            g_next = ((int64_t)(cur_g + 1) * M_total_ + G - 1) / G;
+        }
         std::array<int32_t, 2> next_types = {
             replicas_[0].op_types[p],
             replicas_[1].op_types[p],
@@ -910,14 +919,15 @@ void QAQMCRenyiEngine::diagonal_update() {
                 int loc = 0;
                 int group = -1;
                 if (delta_groups_ > 0) {
-                    group = grp_alias_.slice_to_group[p];
+                    group = cur_g;
                     int n_alias_g = grp_alias_.n_alias_all[group];
+                    const AliasEntry* tab = &grp_alias_.entries[(size_t)group * max_alias_];
                     int i = renyi_randi(rng, n_alias_g);
-                    int idx = (renyi_u01(rng) < grp_alias_.alias_prob_all[group * max_alias_ + i])
-                        ? i
-                        : static_cast<int>(grp_alias_.alias_idx_all[group * max_alias_ + i]);
-                    kind = grp_alias_.op_map_kind_all[group * max_alias_ + idx];
-                    loc = grp_alias_.op_map_loc_all[group * max_alias_ + idx];
+                    const AliasEntry& e = tab[i];
+                    int idx = (renyi_u01(rng) < e.prob) ? i : (int)e.alias;
+                    int lk = tab[idx].loc_kind;
+                    kind = lk & 1;
+                    loc = lk >> 1;
                 } else {
                     int n_alias_p = alias_.n_alias_all[p];
                     int i = renyi_randi(rng, n_alias_p);
@@ -942,10 +952,12 @@ void QAQMCRenyiEngine::diagonal_update() {
                     int c_j = channel_for_actual(replica, sj, p);
                     int w_idx = channel_state[ch_idx(c_i, si)] * 2 + channel_state[ch_idx(c_j, sj)];
                     double w_actual = actual_bond_weight(p, b, w_idx);
-                    double w_max = (delta_groups_ > 0)
-                        ? grp_alias_.bond_W_max_all[group * n_bonds_pad_ + b]
-                        : alias_.bond_W_max_all[p * n_bonds_pad_ + b];
-                    if (w_max > 0.0 && renyi_u01(rng) < w_actual / w_max) {
+                    // Precomputed reciprocal envelope (0 when W_max <= 0, making
+                    // the acceptance test false) — no division in the hot loop.
+                    double rmax = (delta_groups_ > 0)
+                        ? grp_alias_.bond_W_rmax_all[group * n_bonds_pad_ + b]
+                        : alias_.bond_W_rmax_all[p * n_bonds_pad_ + b];
+                    if (renyi_u01(rng) < w_actual * rmax) {
                         diag_bond_accepts_++;
                         next_types[replica] = 2;
                         next_sites[replica] = b;
@@ -1016,6 +1028,10 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
 
     std::vector<int32_t> op_cursor(ch_sites, 0);
     std::vector<int32_t> bond_cursor(ch_sites, 0);
+    // Fused with the former build_bond_spins_from_ops pass 1: walk
+    // channel_state alongside the fill so bond_spin_by_replica_ is produced
+    // in the same sweep (only type-2 slots are ever read back).
+    std::vector<int32_t> channel_state(ch_sites, 0);
     for (int p = 0; p < M_total_; ++p) {
         for (int replica = 0; replica < 2; ++replica) {
             int ot = replicas_[replica].op_types[p];
@@ -1025,6 +1041,7 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
                 int idx = cs_idx(channel, site);
                 ch_site_op_list_[ch_site_op_head_[idx] + op_cursor[idx]++] =
                     pack_site_event(static_cast<int32_t>(p), static_cast<int8_t>(replica));
+                if (ot == -1) channel_state[idx] ^= 1;
             } else if (ot == 2) {
                 int b = replicas_[replica].op_sites[p];
                 int si = bond_sites[b * 2 + 0];
@@ -1033,6 +1050,8 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
                 int c_j = channel_for_actual(replica, sj, p);
                 int idx_i = cs_idx(c_i, si);
                 int idx_j = cs_idx(c_j, sj);
+                bond_spin_by_replica_[replica * M_total_ + p] = static_cast<int8_t>(
+                    channel_state[idx_i] * 2 + channel_state[idx_j]);
                 ch_site_bond_list_[ch_site_bond_head_[idx_i] + bond_cursor[idx_i]++] =
                     pack_bond_event(static_cast<int32_t>(p), static_cast<int8_t>(replica), 0);
                 ch_site_bond_list_[ch_site_bond_head_[idx_j] + bond_cursor[idx_j]++] =
@@ -1043,50 +1062,28 @@ void QAQMCRenyiEngine::build_channel_vertex_lists() {
 }
 
 void QAQMCRenyiEngine::build_bond_spins_from_ops() {
+    // bond_spin_by_replica_ itself is now filled inside
+    // build_channel_vertex_lists (fused with the event-list fill pass);
+    // this function only materialises the raw-W cache.
     if (static_cast<int>(bond_spin_by_replica_.size()) != 2 * M_total_) {
         bond_spin_by_replica_.assign(static_cast<size_t>(2) * M_total_, 0);
-    } else {
-        std::fill(bond_spin_by_replica_.begin(), bond_spin_by_replica_.end(), 0);
     }
-    const size_t need_log_W = static_cast<size_t>(2) * M_total_ * 4;
-    if (log_W_by_op_.size() != need_log_W) {
-        log_W_by_op_.assign(need_log_W, 0.0);
+    const size_t need_W = static_cast<size_t>(2) * M_total_ * 4;
+    if (W_by_op_.size() != need_W) {
+        W_by_op_.assign(need_W, 0.0);
     }
-    auto ch_idx = [&](int channel, int site) { return channel * N_ + site; };
     const int* bond_sites = vij_.bond_sites_flat.data();
     // Choose between precomputed alias_.bond_W_all (delta_groups==0 path) and
     // on-the-fly compute_bond_W_inline (delta_groups>0 or no precompute).
-    // Either way we materialise log_W[4] for every bond op so the segment
-    // Metropolis is pure memory loads.
+    // Either way we materialise W[4] for every bond op so the segment
+    // Metropolis is pure memory loads (raw weights — the sweep accumulates
+    // the plain ratio product, so no std::log is needed anywhere here).
     const bool have_alias_W = (delta_groups_ <= 0 && !alias_.bond_W_all.empty());
 
-    // Pass 1 (sequential, cheap): walk channel_state to compute bond_spin.
-    // The channel_state propagation is inherently sequential in p, but each
-    // iteration is just a couple of array updates (no log/W work).
-    std::vector<int32_t> channel_state(2 * N_, 0);
-    for (int p = 0; p < M_total_; ++p) {
-        for (int replica = 0; replica < 2; ++replica) {
-            int ot = replicas_[replica].op_types[p];
-            if (ot == 2) {
-                int b = replicas_[replica].op_sites[p];
-                int si = bond_sites[b * 2 + 0];
-                int sj = bond_sites[b * 2 + 1];
-                int c_i = channel_for_actual(replica, si, p);
-                int c_j = channel_for_actual(replica, sj, p);
-                bond_spin_by_replica_[replica * M_total_ + p] =
-                    channel_state[ch_idx(c_i, si)] * 2 + channel_state[ch_idx(c_j, sj)];
-            } else if (ot == -1) {
-                int site = replicas_[replica].op_sites[p];
-                int channel = channel_for_actual(replica, site, p);
-                channel_state[ch_idx(channel, site)] ^= 1;
-            }
-        }
-    }
-
-    // Pass 2 (OpenMP parallel, expensive): fill log_W cache.  Each (p, replica)
+    // OpenMP-parallel pass: fill the raw-W cache.  Each (p, replica)
     // type-2 entry is independent — no channel_state dependency, only
-    // delta_sched_[p], coord_number, vij_, and epsilon.  The std::log calls
-    // dominated cluster_build before parallelization (~700 ms at M_total≈4.5M).
+    // delta_sched_[p], inv_coord, vij_, and epsilon.  (The former log_W
+    // variant spent ~4 std::log per bond op here; raw W needs none.)
 #ifdef QAQMC_USE_OPENMP
     #pragma omp parallel for schedule(static)
 #endif
@@ -1094,22 +1091,18 @@ void QAQMCRenyiEngine::build_bond_spins_from_ops() {
         for (int replica = 0; replica < 2; ++replica) {
             if (replicas_[replica].op_types[p] != 2) continue;
             int b = replicas_[replica].op_sites[p];
-            double W[4];
+            double* wout = &W_by_op_[(replica * M_total_ + p) * 4];
             if (have_alias_W) {
                 const double* base = &alias_.bond_W_all[(p * n_bonds_pad_ + b) * 4];
-                W[0] = base[0]; W[1] = base[1]; W[2] = base[2]; W[3] = base[3];
+                wout[0] = base[0]; wout[1] = base[1]; wout[2] = base[2]; wout[3] = base[3];
             } else {
                 int si = bond_sites[b * 2 + 0];
                 int sj = bond_sites[b * 2 + 1];
                 const double delta = delta_sched_[p];
-                const double di = (vij_.coord_number[si] > 0) ? delta / vij_.coord_number[si] : 0.0;
-                const double dj = (vij_.coord_number[sj] > 0) ? delta / vij_.coord_number[sj] : 0.0;
+                const double di = delta * vij_.inv_coord[si];
+                const double dj = delta * vij_.inv_coord[sj];
                 double wmax;
-                compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, W, wmax);
-            }
-            double* lw = &log_W_by_op_[(replica * M_total_ + p) * 4];
-            for (int k = 0; k < 4; ++k) {
-                lw[k] = (W[k] > 1e-300) ? std::log(W[k]) : -1e30;
+                compute_bond_W_inline(di, dj, vij_.vij_list[b], epsilon_, wout, wmax);
             }
         }
     }
@@ -1161,7 +1154,16 @@ void QAQMCRenyiEngine::cluster_update() {
                 for (int seg = 1; seg < n_sops; ++seg) {
                     int p_start = site_event_p(ch_site_op_list_[op_base + seg - 1]);
                     int p_end = site_event_p(ch_site_op_list_[op_base + seg]);
-                    double log_ratio = 0.0;
+
+                    // Plain ratio product Π w_new/w_old (same accept probability
+                    // as the former log-sum, no std::log/exp in the hot loop).
+                    // Zero weights are tallied separately so 0-crossings can't
+                    // produce inf*0 = NaN; the product is renormalised by
+                    // 1e±100 so long segments can't over/underflow.
+                    double ratio = 1.0;
+                    int shift = 0;    // ratio_total = ratio * 1e100^shift
+                    int inf_ct = 0;   // w_old == 0 < w_new  (force-accept)
+                    int zero_ct = 0;  // w_new == 0 < w_old  (force-reject)
 
                     int j0 = upper_bound_bond(bond_base, bond_end, p_start);
                     int j1 = upper_bound_bond(bond_base, bond_end, p_end);
@@ -1173,11 +1175,33 @@ void QAQMCRenyiEngine::cluster_update() {
                         const int w_idx = bond_spin_by_replica_[replica * M_total_ + p];
                         const int new_w_idx = w_idx ^ (endpoint == 0 ? 2 : 1);
 
-                        const double* lw = &log_W_by_op_[(replica * M_total_ + p) * 4];
-                        log_ratio += lw[new_w_idx] - lw[w_idx];
+                        const double* w = &W_by_op_[(replica * M_total_ + p) * 4];
+                        const double w_old = w[w_idx];
+                        const double w_new = w[new_w_idx];
+                        if (w_new > 1e-300) {
+                            if (w_old > 1e-300) {
+                                ratio *= w_new / w_old;
+                                if (ratio > 1e100)       { ratio *= 1e-100; ++shift; }
+                                else if (ratio < 1e-100) { ratio *= 1e100;  --shift; }
+                            } else {
+                                ++inf_ct;
+                            }
+                        } else if (w_old > 1e-300) {
+                            ++zero_ct;
+                        }
                     }
 
-                    bool do_flip = (log_ratio >= 0.0) || (renyi_u01(rng) < std::exp(log_ratio));
+                    bool do_flip;
+                    if (inf_ct != zero_ct) {
+                        do_flip = inf_ct > zero_ct;
+                    } else if (shift >= 1) {
+                        do_flip = true;
+                    } else if (shift <= -2) {
+                        do_flip = false;
+                    } else {
+                        const double r = (shift == -1) ? ratio * 1e-100 : ratio;
+                        do_flip = (r >= 1.0) || (renyi_u01(rng) < r);
+                    }
                     if (!do_flip) continue;
 
                     for (int j = j0; j < j1; ++j) {

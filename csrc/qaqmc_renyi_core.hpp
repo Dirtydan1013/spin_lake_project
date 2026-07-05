@@ -85,6 +85,15 @@ public:
     const std::vector<int32_t>& get_state_at_M(int replica) const { return replicas_[replica].state_at_M; }
     const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
     const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
+
+    // delta at slice p, bit-identical to delta_sched_[p] (same expression as
+    // the ctor) — lets hot loops avoid touching the schedule array.
+    inline double delta_at(int p) const {
+        return (p < M_)
+            ? delta_min_ + (delta_max_ - delta_min_) * (static_cast<double>(p) / M_)
+            : delta_max_ - (delta_max_ - delta_min_) * (static_cast<double>(p - M_) / M_);
+    }
+
     const std::vector<uint8_t>& get_A_mask() const { return A_mask_; }
     const std::vector<uint8_t>& get_topology_mask(int topology) const { return A_masks_[topology]; }
     const std::array<int64_t, 2>& get_visit_counts() const { return visit_count_; }
@@ -183,15 +192,14 @@ private:
 
     struct GroupedAlias {
         int n_groups{0};
-        std::vector<int> slice_to_group;
+        // (slice -> group is computed incrementally in diagonal_update; no
+        //  per-slice map is stored.)
         int max_alias{0};
         int n_bonds_pad{1};
         std::vector<double> bond_W_max_all;
+        std::vector<double> bond_W_rmax_all;  // 1/W_max (0 if W_max <= 0)
         std::vector<int> n_alias_all;
-        std::vector<double> alias_prob_all;
-        std::vector<int64_t> alias_idx_all;
-        std::vector<int> op_map_kind_all;
-        std::vector<int> op_map_loc_all;
+        std::vector<AliasEntry> entries;      // [n_groups * max_alias] (AoS)
     };
     GroupedAlias grp_alias_;
 
@@ -250,12 +258,15 @@ private:
     std::vector<int32_t> ch_site_bond_count_;
     std::vector<int32_t> ch_site_bond_head_;
     std::vector<BondEvent> ch_site_bond_list_;
-    std::vector<int32_t> bond_spin_by_replica_;  // [2 * M_total_]
-    // Per-bond-op log_W cache, layout [(replica * M_total + p) * 4 + w_idx].
+    // Values 0..3 — int8 quarters the random-access footprint in the sweep.
+    std::vector<int8_t> bond_spin_by_replica_;   // [2 * M_total_]
+    // Per-bond-op raw-W cache, layout [(replica * M_total + p) * 4 + w_idx].
     // Populated by build_bond_spins_from_ops() at the start of each
-    // cluster_update so the inner segment-Metropolis loop avoids both
-    // compute_bond_W_inline() and std::log() in the hot path.
-    std::vector<double> log_W_by_op_;
+    // cluster_update so the inner segment-Metropolis loop avoids
+    // compute_bond_W_inline() in the hot path.  Raw weights (not logs):
+    // the segment Metropolis accumulates the plain ratio product, so no
+    // std::log is needed anywhere in the cluster path.
+    std::vector<double> W_by_op_;
     OffdiagPaths paths_scratch_from_;
     OffdiagPaths paths_scratch_to_;
     std::vector<OffdiagPaths> paths_scratch_targets_;

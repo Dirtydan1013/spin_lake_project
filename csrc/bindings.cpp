@@ -453,14 +453,26 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             };
 
             for (int i = 0; i < total_steps; ++i) {
-                self.mc_step();
                 int step = i + 1;
                 bool need_d = (step % me_density == 0);
                 bool need_z = (step % me_zl      == 0);
                 bool need_c = (step % me_cml     == 0);
+                const bool need_any = need_d || need_z || need_c;
 
-                if (need_d || need_z || need_c) {
-                    auto prof = self.measure_profile(profile_step);
+                // Fused step+measurement: mc_step_profiled captures the profile
+                // during its diagonal sweep (the diagonal update never touches
+                // off-diagonal ops, so the captured trajectory equals what
+                // measure_profile would return for the PREVIOUS completed step
+                // — a one-step lag with identical equilibrium statistics) and
+                // saves a full O(M) measurement sweep per sample.
+                QAQMCEngine::ProfileObservables prof;
+                if (need_any) {
+                    prof = self.mc_step_profiled(profile_step);
+                } else {
+                    self.mc_step();
+                }
+
+                if (need_any) {
                     // Collect full-state snapshots spread evenly across the run:
                     // the k-th snapshot is taken at step ≈ (k+1)/n_snap_collect of
                     // total_steps, so all are post-thermalization and mutually

@@ -80,26 +80,35 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
     // single-site op for `site` can occur before the terminal is reached).
     std::vector<int32_t> local_state = direction_right ? state_at_seam_plus_ : state_at_seam_minus_;
 
-    // Returns false iff the bond op's flipped weight is non-positive
-    // (invalid proposal -> caller must reject). touches=false means this
-    // bond does not involve `site` (no contribution, always "valid").
-    auto bond_ratio_touching_site = [&](int p, bool& touches, double& dlog) -> bool {
-        touches = false;
+    // The physical ratio Π w_new/w_old over touching bonds is accumulated as
+    // a plain product (renormalised by 1e±100 so long walks can't over/
+    // underflow); a single std::log at the terminal converts it back to the
+    // log_physical_ratio the callers expect.  This replaces two std::log
+    // calls per touching bond op with one division.
+    double ratio = 1.0;
+    int shift = 0;  // ratio_total = ratio * 1e100^shift
+    static const double LOG_1E100 = std::log(1e100);
+
+    // Returns false iff the bond op's old or flipped weight is non-positive
+    // (invalid proposal -> caller must reject).  Non-touching bonds
+    // contribute nothing and are always "valid".
+    auto bond_ratio_touching_site = [&](int p) -> bool {
         int b = eng.op_sites_[p];
         int si = bond_sites[b * 2 + 0];
         int sj = bond_sites[b * 2 + 1];
         if (si != site && sj != site) return true;
-        touches = true;
-        double delta = eng.delta_sched_[p];
-        double di = (eng.vij_.coord_number[si] > 0) ? delta / eng.vij_.coord_number[si] : 0.0;
-        double dj = (eng.vij_.coord_number[sj] > 0) ? delta / eng.vij_.coord_number[sj] : 0.0;
+        double delta = eng.delta_sched_[p];  // sequential walk → array read is cheapest
+        double di = delta * eng.vij_.inv_coord[si];
+        double dj = delta * eng.vij_.inv_coord[sj];
         double W[4], wmax;
         QAQMCEngine::compute_bond_W_inline(di, dj, eng.vij_.vij_list[b], eng.epsilon_, W, wmax);
         int ni = local_state[si], nj = local_state[sj];
         double w_old = W[ni * 2 + nj];
         double w_new = (si == site) ? W[(1 - ni) * 2 + nj] : W[ni * 2 + (1 - nj)];
         if (w_old <= 0.0 || w_new <= 0.0) return false;
-        dlog = std::log(w_new) - std::log(w_old);
+        ratio *= w_new / w_old;
+        if (ratio > 1e100)       { ratio *= 1e-100; ++shift; }
+        else if (ratio < 1e-100) { ratio *= 1e100;  --shift; }
         return true;
     };
 
@@ -109,12 +118,11 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
             if ((ot == 1 || ot == -1) && eng.op_sites_[p] == site) {
                 out.terminal_p = p;
                 out.valid = true;
+                out.log_physical_ratio = std::log(ratio) + shift * LOG_1E100;
                 return out;
             }
             if (ot == 2) {
-                bool touches; double dlog = 0.0;
-                if (!bond_ratio_touching_site(p, touches, dlog)) return out;
-                if (touches) out.log_physical_ratio += dlog;
+                if (!bond_ratio_touching_site(p)) return out;
             } else if (ot == -1) {
                 local_state[eng.op_sites_[p]] ^= 1;
             }
@@ -126,12 +134,11 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
             if ((ot == 1 || ot == -1) && eng.op_sites_[p] == site) {
                 out.terminal_p = p;
                 out.valid = true;
+                out.log_physical_ratio = std::log(ratio) + shift * LOG_1E100;
                 return out;
             }
             if (ot == 2) {
-                bool touches; double dlog = 0.0;
-                if (!bond_ratio_touching_site(p, touches, dlog)) return out;
-                if (touches) out.log_physical_ratio += dlog;
+                if (!bond_ratio_touching_site(p)) return out;
             } else if (ot == -1) {
                 local_state[eng.op_sites_[p]] ^= 1;
             }

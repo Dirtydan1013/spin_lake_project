@@ -15,13 +15,31 @@
 // qaqmc_off_diagonal_core.cpp (half-line proposal/topology_sweep) -- header-
 // local `static inline` gives each translation unit its own copy, which is
 // fine for functions this small.
+//
+// uniform01: top 53 bits of one mt19937_64 draw scaled to [0,1) — replaces
+// std::uniform_real_distribution (same one-draw cost class, no per-call
+// object construction, branch-free).
 static inline double uniform01(std::mt19937_64& rng) {
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    return dist(rng);
+    return (double)(rng() >> 11) * 0x1.0p-53;
 }
+// randint: Lemire's unbiased bounded integer via 64x64->128 multiply-shift.
+// Exactly uniform on [0, n); the rejection branch fires with probability
+// < n / 2^64 (i.e. essentially never), replacing the per-call division that
+// std::uniform_int_distribution performs.
 static inline int randint(std::mt19937_64& rng, int n) {
-    std::uniform_int_distribution<int> dist(0, n - 1);
-    return dist(rng);
+    const uint64_t un = (uint64_t)n;
+    uint64_t x = rng();
+    __uint128_t m = (__uint128_t)x * un;
+    uint64_t lo = (uint64_t)m;
+    if (lo < un) {
+        const uint64_t t = (0 - un) % un;
+        while (lo < t) {
+            x = rng();
+            m = (__uint128_t)x * un;
+            lo = (uint64_t)m;
+        }
+    }
+    return (int)(uint64_t)(m >> 64);
 }
 
 #include "qaqmc_off_diagonal_core.hpp"
@@ -34,6 +52,7 @@ struct RydbergVij {
     std::vector<double> vij_list;
     std::vector<int> bond_sites_flat; // (n_bonds * 2), row-major
     std::vector<int> coord_number;    // z_eff[i]: # active bonds touching site i
+    std::vector<double> inv_coord;    // 1/z_eff[i] (0 if z_eff[i] == 0)
     int n_bonds;
 };
 
@@ -47,13 +66,24 @@ struct AliasTable {
     // All arrays: first dimension = M_total (time slices)
     std::vector<double> bond_W_all;      // (M_total * n_bonds_pad * 4)
     std::vector<double> bond_W_max_all;  // (M_total * n_bonds_pad)
+    std::vector<double> bond_W_rmax_all; // (M_total * n_bonds_pad) 1/W_max (0 if W_max <= 0)
     std::vector<int>    n_alias_all;     // (M_total)
     std::vector<double> alias_prob_all;  // (M_total * max_alias)
-    std::vector<int64_t> alias_idx_all;  // (M_total * max_alias)
+    std::vector<int32_t> alias_idx_all;  // (M_total * max_alias); values < max_alias
     std::vector<int>    op_map_kind_all; // (M_total * max_alias)
     std::vector<int>    op_map_loc_all;  // (M_total * max_alias)
     int max_alias;
     int n_bonds_pad; // max(n_bonds, 1)
+};
+
+// AoS alias-table entry: one 16-byte struct per alias slot instead of four
+// parallel arrays, so each rejection-loop attempt touches 1-2 cache lines
+// instead of 3-4 (and the per-group table stays small enough to live in L2).
+// loc_kind packs (loc << 1) | kind (kind: 0 = site, 1 = bond).
+struct AliasEntry {
+    double  prob;      // Vose acceptance threshold
+    int32_t alias;     // Vose alias index (< max_alias)
+    int32_t loc_kind;  // (loc << 1) | kind
 };
 
 AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
@@ -76,6 +106,15 @@ public:
 
     void mc_step();
 
+    // Fused mc_step + asymmetric-profile measurement: the profile capture
+    // rides the diagonal sweep (which walks the identical state trajectory
+    // measure_profile would), returning the sample of the PREVIOUS completed
+    // step with zero extra O(M) passes.  One-step lag; statistically
+    // identical for equilibrium sampling.  NOTE: assumes the off-diagonal
+    // string seam is inactive (profile runs never enable it).
+    struct ProfileObservables;
+    ProfileObservables mc_step_profiled(int profile_step);
+
     // Accessors
     int get_N() const { return N_; }
     int get_M() const { return M_; }
@@ -84,6 +123,15 @@ public:
     const std::vector<int32_t>& get_op_sites() const { return op_sites_; }
     const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
     const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
+
+    // delta at slice p, computed arithmetically with the EXACT expression used
+    // to build delta_sched_ (bit-identical), so hot loops avoid streaming /
+    // randomly hitting the 8-byte-per-slice schedule array.
+    inline double delta_at(int p) const {
+        return (p < M_)
+            ? delta_min_ + (delta_max_ - delta_min_) * ((double)p / M_)
+            : delta_max_ - (delta_max_ - delta_min_) * ((double)(p - M_) / M_);
+    }
 
     // ── On-the-fly observable support ─────────────────────────────────────
     // Set loop/string site index arrays for Z(l) and C_m(l) measurement.
@@ -331,18 +379,16 @@ private:
     int pos_dim_{0};
 
     // ── Grouped alias tables for O(G) diagonal update ─────────────────────
+    // (slice -> group is computed incrementally during the diagonal sweep;
+    //  no per-slice map is stored.)
     struct GroupedAlias {
         int n_groups;
-        std::vector<int> slice_to_group;      // [M_total] -> group index
-        // Per-group alias table (same layout as AliasTable but indexed by group)
         int max_alias;
         int n_bonds_pad;
         std::vector<double>  bond_W_max_all;  // [n_groups * n_bonds_pad]
+        std::vector<double>  bond_W_rmax_all; // [n_groups * n_bonds_pad] 1/W_max (0 if W_max <= 0)
         std::vector<int>     n_alias_all;     // [n_groups]
-        std::vector<double>  alias_prob_all;  // [n_groups * max_alias]
-        std::vector<int64_t> alias_idx_all;   // [n_groups * max_alias]
-        std::vector<int>     op_map_kind_all; // [n_groups * max_alias]
-        std::vector<int>     op_map_loc_all;  // [n_groups * max_alias]
+        std::vector<AliasEntry> entries;      // [n_groups * max_alias]
     };
     GroupedAlias grp_alias_;
 
@@ -410,14 +456,39 @@ private:
 
     std::vector<int32_t> site_bond_count_;
     std::vector<int32_t> site_bond_head_;
-    std::vector<int32_t> site_bond_list_;
+    // Packed bond-op vertex events: [ p : 32 ][ b : 31 ][ endpoint : 1 ]
+    // (endpoint = 0 if the owning site is bonds_i[b], 1 if bonds_j[b]).
+    // Lists are filled in ascending p per site and p occupies the high bits,
+    // so packed order == p order and upper_bound can search the packed key
+    // directly.  Carrying b avoids the dependent op_sites_[p] load in the
+    // segment-Metropolis hot loop.
+    std::vector<int64_t> site_bond_list_;
+    static inline int64_t pack_bond_entry(int p, int b, int endpoint) {
+        return (static_cast<int64_t>(p) << 32)
+             | (static_cast<int64_t>(static_cast<uint32_t>(b)) << 1)
+             | static_cast<int64_t>(endpoint & 1);
+    }
+    static inline int bond_entry_p(int64_t e)        { return static_cast<int>(e >> 32); }
+    static inline int bond_entry_b(int64_t e)        { return static_cast<int>((e >> 1) & 0x7FFFFFFF); }
+    static inline int bond_entry_endpoint(int64_t e) { return static_cast<int>(e & 1); }
 
-    std::vector<int32_t> bond_spin_;
+    // Bond-op spin cache, values 0..3 — int8 quarters the footprint of the
+    // random-access reads/XORs in the segment Metropolis.
+    std::vector<int8_t> bond_spin_;
+    // True while the site_op_count_/site_bond_count_ filled by the last
+    // diagonal sweep still describe op_types_/op_sites_ (cluster's 1 <-> -1
+    // toggles are count-neutral); cleared by set_op_string.
+    bool vertex_counts_valid_{false};
     std::vector<int32_t> spin_now_;
     std::vector<int8_t>  seg_flipped_;
 
     // Internal update functions
     void diagonal_update();
+    void diagonal_update_profiled(ProfileObservables* prof, int profile_step);
     void cluster_update();
     void build_vertex_lists();
+    void profile_alloc(ProfileObservables& prof, int n_points) const;
+    void profile_measure_point(const std::vector<int32_t>& state, int out_idx,
+                               ProfileObservables& prof,
+                               size_t& next_snap, size_t& next_occ) const;
 };
