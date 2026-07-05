@@ -75,6 +75,7 @@ def run_ratio_job_mpi(
     preferred_center_label: str | None,
     output_dir,
     lattice: str = DEFAULT_LATTICE,
+    checkpoint_every_blocks: int = 0,
     comm=None,
 ) -> dict | None:
     if comm is None:
@@ -130,9 +131,14 @@ def run_ratio_job_mpi(
         ratio_results = []
         for step_index, next_site in enumerate(site_order):
             step_out = None
+            step_ckpt_dir = None
             if rank == 0:
                 step_out = str(out_dir / "ratio_steps"
                                / f"{region_name}_step{int(step_index):03d}.h5")
+                if int(checkpoint_every_blocks) > 0:
+                    # Chunk layout: ratio_steps/{region}_step{i}/rank{r}/chunk{c}.h5
+                    step_ckpt_dir = str(out_dir / "ratio_steps"
+                                        / f"{region_name}_step{int(step_index):03d}")
             payload = run_ratio_mpi(
                 N=N, M=int(M),
                 A_mask=current_mask, next_site=int(next_site),
@@ -143,7 +149,10 @@ def run_ratio_job_mpi(
                 n_therm=int(n_therm), n_measure=int(n_measure),
                 measure_stride=int(measure_stride), block_size=block_size,
                 filepath=step_out, region_name=region_name,
-                step_index=int(step_index), comm=comm, verbose=False,
+                step_index=int(step_index),
+                checkpoint_every_blocks=int(checkpoint_every_blocks),
+                checkpoint_dir=step_ckpt_dir,
+                comm=comm, verbose=False,
             )
             if rank == 0:
                 ratio_results.append(payload)
@@ -187,6 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_measure_total", type=int, default=-1,
                         help="total measurement sweeps across ranks; auto-divided per rank")
     parser.add_argument("--measure_stride", type=int, default=1)
+    parser.add_argument("--checkpoint_every_blocks", type=int, default=0,
+                        help="incremental checkpointing: flush per-block visit counts every "
+                             "N blocks per rank into ratio_steps/{region}_step{i}/rank{r}/"
+                             "chunk{c}.h5 (requires --block_size). 0 = disabled.")
     return parser
 
 
@@ -218,6 +231,7 @@ def main():
         preferred_center_label=common["preferred_center_label"],
         output_dir=args.output_dir,
         lattice=args.lattice,
+        checkpoint_every_blocks=int(args.checkpoint_every_blocks),
         comm=comm,
     )
 

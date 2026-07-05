@@ -90,7 +90,16 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                  neighbor_cutoff: int = -1, delta_groups: int = 200,
                  seed: int = 7, compute_ed: bool = True,
                  filepath: str | None = None,
+                 checkpoint_every_trajectories: int = 0,
+                 checkpoint_dir: str | None = None,
                  verbose: bool = True) -> dict:
+    """When checkpoint_every_trajectories > 0 and checkpoint_dir is set, each
+    rank additionally flushes its per-trajectory arrays every that many
+    trajectories to checkpoint_dir/K{K}/rank{r}/chunk{c}.h5 (same layout as
+    the profile driver's incremental checkpointing).  Repeated
+    run_trajectories calls continue the same checkpoint chain, so the chunked
+    run is statistically identical to a single long call; a crash loses at
+    most one chunk per rank.  The final aggregate file is unchanged."""
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
@@ -130,7 +139,51 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         eng.set_region_pair(A_start_mask, A_end_mask)
         eng.set_lambda_schedule(np.linspace(0.0, 1.0, K + 1))
         eng.thermalize(n_thermalize)
-        local = eng.run_trajectories(my_n, decorrelation_steps)
+
+        ckpt = int(checkpoint_every_trajectories) if checkpoint_dir else 0
+        if ckpt > 0 and my_n > 0:
+            from types import SimpleNamespace
+
+            from src.mpi.kp_tee_common import write_rank_chunk_h5
+
+            k_dir = os.path.join(checkpoint_dir, f"K{K}")
+            parts = []
+            done = 0
+            c = 0
+            while done < my_n:
+                n_chunk = min(ckpt, my_n - done)
+                part = eng.run_trajectories(n_chunk, decorrelation_steps)
+                parts.append(part)
+                done += n_chunk
+                write_rank_chunk_h5(
+                    k_dir, rank, c,
+                    datasets=dict(
+                        work_samples=part.work_samples,
+                        final_swap_counts=part.final_swap_counts,
+                        unjoined_counts_per_traj=part.unjoined_counts_per_traj,
+                        topology_attempts_per_traj=part.topology_attempts_per_traj,
+                        topology_accepts_per_traj=part.topology_accepts_per_traj,
+                    ),
+                    attrs=dict(K=int(K), n_trajectories=int(n_chunk),
+                               trajectories_cumulative=int(done),
+                               my_n_trajectories=int(my_n), seed=int(seed)),
+                )
+                c += 1
+                if rank == 0 and verbose:
+                    print(f"[MPI-WORK] K={K} rank0 chunk {c} written "
+                          f"({done}/{my_n} trajectories)", flush=True)
+            local = SimpleNamespace(
+                work_samples=np.concatenate([p.work_samples for p in parts]),
+                final_swap_counts=np.concatenate([p.final_swap_counts for p in parts]),
+                unjoined_counts_per_traj=np.concatenate(
+                    [p.unjoined_counts_per_traj for p in parts]),
+                topology_attempts_per_traj=np.concatenate(
+                    [p.topology_attempts_per_traj for p in parts]),
+                topology_accepts_per_traj=np.concatenate(
+                    [p.topology_accepts_per_traj for p in parts]),
+            )
+        else:
+            local = eng.run_trajectories(my_n, decorrelation_steps)
 
         # Gather per-trajectory arrays to rank 0 and aggregate via log-sum-exp
         all_w           = comm.gather(local.work_samples,                root=0)
@@ -251,6 +304,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
                        n_trajectories, n_thermalize, decorrelation_steps,
                        neighbor_cutoff=-1, delta_groups=600, seed=7,
                        compute_ed=True, filepath=None, kp_meta=None,
+                       checkpoint_every_trajectories=0, checkpoint_dir=None,
                        verbose=True) -> dict | None:
     """Run the work engine for a list of (region_name, A_start_mask, A_end_mask).
 
@@ -288,6 +342,9 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
             seed=seed + 7919 * (hash(region_name) & 0xFFFF),
             compute_ed=compute_ed,
             filepath=None,    # we write a combined file at the end
+            checkpoint_every_trajectories=checkpoint_every_trajectories,
+            checkpoint_dir=(os.path.join(checkpoint_dir, str(region_name))
+                            if checkpoint_dir else None),
             verbose=verbose,
         )
         if rank == 0:
@@ -489,9 +546,26 @@ def main():
     # Output / misc
     parser.add_argument("--filepath", type=str, default=None,
                         help="optional HDF5 output path")
+    parser.add_argument("--checkpoint-every-trajectories", type=int, default=0,
+                        help="incremental checkpointing: flush per-trajectory arrays "
+                             "every N trajectories per rank into "
+                             "<checkpoint_dir>/[region/]K{K}/rank{r}/chunk{c}.h5. "
+                             "0 = disabled. A crash then loses at most one chunk.")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="checkpoint run directory (default: <filepath minus .h5>_chunks "
+                             "when checkpointing is enabled)")
     parser.add_argument("--skip-ed", action="store_true",
                         help="skip ED reference computation (forced if N > 16)")
     args = parser.parse_args()
+
+    ckpt_dir = args.checkpoint_dir
+    if int(args.checkpoint_every_trajectories) > 0 and ckpt_dir is None:
+        if args.filepath:
+            base = args.filepath[:-3] if args.filepath.endswith(".h5") else args.filepath
+            ckpt_dir = base + "_chunks"
+        else:
+            raise ValueError("--checkpoint-every-trajectories requires "
+                             "--checkpoint-dir or --filepath")
 
     if args.lattice == "1d_chain":
         if args.N <= 0:
@@ -573,6 +647,8 @@ def main():
             seed=args.seed,
             compute_ed=(not args.skip_ed),
             filepath=args.filepath,
+            checkpoint_every_trajectories=args.checkpoint_every_trajectories,
+            checkpoint_dir=ckpt_dir,
             kp_meta=dict(
                 lattice=args.lattice, nx=args.nx, ny=args.ny, a=args.a,
                 m=args.kp_m, center_label=spec.center_label,
@@ -602,6 +678,8 @@ def main():
         seed=args.seed,
         compute_ed=(not args.skip_ed),
         filepath=args.filepath,
+        checkpoint_every_trajectories=args.checkpoint_every_trajectories,
+        checkpoint_dir=ckpt_dir,
     )
 
 

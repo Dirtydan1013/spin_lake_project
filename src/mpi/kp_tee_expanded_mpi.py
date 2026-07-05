@@ -108,6 +108,7 @@ def run_expanded_job_mpi(
     log_g_init: str | None = None,
     skip_autotune: bool = False,
     warm_up_steps: int = 0,
+    checkpoint_every_blocks: int = 0,
 ) -> dict | None:
     if comm is None:
         comm = MPI.COMM_WORLD
@@ -248,6 +249,11 @@ def run_expanded_job_mpi(
             warm_up_steps=int(warm_up_steps),
             engine_factory=_shared_engine_factory,
             diagnostic_label=str(region_name),
+            checkpoint_every_blocks=int(checkpoint_every_blocks),
+            # Chunk layout: <out_dir>/expanded_chunks/{region}/rank{r}/chunk{c}.h5
+            checkpoint_dir=(str(out_dir / "expanded_chunks" / str(region_name))
+                            if (rank == 0 and int(checkpoint_every_blocks) > 0)
+                            else None),
         )
 
         if rank != 0:
@@ -328,6 +334,13 @@ def build_parser() -> argparse.ArgumentParser:
              "loading log_g via --log_g_init so the chain leaves the C++ "
              "constructor's fresh state before measurements begin.",
     )
+    parser.add_argument(
+        "--checkpoint_every_blocks", type=int, default=0,
+        help="incremental checkpointing (fixed n_steps production only): flush "
+             "per-block counts every N blocks per rank into "
+             "expanded_chunks/{region}/rank{r}/chunk{c}.h5 (requires "
+             "--block_size). 0 = disabled.",
+    )
     return parser
 
 
@@ -391,6 +404,7 @@ def main():
         log_g_init=args.log_g_init,
         skip_autotune=bool(args.skip_autotune),
         warm_up_steps=int(args.warm_up_steps),
+        checkpoint_every_blocks=int(args.checkpoint_every_blocks),
     )
 
     if rank == 0 and payload is not None:

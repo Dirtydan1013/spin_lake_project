@@ -231,7 +231,9 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
                      diagnostic_label: str | None = None,
                      initial_log_g=None,
                      skip_autotune: bool = False,
-                     warm_up_steps: int = 0):
+                     warm_up_steps: int = 0,
+                     checkpoint_every_blocks: int = 0,
+                     checkpoint_dir=None):
     if comm is None:
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -292,13 +294,84 @@ def run_expanded_mpi(*, N: int, M: int, masks, neighbors, target_ensemble: int,
     if target_s2_err is None:
         if n_steps is None:
             raise ValueError("n_steps must be provided when target_s2_err is None")
-        local_result = driver.run_production(
-            n_steps=int(n_steps),
-            block_size=block_size,
-            reference_ensemble=reference_ensemble,
-            require_histogram=False,
-            require_collection=False,
-        )
+        ckpt_blocks = int(checkpoint_every_blocks)
+        if ckpt_blocks > 0:
+            checkpoint_dir = comm.bcast(checkpoint_dir if rank == 0 else None, root=0)
+        if ckpt_blocks > 0 and checkpoint_dir:
+            # Incremental checkpointing: production runs in chunks of
+            # ckpt_blocks * block_size steps; after each chunk the per-block
+            # counts are flushed to checkpoint_dir/rank{r}/chunk{c}.h5 (same
+            # layout as the profile driver's checkpointing).  Block boundaries
+            # and the chain are identical to a single run_production call, so
+            # the combined local result below is statistically identical; a
+            # crash loses at most one chunk per rank.
+            if block_size is None or int(block_size) <= 0:
+                raise ValueError("checkpoint_every_blocks requires a positive block_size")
+            from src.mpi.kp_tee_common import write_rank_chunk_h5
+            from src.tee.reweighting import (
+                _jackknife_log_z_from_collection_or_nan,
+                _jackknife_log_z_or_nan,
+            )
+
+            chunk_steps = ckpt_blocks * int(block_size)
+            parts = []
+            done = 0
+            c = 0
+            while done < int(n_steps):
+                cur = min(chunk_steps, int(n_steps) - done)
+                part = driver.run_production(
+                    n_steps=cur,
+                    block_size=block_size,
+                    reference_ensemble=reference_ensemble,
+                    require_histogram=False,
+                    require_collection=False,
+                )
+                parts.append(part)
+                done += cur
+                write_rank_chunk_h5(
+                    checkpoint_dir, rank, c,
+                    datasets=dict(
+                        block_visit_counts=part.block_visit_counts,
+                        block_collection_counts=part.block_collection_counts,
+                        transition_counts=part.transition_counts,
+                        log_g=part.log_g,
+                    ),
+                    attrs=dict(n_steps=int(cur), block_size=int(block_size),
+                               steps_cumulative=int(done),
+                               n_steps_total=int(n_steps), seed=int(seed)),
+                )
+                c += 1
+            block_arr = np.concatenate([p.block_visit_counts for p in parts], axis=0)
+            collection_block_arr = np.concatenate(
+                [p.block_collection_counts for p in parts], axis=0)
+            log_z, log_z_err = _jackknife_log_z_or_nan(
+                block_arr, driver.log_g,
+                reference_ensemble=reference_ensemble, require_histogram=False)
+            collection_log_z, collection_log_z_err = _jackknife_log_z_from_collection_or_nan(
+                collection_block_arr, driver.log_g,
+                reference_ensemble=reference_ensemble, require_collection=False)
+            local_result = ExpandedProductionResult(
+                log_g=driver.log_g,
+                visit_counts=np.sum(block_arr, axis=0, dtype=np.int64),
+                block_visit_counts=block_arr,
+                transition_counts=np.sum(
+                    np.stack([p.transition_counts for p in parts]), axis=0).astype(np.int64),
+                collection_counts=np.sum(
+                    np.stack([p.collection_counts for p in parts]), axis=0),
+                log_z=log_z,
+                log_z_err=log_z_err,
+                block_collection_counts=collection_block_arr,
+                collection_log_z=collection_log_z,
+                collection_log_z_err=collection_log_z_err,
+            )
+        else:
+            local_result = driver.run_production(
+                n_steps=int(n_steps),
+                block_size=block_size,
+                reference_ensemble=reference_ensemble,
+                require_histogram=False,
+                require_collection=False,
+            )
         gathered = comm.gather(local_result, root=0)
         root_result = None
         if rank == 0:

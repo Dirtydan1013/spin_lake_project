@@ -107,3 +107,28 @@ def normalize_common_args(args: argparse.Namespace) -> dict:
         "block_size": block_size,
         "preferred_center_label": preferred,
     }
+
+
+def write_rank_chunk_h5(run_dir, rank: int, chunk: int, datasets: dict,
+                        attrs: dict | None = None) -> str:
+    """Write one self-contained checkpoint chunk to run_dir/rank{r}/chunk{c}.h5.
+
+    Same layout convention as qaqmc_mpi.run_mpi_profile's incremental
+    checkpointing: one subdirectory per rank inside the run directory, one
+    HDF5 file per chunk inside it.  A crash then loses at most one chunk of
+    the affected rank.  Each rank creates its own subdirectory, so no
+    inter-rank coordination is needed beyond agreeing on ``run_dir``.
+    """
+    import h5py
+
+    rank_dir = Path(run_dir) / f"rank{int(rank)}"
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    path = rank_dir / f"chunk{int(chunk)}.h5"
+    with h5py.File(path, "w") as f:
+        for key, value in datasets.items():
+            f.create_dataset(key, data=np.asarray(value))
+        f.attrs["rank"] = int(rank)
+        f.attrs["chunk"] = int(chunk)
+        for key, value in (attrs or {}).items():
+            f.attrs[key] = value
+    return str(path)

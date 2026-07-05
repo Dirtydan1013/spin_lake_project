@@ -50,7 +50,14 @@ def run_ratio_mpi(*, N: int, M: int, A_mask, next_site: int,
                   n_therm: int, n_measure: int, measure_stride: int = 1,
                   block_size: int | None = None,
                   filepath=None, region_name: str = "region", step_index: int = 0,
+                  checkpoint_every_blocks: int = 0, checkpoint_dir=None,
                   comm=None, engine_factory=None, verbose: bool = False):
+    """When checkpoint_every_blocks > 0 and checkpoint_dir is set (rank 0's
+    value is broadcast), each rank flushes its per-block visit counts every
+    that many blocks to checkpoint_dir/rank{r}/chunk{c}.h5.  The sampling is
+    block-for-block identical to a single run_single_ratio call with the same
+    block_size (which is required in this mode); a crash loses at most one
+    chunk per rank.  The combined per-step result file is unchanged."""
     if comm is None:
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -74,14 +81,66 @@ def run_ratio_mpi(*, N: int, M: int, A_mask, next_site: int,
 
     engine = engine_factory(rank)
     runner = RatioRunner(engine=engine)
-    local_result = runner.run_single_ratio(
-        A_mask,
-        next_site=next_site,
-        n_therm=n_therm,
-        n_measure=n_measure,
-        measure_stride=measure_stride,
-        block_size=block_size,
-    )
+
+    ckpt_blocks = int(checkpoint_every_blocks)
+    if ckpt_blocks > 0:
+        checkpoint_dir = comm.bcast(checkpoint_dir if rank == 0 else None, root=0)
+    if ckpt_blocks > 0 and checkpoint_dir:
+        if block_size is None or int(block_size) <= 0:
+            raise ValueError("checkpoint_every_blocks requires a positive block_size")
+        from src.mpi.kp_tee_common import write_rank_chunk_h5
+        from src.tee.qaqmc_renyi_ratio import build_ratio_result
+
+        # Inline block loop (same semantics as RatioRunner.run_single_ratio
+        # with block_size): the chain and block boundaries are identical, we
+        # just flush accumulated blocks every ckpt_blocks blocks.
+        mask = np.asarray(A_mask, dtype=np.uint8).reshape(-1)
+        next_mask = mask.copy()
+        next_mask[int(next_site)] = 1
+        engine.set_topology_pair(mask, next_mask, int(next_site))
+        if n_therm > 0:
+            engine.run_steps(int(n_therm))
+
+        stride = max(1, int(measure_stride))
+        blk = int(block_size)
+        block_lows: list[int] = []
+        block_highs: list[int] = []
+        chunk_lows: list[int] = []
+        chunk_highs: list[int] = []
+        c = 0
+        remaining = int(n_measure)
+        while remaining > 0:
+            current_block = min(blk, remaining)
+            engine.reset_visit_counts()
+            engine.run_steps(current_block * stride)
+            lo, hi = engine.get_visit_counts().tolist()
+            block_lows.append(int(lo)); chunk_lows.append(int(lo))
+            block_highs.append(int(hi)); chunk_highs.append(int(hi))
+            remaining -= current_block
+            if len(chunk_lows) >= ckpt_blocks or remaining <= 0:
+                write_rank_chunk_h5(
+                    checkpoint_dir, rank, c,
+                    datasets=dict(block_visit_count_low=chunk_lows,
+                                  block_visit_count_high=chunk_highs),
+                    attrs=dict(region_name=str(region_name),
+                               step_index=int(step_index),
+                               next_site=int(next_site),
+                               block_size=blk, measure_stride=stride,
+                               blocks_cumulative=len(block_lows),
+                               seed=int(seed)),
+                )
+                c += 1
+                chunk_lows, chunk_highs = [], []
+        local_result = build_ratio_result(block_lows, block_highs)
+    else:
+        local_result = runner.run_single_ratio(
+            A_mask,
+            next_site=next_site,
+            n_therm=n_therm,
+            n_measure=n_measure,
+            measure_stride=measure_stride,
+            block_size=block_size,
+        )
     results_per_rank = comm.gather(local_result, root=0)
 
     root_payload = None
