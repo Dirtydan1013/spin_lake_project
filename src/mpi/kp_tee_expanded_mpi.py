@@ -117,7 +117,11 @@ def run_expanded_job_mpi(
     if skip_autotune and not log_g_init:
         raise ValueError("skip_autotune requires log_g_init to be provided")
 
+    # Any rank-0 geometry failure is broadcast so other ranks raise instead of
+    # deadlocking in the data bcasts below.
+    geo_error = None
     if rank == 0:
+      try:
         pos = kagome_bond_pos(lattice, nx, ny, a=a)
         ordering_bonds = kp_ordering_bonds(lattice, nx, ny, a=a)
         spec = build_kp_region_masks_for_lattice(
@@ -161,12 +165,19 @@ def run_expanded_job_mpi(
             spec=spec,
             params={**common_params, "regions": list(regions)},
         )
+      except Exception as exc:
+        geo_error = exc
+        pos = ladders = out_dir = common_params = geometry_path = None
     else:
         pos = None
         ladders = None
         out_dir = None
         common_params = None
         geometry_path = None
+
+    geo_error = comm.bcast(geo_error, root=0)
+    if geo_error is not None:
+        raise geo_error
 
     pos = comm.bcast(pos, root=0)
     ladders = comm.bcast(ladders, root=0)

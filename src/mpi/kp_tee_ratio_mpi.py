@@ -83,7 +83,11 @@ def run_ratio_job_mpi(
     rank = comm.Get_rank()
 
     # Rank 0 builds KP geometry then broadcasts the parts everyone needs.
+    # Any rank-0 failure (e.g. invalid nx/m for the lattice) is broadcast so
+    # the other ranks raise instead of deadlocking in the data bcasts below.
+    geo_error = None
     if rank == 0:
+      try:
         pos = kagome_bond_pos(lattice, nx, ny, a=a)
         ordering_bonds = kp_ordering_bonds(lattice, nx, ny, a=a)
         spec = build_kp_region_masks_for_lattice(
@@ -113,11 +117,18 @@ def run_ratio_job_mpi(
         }
         geometry_path = _write_geometry_json(out_dir / "kp_geometry.json",
                                              spec=spec, params=params)
+      except Exception as exc:
+        geo_error = exc
+        pos = spec = out_dir = geometry_path = None
     else:
         pos = None
         spec = None
         out_dir = None
         geometry_path = None
+
+    geo_error = comm.bcast(geo_error, root=0)
+    if geo_error is not None:
+        raise geo_error
 
     pos = comm.bcast(pos, root=0)
     spec = comm.bcast(spec, root=0)
