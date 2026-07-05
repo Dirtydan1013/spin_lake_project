@@ -672,9 +672,32 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     return filepath
 
 
+def _write_result_h5(path, arrays, attrs=None):
+    """Atomically write a dict of arrays to a self-contained HDF5 file.
+
+    Writes to ``path + '.tmp'`` first, then ``os.replace()`` into place, so a
+    crash mid-write can never corrupt a previously-completed checkpoint file.
+    Arrays larger than 1 MiB are gzip-compressed (op-type-like data shrinks a
+    lot; batch means less so, but the cost is negligible at this cadence).
+    """
+    tmp = path + '.tmp'
+    with h5py.File(tmp, 'w') as f:
+        if attrs:
+            for k, v in attrs.items():
+                f.attrs[k] = v
+        for k, v in arrays.items():
+            arr = np.ascontiguousarray(v)
+            if arr.nbytes > (1 << 20):
+                f.create_dataset(k, data=arr, compression='gzip', compression_opts=4)
+            else:
+                f.create_dataset(k, data=arr)
+    os.replace(tmp, path)
+
+
 def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     pos=None, epsilon=0.01, seed=42, n_equil=0, n_samples=1000,
                     measure_every=1, profile_step=10000, batch_size=1000,
+                    checkpoint_every_batches=0,
                     filepath='data/qaqmc_profile.h5',
                     neighbor_cutoff=None,
                     loop_sizes=None, string_sizes=None,
@@ -858,6 +881,88 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
     # Sampling
     t0 = time.perf_counter()
+
+    # ── Level-1 incremental checkpointing ────────────────────────────────────
+    # When checkpoint_every_batches > 0, each rank runs its (already-equilibrated)
+    # chain in chunks of that many batches and writes a self-contained HDF5 file
+    # after every chunk, so a crash loses at most one chunk instead of the whole
+    # run.  Repeated run_profile(n_equil=0, ...) calls continue the SAME Markov
+    # chain (engine state persists), so this is statistically identical to one
+    # long call.  Layout:  data/M={M}_{nx}x{ny}_{timestamp}/rank{r}_chunk{c}.h5
+    # plus a one-time meta.h5 (geometry + params) written by rank 0.
+    if checkpoint_every_batches and checkpoint_every_batches > 0:
+        if rank == 0:
+            base_dir = os.path.dirname(filepath) or '.'
+            stamp = time.strftime('%Y%m%d_%H%M%S')
+            run_dir = os.path.join(base_dir, f'M={M}_{nx}x{ny}_{stamp}')
+            os.makedirs(run_dir, exist_ok=True)
+        else:
+            run_dir = None
+        run_dir = comm.bcast(run_dir, root=0)
+
+        chunk_samples = int(checkpoint_every_batches) * batch_size
+        n_chunks = ((my_n_samples + chunk_samples - 1) // chunk_samples
+                    if my_n_samples > 0 else 0)
+
+        samples_done = 0
+        c = 0
+        while samples_done < my_n_samples:
+            n = min(chunk_samples, my_n_samples - samples_done)
+            res = engine._cpp_engine.run_profile(
+                0, n, me_density, me_zl, me_cml, profile_step,
+                batch_size,
+                None, 1,
+                n_snapshots if n_snap_pts > 0 else 0,
+                occ_sf_nbatch if do_occ else 0)
+            _write_result_h5(
+                os.path.join(run_dir, f'rank{rank}_chunk{c}.h5'),
+                {k: np.asarray(v) for k, v in res.items()},
+                attrs=dict(rank=rank, chunk=c, n_samples=n, batch_size=batch_size,
+                           samples_cumulative=samples_done + n,
+                           my_n_samples=my_n_samples))
+            samples_done += n
+            c += 1
+            if verbose and rank == 0:
+                el = time.perf_counter() - t0
+                print(f"[MPI-PROF] rank0 chunk {c}/{n_chunks} written "
+                      f"({samples_done}/{my_n_samples} samples, {el:.0f}s)", flush=True)
+
+        # One-time run metadata (geometry + params) from rank 0.
+        if rank == 0:
+            meta = {
+                'delta_schedule': np.array(engine._cpp_engine.delta_schedule,
+                                           dtype=np.float64),
+                'p_indices': np.array([(k + 1) * profile_step - 1
+                                       for k in range(M_total_ // profile_step)],
+                                      dtype=np.int64),
+            }
+            if pos is not None:
+                meta['pos'] = np.asarray(pos, dtype=np.float64)
+            if do_occ:
+                meta['occ_basis'] = np.asarray(occ_basis, dtype=np.int32)
+                meta['occ_cell_R'] = np.asarray(occ_cell_R, dtype=np.float64)
+                if occ_q_points is not None:
+                    meta['occ_q_points'] = np.asarray(occ_q_points, dtype=np.float64)
+            _write_result_h5(
+                os.path.join(run_dir, 'meta.h5'), meta,
+                attrs=dict(N=N, M=M, nx=nx, ny=ny, Omega=Omega, Rb=Rb,
+                           delta_min=delta_min, delta_max=delta_max, epsilon=epsilon,
+                           seed=seed, profile_step=profile_step, batch_size=batch_size,
+                           n_samples=n_samples, n_ranks=n_ranks,
+                           checkpoint_every_batches=int(checkpoint_every_batches)))
+            print(f"[MPI-PROF] checkpoint run dir: {run_dir}", flush=True)
+
+        comm.Barrier()
+        t_sample = time.perf_counter() - t0
+        if verbose and rank == 0:
+            max_sa = comm.reduce(t_sample, op=MPI.MAX, root=0)
+            print(f"[MPI-PROF] Sampling done in {max_sa:.1f}s (slowest rank); "
+                  f"{n_chunks} chunk(s)/rank written.")
+        else:
+            comm.reduce(t_sample, op=MPI.MAX, root=0)
+        return run_dir
+
+    # ── Legacy single-call path (checkpointing disabled) ─────────────────────
     sa_cb = None
     sa_bar = None
     if verbose and rank == 0 and my_n_samples > 0:
@@ -1335,6 +1440,13 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1000,
                         help='(profile mode) Number of Z_l/C_m_l samples per batch for '
                              'memory-efficient per-copy storage. Default 1000.')
+    parser.add_argument('--checkpoint_every_batches', type=int, default=0,
+                        help='(profile mode) Level-1 incremental checkpointing: flush a '
+                             'self-contained HDF5 file every N batches per rank into a '
+                             'per-run subfolder (data/M=..._<nx>x<ny>_<timestamp>/'
+                             'rank{r}_chunk{c}.h5). 0 = disabled (single combined file). '
+                             'A crash then loses at most one chunk. Pick N so N*batch_size '
+                             'samples ~= 30-60 min of wall time.')
     # Loop / string sizes are auto-selected from (nx, ny):
     #   loop sizes   = 2 .. min(nx, ny) - 1
     #   string sizes = 1 .. min(nx, ny) - 1
@@ -1417,6 +1529,7 @@ def main():
             measure_every=config.get('measure_every', 1),
             profile_step=config.get('profile_step', 10000),
             batch_size=config.get('batch_size', 1000),
+            checkpoint_every_batches=config.get('checkpoint_every_batches', 0),
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),
             delta_groups=config.get('delta_groups', 600),

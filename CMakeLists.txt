@@ -32,18 +32,45 @@ target_include_directories(qaqmc_cpp PRIVATE csrc)
 #     and break ED-comparison tests. Avoid.
 #   - -ffinite-math-only: log_W cache uses log(W) which we clamp to -1e30
 #     manually; allowing finite-only assumption is unsafe.
-target_compile_options(qaqmc_cpp PRIVATE
-    -O3
-    -march=cascadelake
-    -mtune=cascadelake
-    -funroll-loops
-    -fno-math-errno
-    -fno-trapping-math
-)
+# Debug build: AddressSanitizer + UBSan for hunting the profile-mode segfault.
+#   cmake -S . -B build_asan -G Ninja -DQAQMC_ASAN=ON -DPYTHON_EXECUTABLE=$(which python)
+# Run under: LD_PRELOAD=$(gcc -print-file-name=libasan.so) ASAN_OPTIONS=detect_leaks=0 ...
+option(QAQMC_ASAN "Build with AddressSanitizer + UBSan (-O1, no LTO) for debugging" OFF)
 
-# Link-time optimization: lets the compiler inline across translation units
-# (channel_for_actual, compute_bond_W_inline, etc.) and prune dead code.
-set_target_properties(qaqmc_cpp PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+# Full-speed (-O3) production build WITH -g debug symbols and no strip, so the
+# OpenMPI/glibc crash handler's offset backtrace can be addr2line'd to exact
+# source lines. Configure with:
+#   cmake -S . -B build_dbg -G Ninja -DQAQMC_DEBUGINFO=ON \
+#         -DCMAKE_BUILD_TYPE=RelWithDebInfo   (RelWithDebInfo => pybind11 won't strip)
+option(QAQMC_DEBUGINFO "Production -O3 build WITH -g symbols (not stripped)" OFF)
+
+if(QAQMC_ASAN)
+    # NOTE: no -march=cascadelake here — a generic build avoids any ISA mismatch
+    # on the login node and gives cleaner (non-vectorized) sanitizer traces.
+    target_compile_options(qaqmc_cpp PRIVATE
+        -O1 -g -fno-omit-frame-pointer
+        -fno-math-errno -fno-trapping-math
+        -fsanitize=address)
+    target_link_options(qaqmc_cpp PRIVATE -fsanitize=address)
+    # libstdc++ hardened bounds checks (vector::operator[], etc.)
+    target_compile_definitions(qaqmc_cpp PRIVATE _GLIBCXX_ASSERTIONS)
+    # LTO left OFF for readable sanitizer stack traces.
+else()
+    target_compile_options(qaqmc_cpp PRIVATE
+        -O3
+        -march=cascadelake
+        -mtune=cascadelake
+        -funroll-loops
+        -fno-math-errno
+        -fno-trapping-math
+        # keep frame pointers + debug symbols when hunting the crash (negligible cost)
+        $<$<BOOL:${QAQMC_DEBUGINFO}>:-g>
+        $<$<BOOL:${QAQMC_DEBUGINFO}>:-fno-omit-frame-pointer>
+    )
+    # Link-time optimization: lets the compiler inline across translation units
+    # (channel_for_actual, compute_bond_W_inline, etc.) and prune dead code.
+    set_target_properties(qaqmc_cpp PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(qaqmc_cpp PRIVATE OpenMP::OpenMP_CXX)
