@@ -21,6 +21,11 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
     // ── QAQMCEngine ──────────────────────────────────────────────────────────
 
+    py::class_<QAQMCEngine::HalfLineProposal>(m, "HalfLineProposal")
+        .def_readonly("valid", &QAQMCEngine::HalfLineProposal::valid)
+        .def_readonly("terminal_p", &QAQMCEngine::HalfLineProposal::terminal_p)
+        .def_readonly("log_physical_ratio", &QAQMCEngine::HalfLineProposal::log_physical_ratio);
+
     py::class_<QAQMCEngine>(m, "QAQMCEngine")
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
@@ -128,6 +133,43 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                                static_cast<const int32_t*>(s.ptr),
                                (int)t.shape[0]);
         })
+
+        // ── Off-diagonal string (X_C) seam support — Phase A ───────────────────
+        .def("set_string_sites", [](QAQMCEngine& self, py::list sites_py, int m_star) {
+            std::vector<int> sites;
+            for (auto& x : sites_py) sites.push_back(x.cast<int>());
+            self.set_string_sites(sites, m_star);
+        },
+        py::arg("sites"), py::arg("m_star"),
+        "Configure the string site list C and cut position m_star; resets seam_mask to empty")
+        .def("set_seam_mask", &QAQMCEngine::set_seam_mask, py::arg("mask"),
+        "Set which string_sites are seam-active (bit k <-> string_sites[k]); Phase A: fixed by caller")
+        .def_property_readonly("seam_mask", &QAQMCEngine::get_seam_mask)
+        .def_property_readonly("m_star", &QAQMCEngine::get_m_star)
+        .def_property_readonly("string_sites", &QAQMCEngine::get_string_sites)
+        .def_property_readonly("state_at_seam_minus", [](const QAQMCEngine& self) {
+            return py::array_t<int32_t>(self.get_state_at_seam_minus().size(),
+                                        self.get_state_at_seam_minus().data());
+        })
+        .def_property_readonly("state_at_seam_plus", [](const QAQMCEngine& self) {
+            return py::array_t<int32_t>(self.get_state_at_seam_plus().size(),
+                                        self.get_state_at_seam_plus().data());
+        })
+        .def("recompute_seam_snapshots", &QAQMCEngine::recompute_seam_snapshots,
+             "Refresh state_at_seam_minus/plus from current op string without resampling")
+
+        // ── Off-diagonal string (X_C) half-line topology move — Phase B ────────
+        .def("build_half_line_proposal", &QAQMCEngine::build_half_line_proposal,
+             py::arg("local_index"), py::arg("direction_right"),
+             "Read-only: build the half-line proposal for toggling string_sites[local_index]")
+        .def("commit_half_line_proposal", &QAQMCEngine::commit_half_line_proposal,
+             py::arg("local_index"), py::arg("prop"),
+             "Toggle the terminal operator + seam bit for a previously-built valid proposal")
+        .def("attempt_string_toggle", &QAQMCEngine::attempt_string_toggle,
+             py::arg("local_index"), py::arg("lambda_"),
+             "One Metropolis attempt (random direction) for string_sites[local_index] at fixed lambda")
+        .def("topology_sweep", &QAQMCEngine::topology_sweep, py::arg("lambda_"),
+             "Random-permutation sweep: one attempt_string_toggle per string site")
 
         // ── On-the-fly observable support ─────────────────────────────────────
         .def("set_bulk_sites", [](QAQMCEngine& self, py::list bulk_py) {

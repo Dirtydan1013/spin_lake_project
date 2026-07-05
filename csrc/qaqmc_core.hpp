@@ -10,6 +10,22 @@
 #include <omp.h>
 #endif
 
+// ─── RNG helpers ─────────────────────────────────────────────────────────────
+// Shared by qaqmc_core.cpp (diagonal_update/cluster_update) and
+// qaqmc_off_diagonal_core.cpp (half-line proposal/topology_sweep) -- header-
+// local `static inline` gives each translation unit its own copy, which is
+// fine for functions this small.
+static inline double uniform01(std::mt19937_64& rng) {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng);
+}
+static inline int randint(std::mt19937_64& rng, int n) {
+    std::uniform_int_distribution<int> dist(0, n - 1);
+    return dist(rng);
+}
+
+#include "qaqmc_off_diagonal_core.hpp"
+
 // ─── V_ij builder ────────────────────────────────────────────────────────────
 
 struct RydbergVij {
@@ -238,6 +254,36 @@ public:
     // Checkpoint: restore operator string from external data
     void set_op_string(const int32_t* types, const int32_t* sites, int len);
 
+    // ── Off-diagonal string (X_C) support ──────────────────────────────────
+    // All seam/half-line/topology_sweep state and logic lives in off_diag_
+    // (QAQMCOffDiagonalCore, csrc/qaqmc_off_diagonal_core.hpp/.cpp) -- these
+    // are one-line pass-throughs so the public API is unchanged. See that
+    // header for the full contract; see diagonal_update()/cluster_update()
+    // for the on_diagonal_slice()/on_cluster_slice() hook call sites.
+    using HalfLineProposal = QAQMCOffDiagonalCore::HalfLineProposal;
+
+    void set_string_sites(const std::vector<int>& sites, int m_star) {
+        off_diag_.set_string_sites(*this, sites, m_star);
+    }
+    void set_seam_mask(uint64_t mask) { off_diag_.set_seam_mask(mask); }
+    uint64_t get_seam_mask() const { return off_diag_.get_seam_mask(); }
+    const std::vector<int>& get_string_sites() const { return off_diag_.get_string_sites(); }
+    int get_m_star() const { return off_diag_.get_m_star(); }
+    const std::vector<int32_t>& get_state_at_seam_minus() const { return off_diag_.get_state_at_seam_minus(); }
+    const std::vector<int32_t>& get_state_at_seam_plus()  const { return off_diag_.get_state_at_seam_plus(); }
+    void recompute_seam_snapshots() { off_diag_.recompute_seam_snapshots(*this); }
+
+    HalfLineProposal build_half_line_proposal(int local_index, bool direction_right) const {
+        return off_diag_.build_half_line_proposal(*this, local_index, direction_right);
+    }
+    void commit_half_line_proposal(int local_index, const HalfLineProposal& prop) {
+        off_diag_.commit_half_line_proposal(*this, local_index, prop);
+    }
+    bool attempt_string_toggle(int local_index, double lambda) {
+        return off_diag_.attempt_string_toggle(*this, local_index, lambda);
+    }
+    void topology_sweep(double lambda) { off_diag_.topology_sweep(*this, lambda); }
+
     // Compute 4 bond weights with asymmetric delta per endpoint
     // delta_i = delta / z_eff[site_i],  delta_j = delta / z_eff[site_j]
     static inline void compute_bond_W_inline(double delta_i, double delta_j,
@@ -263,6 +309,8 @@ public:
     }
 
 private:
+    friend class QAQMCOffDiagonalCore;
+
     int N_, M_, M_total_;
     double Omega_, Rb_, delta_min_, delta_max_;
     double site_W_, site_W_max_;
@@ -303,6 +351,12 @@ private:
 
     // ── On-the-fly observable data ──────────────────────────────────────
     std::vector<int32_t> state_at_M_;          // spin config at symmetry point
+
+    // ── Off-diagonal string (X_C) component ──────────────────────────────
+    // All of its state (string_sites_, m_star_, seam_mask_, the two seam
+    // snapshots) lives inside this object now, not as QAQMCEngine members.
+    QAQMCOffDiagonalCore off_diag_;
+
     std::vector<std::vector<int>> loop_site_sets_;
     std::vector<std::vector<int>> string_site_sets_;
     std::vector<int> bulk_sites_;              // interior sites for density (empty = all sites)

@@ -266,6 +266,137 @@ def qaqmc_exact_asymmetric_observables(
     }
 
 
+def qaqmc_exact_string_zratio(
+    N: int,
+    Omega: float,
+    delta_min: float,
+    delta_max: float,
+    Rb: float,
+    M: int,
+    B_sets,
+    m_star: int | None = None,
+    pos: np.ndarray = None,
+    psi0: np.ndarray = None,
+    epsilon: float = 0.01,
+    neighbor_cutoff: int | None = None,
+    normalize_each_step: bool = True,
+):
+    """
+    Exact ground truth for the QAQMC off-diagonal string matrix elements
+
+        Z_B = <psi_L| P_L  X_B  P_R |psi_R>,      X_B = prod_{i in B} sigma_i^x
+
+    inserted at imaginary-time slice ``m_star`` (default: the ramp turning
+    point p=M, matching ``state_at_M_`` in the C++ engine). Generalizes
+    ``qaqmc_exact_asymmetric_observables``'s symmetric-cut construction to an
+    arbitrary cut position and to an X_B insertion instead of a plain overlap.
+
+    Convention (must match the C++ seam implementation): the cut sits *before*
+    operator index ``m_star`` in the 0-indexed operator string, i.e.
+    ``r_state`` includes operators ``0 .. m_star-1`` and ``l_state`` includes
+    operators ``m_star .. M_total-1``. Occupation index bit ``i`` = site ``i``
+    (matches ``build_rydberg_hamiltonian`` / ``_apply_minus_h_inplace_numba``).
+
+    Parameters
+    ----------
+    B_sets : iterable of iterables of int
+        Each element is a subset of sites (a candidate ``B``) to evaluate.
+        The empty set (``Z_empty``) is always computed as the normalization
+        baseline and does not need to be included explicitly.
+
+    Returns
+    -------
+    dict with:
+        'm_star' : int
+        'Z_empty': float                          -- Z at B = empty set
+        'Z_B'    : dict[frozenset[int], float]     -- Z_B for each requested B
+        'O_B'    : dict[frozenset[int], float]     -- Z_B / Z_empty
+    """
+    if M <= 0:
+        raise ValueError("M must be positive.")
+
+    dim = 1 << N
+    if psi0 is None:
+        psi = np.zeros(dim, dtype=np.float64)
+        psi[0] = 1.0
+    else:
+        psi = np.asarray(psi0, dtype=np.float64).copy()
+        n0 = np.linalg.norm(psi)
+        if n0 == 0.0:
+            raise ValueError("psi0 must have non-zero norm.")
+        psi /= n0
+
+    M_total = 2 * M
+    if m_star is None:
+        m_star = M
+    if not (0 <= m_star <= M_total):
+        raise ValueError(f"m_star must be in [0, {M_total}], got {m_star}.")
+
+    V, _, _, vij_list, bond_sites, coord_number = build_rydberg_vij(
+        N, Omega, Rb, pos, verbose=False, neighbor_cutoff=neighbor_cutoff,
+    )
+    n_tot, _dens_val, _mz_val, v_diag = _build_diag_terms_numba(N, dim, V)
+
+    d_lambda = (delta_max - delta_min) / M
+    lambdas = np.empty(M_total, dtype=np.float64)
+    for p in range(M):
+        lambdas[p] = delta_min + p * d_lambda
+    for p in range(M, M_total):
+        lambdas[p] = delta_max - (p - M) * d_lambda
+
+    offsets = np.empty(M_total, dtype=np.float64)
+    for t in range(M_total):
+        offsets[t] = _qaqmc_slice_offset(lambdas[t], vij_list, bond_sites, coord_number, epsilon)
+
+    # r_state = H(m_star-1) ... H(0) psi   (operators strictly before the cut)
+    r_state = psi.copy()
+    tmp = np.empty(dim, dtype=np.float64)
+    for t in range(m_star):
+        _apply_minus_h_inplace_numba(r_state, tmp, lambdas[t], Omega, N, n_tot, v_diag, offsets[t])
+        r_state, tmp = tmp, r_state
+        if normalize_each_step:
+            nr = np.linalg.norm(r_state)
+            if nr > 0:
+                r_state /= nr
+
+    # l_state = H(m_star) ... H(M_total-1) psi   (operators at/after the cut,
+    # accumulated backward from the same boundary state)
+    l_state = psi.copy()
+    for t in range(M_total - 1, m_star - 1, -1):
+        _apply_minus_h_inplace_numba(l_state, tmp, lambdas[t], Omega, N, n_tot, v_diag, offsets[t])
+        l_state, tmp = tmp, l_state
+        if normalize_each_step:
+            nl = np.linalg.norm(l_state)
+            if nl > 0:
+                l_state /= nl
+
+    def _z_for_mask(mask: int) -> float:
+        if mask == 0:
+            return float(np.sum(l_state * r_state))
+        idx = np.arange(dim) ^ mask
+        return float(np.sum(l_state * r_state[idx]))
+
+    z_empty = _z_for_mask(0)
+
+    z_b = {}
+    o_b = {}
+    for sites in B_sets:
+        sites = frozenset(sites)
+        mask = 0
+        for i in sites:
+            mask |= (1 << i)
+        z = _z_for_mask(mask)
+        z_b[sites] = z
+        o_b[sites] = z / z_empty if z_empty != 0.0 else float("nan")
+
+    return {
+        "m_star": m_star,
+        "Z_empty": z_empty,
+        "Z_B": z_b,
+        "O_B": o_b,
+    }
+
+
 # ── Real-time dynamics ────────────────────────────────────────────────────────
 
 @njit(cache=True, nogil=True)
