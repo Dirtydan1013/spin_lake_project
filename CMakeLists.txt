@@ -14,6 +14,7 @@ find_package(OpenMP)
 # ── Build the Python extension module ────────────────────────────────────────
 pybind11_add_module(qaqmc_cpp
     csrc/qaqmc_core.cpp
+    csrc/qaqmc_off_diagonal_core.cpp
     csrc/qaqmc_renyi_core.cpp
     csrc/qaqmc_renyi_work_core.cpp
     csrc/sse_core.cpp

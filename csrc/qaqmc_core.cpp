@@ -4,16 +4,6 @@
 #include <sstream>
 #include <stdexcept>
 
-// ─── Helper: uniform random [0, 1) ──────────────────────────────────────────
-static inline double uniform01(std::mt19937_64& rng) {
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    return dist(rng);
-}
-static inline int randint(std::mt19937_64& rng, int n) {
-    std::uniform_int_distribution<int> dist(0, n - 1);
-    return dist(rng);
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 // V_ij builder
 // ═════════════════════════════════════════════════════════════════════════════
@@ -408,6 +398,11 @@ void QAQMCEngine::set_op_string(const int32_t* types, const int32_t* sites, int 
     std::memcpy(op_types_.data(), types, len * sizeof(int32_t));
     std::memcpy(op_sites_.data(), sites, len * sizeof(int32_t));
 }
+
+// Off-diagonal string (X_C) seam/half-line/topology_sweep methods
+// (set_string_sites, recompute_seam_snapshots, build_half_line_proposal,
+// commit_half_line_proposal, attempt_string_toggle, topology_sweep) live in
+// qaqmc_off_diagonal_core.cpp -- see qaqmc_off_diagonal_core.hpp for why.
 
 // ─── On-the-fly observable helpers ───────────────────────────────────────────
 
@@ -962,6 +957,11 @@ void QAQMCEngine::diagonal_update() {
         // Capture state at symmetry point
         if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
 
+        // Off-diagonal string seam: no-op unless p == m_star_. See
+        // QAQMCOffDiagonalCore::on_diagonal_slice (qaqmc_off_diagonal_core.hpp)
+        // for the seam capture/XOR convention.
+        off_diag_.on_diagonal_slice(p, state);
+
         int ot = op_types_[p];
         if (ot == -1) {
             state[op_sites_[p]] ^= 1;
@@ -1089,6 +1089,10 @@ void QAQMCEngine::cluster_update() {
     //   Propagate from |0...0> boundary at tau=0
     std::fill(spin_now_.begin(), spin_now_.end(), 0);  // |0...0>
     for (int p = 0; p < M; ++p) {
+        // Off-diagonal string seam: same convention as diagonal_update(), so
+        // bond_spin_[p] for p >= m_star_ reflects the post-seam occupation.
+        off_diag_.on_cluster_slice(p, spin_now_);
+
         int ot = op_types_[p];
         if (ot == 2) {
             int b  = op_sites_[p];
