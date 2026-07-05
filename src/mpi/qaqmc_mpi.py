@@ -888,8 +888,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     # after every chunk, so a crash loses at most one chunk instead of the whole
     # run.  Repeated run_profile(n_equil=0, ...) calls continue the SAME Markov
     # chain (engine state persists), so this is statistically identical to one
-    # long call.  Layout:  data/M={M}_{nx}x{ny}_{timestamp}/rank{r}_chunk{c}.h5
-    # plus a one-time meta.h5 (geometry + params) written by rank 0.
+    # long call.  Layout:  data/M={M}_{nx}x{ny}_{timestamp}/rank{r}/chunk{c}.h5
+    # (one subdirectory per rank) plus a one-time meta.h5 (geometry + params)
+    # written by rank 0 at the run-dir root.
     if checkpoint_every_batches and checkpoint_every_batches > 0:
         if rank == 0:
             base_dir = os.path.dirname(filepath) or '.'
@@ -904,6 +905,10 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         n_chunks = ((my_n_samples + chunk_samples - 1) // chunk_samples
                     if my_n_samples > 0 else 0)
 
+        # One subdirectory per rank: run_dir/rank{r}/chunk{c}.h5
+        rank_dir = os.path.join(run_dir, f'rank{rank}')
+        os.makedirs(rank_dir, exist_ok=True)
+
         samples_done = 0
         c = 0
         while samples_done < my_n_samples:
@@ -915,7 +920,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 n_snapshots if n_snap_pts > 0 else 0,
                 occ_sf_nbatch if do_occ else 0)
             _write_result_h5(
-                os.path.join(run_dir, f'rank{rank}_chunk{c}.h5'),
+                os.path.join(rank_dir, f'chunk{c}.h5'),
                 {k: np.asarray(v) for k, v in res.items()},
                 attrs=dict(rank=rank, chunk=c, n_samples=n, batch_size=batch_size,
                            samples_cumulative=samples_done + n,
@@ -1443,8 +1448,8 @@ def main():
     parser.add_argument('--checkpoint_every_batches', type=int, default=0,
                         help='(profile mode) Level-1 incremental checkpointing: flush a '
                              'self-contained HDF5 file every N batches per rank into a '
-                             'per-run subfolder (data/M=..._<nx>x<ny>_<timestamp>/'
-                             'rank{r}_chunk{c}.h5). 0 = disabled (single combined file). '
+                             'per-rank subfolder (data/M=..._<nx>x<ny>_<timestamp>/'
+                             'rank{r}/chunk{c}.h5). 0 = disabled (single combined file). '
                              'A crash then loses at most one chunk. Pick N so N*batch_size '
                              'samples ~= 30-60 min of wall time.')
     # Loop / string sizes are auto-selected from (nx, ny):
