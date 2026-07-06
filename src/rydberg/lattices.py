@@ -541,3 +541,208 @@ def kagome_hex_centers(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
         for i in range(nx):
             centers.append(i * v1 + j * v2)
     return np.array(centers)
+
+
+# ─── kagome_bond_triangle observable support ─────────────────────────────────
+#
+# The cropped triangle lattice places atoms on the SAME infinite family of
+# points as generate_kagome_bond_lattice (kagome hexagonal-void edge midpoints,
+# C(i,j) + offset_k), but (i,j) ranges over the oversized (nx+1)x(ny+1) void
+# grid of kagome_edge_patch_graph and the crop polygon removes part of the
+# boundary voids' atoms.  Two hexagonal voids never share an edge, so every
+# atom carries a unique (i, j, k) label — all observable constructions written
+# in void coordinates (bulk sites, A_v bowties, Z loops, C_m strings, VBS
+# triangles, occ-SF cells) therefore carry over UNCHANGED; only the
+# (i,j,k) -> flat-index map and the "does this copy fit inside the crop"
+# filter differ.
+
+
+def kagome_triangle_ijk_map(nx: int, ny: int, a: float = 1.0) -> dict:
+    """Map (void_i, void_j, k) -> flat site index of the triangle lattice.
+
+    (i, j) ranges over the oversized (nx+1) x (ny+1) void grid; keys are only
+    present for atoms that survive the crop.  Every atom of
+    ``generate_kagome_bond_triangle_lattice(nx, ny, a)`` receives exactly one
+    label (asserted).
+    """
+    pos = generate_kagome_bond_triangle_lattice(nx, ny, a)
+    def key(p):
+        return (round(p[0] / a, 9), round(p[1] / a, 9))
+    by_pos = {key(p): s for s, p in enumerate(pos)}
+
+    v1 = np.array([a, 0.0])
+    v2 = np.array([a / 2, a * np.sqrt(3) / 2])
+    r = a * np.sqrt(3) / 4.0
+    offsets = np.array([
+        [r * np.cos(np.radians(30 + k * 60)),
+         r * np.sin(np.radians(30 + k * 60))]
+        for k in range(6)
+    ])
+
+    mapping = {}
+    for j in range(ny + 1):
+        for i in range(nx + 1):
+            centre = i * v1 + j * v2
+            for k in range(6):
+                s = by_pos.get(key(centre + offsets[k]))
+                if s is not None:
+                    mapping[(i, j, k)] = s
+    if len(mapping) != len(pos):
+        raise RuntimeError(
+            f"kagome_triangle_ijk_map: labelled {len(mapping)} of {len(pos)} atoms"
+        )
+    return mapping
+
+
+def _triangle_complete_voids(ijk_map: dict, nx: int, ny: int) -> set:
+    """Voids (i, j) of the oversized grid whose all 6 atoms survive the crop."""
+    return {
+        (i, j)
+        for j in range(ny + 1)
+        for i in range(nx + 1)
+        if all((i, j, k) in ijk_map for k in range(6))
+    }
+
+
+_BULK_PARTNERS_CACHE: dict | None = None
+
+
+def _bulk_partner_atoms() -> dict:
+    """For each sublattice k: the specific partner atoms (dv_i, dv_j, k')
+    within distance ~a that kagome_bulk_sites' partner-void requirement
+    implies.  On the un-cropped bond lattice "these atoms exist" is exactly
+    equivalent to "the two required partner voids are in the grid"; on the
+    cropped triangle lattice it is the faithful (atom-level) generalisation.
+    Derived geometrically once and cached.
+    """
+    global _BULK_PARTNERS_CACHE
+    if _BULK_PARTNERS_CACHE is not None:
+        return _BULK_PARTNERS_CACHE
+    a = 1.0
+    v1 = np.array([a, 0.0]); v2 = np.array([a / 2, a * np.sqrt(3) / 2])
+    r = a * np.sqrt(3) / 4
+    off = np.array([
+        [r * np.cos(np.radians(30 + 60 * k)), r * np.sin(np.radians(30 + 60 * k))]
+        for k in range(6)
+    ])
+    requirements = [
+        [(+1,  0), ( 0, +1)],  # k=0
+        [(-1, +1), ( 0, +1)],  # k=1
+        [(-1,  0), (-1, +1)],  # k=2
+        [(-1,  0), ( 0, -1)],  # k=3
+        [( 0, -1), (+1, -1)],  # k=4
+        [(+1,  0), (+1, -1)],  # k=5
+    ]
+    partners = {}
+    for k in range(6):
+        plist = []
+        for (di, dj) in requirements[k]:
+            centre = di * v1 + dj * v2
+            for kp in range(6):
+                if np.linalg.norm(centre + off[kp] - off[k]) < 1.001 * a:
+                    plist.append((di, dj, kp))
+        partners[k] = plist
+    _BULK_PARTNERS_CACHE = partners
+    return partners
+
+
+def kagome_triangle_bulk_sites(nx: int, ny: int, a: float = 1.0,
+                               ijk_map: dict | None = None) -> list:
+    """Interior atoms of the cropped triangle lattice.
+
+    Same physical criterion as kagome_bulk_sites — all inter-void partner
+    atoms within distance ~a exist — applied at the atom level, so a partner
+    void only partially removed by the crop still counts through its
+    surviving near atoms.  (On the un-cropped bond lattice this reduces
+    exactly to kagome_bulk_sites; verified in tests.)
+    """
+    if ijk_map is None:
+        ijk_map = kagome_triangle_ijk_map(nx, ny, a)
+    partners = _bulk_partner_atoms()
+    sites = []
+    for (i, j, k), s in ijk_map.items():
+        if all((i + di, j + dj, kp) in ijk_map for di, dj, kp in partners[k]):
+            sites.append(s)
+    return sorted(sites)
+
+
+def kagome_triangle_vertex_sites(nx: int, ny: int, a: float = 1.0,
+                                 interior_only: bool = True,
+                                 ijk_map: dict | None = None) -> list:
+    """A_v bowtie quadruples on the cropped triangle lattice.
+
+    Same three bond orientations as kagome_vertex_sites; a vertex is kept when
+    all 4 atoms survive the crop, and (interior_only) when at least one of the
+    two participating voids is complete — the cropped-lattice analogue of "at
+    least one void strictly interior".
+    """
+    if ijk_map is None:
+        ijk_map = kagome_triangle_ijk_map(nx, ny, a)
+    complete = _triangle_complete_voids(ijk_map, nx, ny)
+
+    def get4(quads):
+        out = [ijk_map.get(q) for q in quads]
+        return out if all(v is not None for v in out) else None
+
+    vertices = []
+    for j in range(ny + 1):
+        for i in range(nx + 1):
+            candidates = [
+                # H: (i,j) -- (i+1,j)
+                ((i + 1, j), [(i, j, 0), (i, j, 5), (i + 1, j, 2), (i + 1, j, 3)]),
+                # UR: (i,j) -- (i,j+1)
+                ((i, j + 1), [(i, j, 0), (i, j, 1), (i, j + 1, 3), (i, j + 1, 4)]),
+                # UL: (i,j) -- (i-1,j+1)
+                ((i - 1, j + 1), [(i, j, 1), (i, j, 2), (i - 1, j + 1, 4), (i - 1, j + 1, 5)]),
+            ]
+            for partner, quads in candidates:
+                flat = get4(quads)
+                if flat is None:
+                    continue
+                if interior_only and (i, j) not in complete and partner not in complete:
+                    continue
+                vertices.append(flat)
+    return vertices
+
+
+def kagome_triangle_multi_size_translations(nx: int, ny: int,
+                                            loop_sizes=(3,), string_sizes=(2,),
+                                            a: float = 1.0,
+                                            ijk_map: dict | None = None):
+    """Triangle-lattice counterpart of kagome_multi_size_translations.
+
+    The base loop/string shapes (void coordinates) are identical; translations
+    are enumerated over the oversized (nx+1)x(ny+1) void grid and a copy is
+    kept only when ALL of its atoms survive the crop.  Sizes that end up with
+    zero copies are dropped from the meta (matching the driver's convention).
+    """
+    if ijk_map is None:
+        ijk_map = kagome_triangle_ijk_map(nx, ny, a)
+    grid_nx, grid_ny = nx + 1, ny + 1
+
+    def translations(base_atoms):
+        i_s = [e[0] for e in base_atoms]
+        j_s = [e[1] for e in base_atoms]
+        sets = []
+        for dj in range(-min(j_s), grid_ny - max(j_s)):
+            for di in range(-min(i_s), grid_nx - max(i_s)):
+                flat = [ijk_map.get((i + di, j + dj, k)) for (i, j, k) in base_atoms]
+                if all(v is not None for v in flat):
+                    sets.append(flat)
+        return sets
+
+    all_loop_sets, all_string_sets = [], []
+    loop_meta, string_meta = [], []
+    for ls in loop_sizes:
+        lsets = translations(_make_base_loop(ls))
+        if lsets:
+            loop_meta.append({'size': ls, 'n_copies': len(lsets),
+                              'offset': len(all_loop_sets)})
+            all_loop_sets.extend(lsets)
+    for ss in string_sizes:
+        ssets = translations(_make_base_string(ss))
+        if ssets:
+            string_meta.append({'size': ss, 'n_copies': len(ssets),
+                                'offset': len(all_string_sets)})
+            all_string_sets.extend(ssets)
+    return all_loop_sets, all_string_sets, loop_meta, string_meta

@@ -108,6 +108,128 @@ def _build_occ2_sf_geometry(nx, ny, a):
     return cell_R, basis
 
 
+def _build_vbs_triangles_tri(nx, ny, ijk_map):
+    """kagome_bond_triangle version of _build_vbs_triangles: same up-triangle
+    construction in void coordinates, enumerated over the oversized
+    (nx+1)x(ny+1) void grid and kept only when all 3 corner atoms survive the
+    crop.  Reference triangles (even/odd column gauge) are chosen as the
+    horizontally-adjacent kept pair closest to the lattice centre."""
+    corners = []; par = []; vbs = []; ss = []
+    idx_by_ij = {}
+    t = 0
+    for j in range(ny + 1):
+        for i in range(nx + 1):
+            tri = [ijk_map.get((i, j, 0)), ijk_map.get((i + 1, j, 2)),
+                   ijk_map.get((i, j + 1, 4))]
+            if any(v is None for v in tri):
+                continue
+            corners += tri
+            par.append(i % 2)
+            vbs.append((-1) ** (i + j))
+            ss.append((-1) ** i)
+            idx_by_ij[(i, j)] = t
+            t += 1
+    if t < 2:
+        return None
+    # Adjacent (even, odd) reference pair nearest the centre of the void grid.
+    ci, cj = nx / 2.0, ny / 2.0
+    best = None
+    for (i, j), idx in idx_by_ij.items():
+        if i % 2 == 0 and (i + 1, j) in idx_by_ij:
+            d = (i - ci) ** 2 + (j - cj) ** 2
+            if best is None or d < best[0]:
+                best = (d, idx, idx_by_ij[(i + 1, j)])
+    if best is None:
+        return None
+    ref00, ref10 = best[1], best[2]
+    return (np.array(corners, np.int32), np.array(par, np.int32),
+            np.array(vbs, np.int32), np.array(ss, np.int32), ref00, ref10)
+
+
+def _build_occ_sf_geometry_tri(nx, ny, a, ijk_map, bulk_sites):
+    """kagome_bond_triangle version of _build_occ_sf_geometry: hexagon-void
+    unit cell on the oversized void grid.  Every atom has a unique (i,j,k)
+    label; α = k, cell_R = i·v1 + j·v2.  A cell is bulk-complete iff all 6 of
+    its atoms survive the crop AND all 6 are bulk."""
+    v1 = np.array([a, 0.0]); v2 = np.array([a/2.0, a*np.sqrt(3)/2.0])
+    N = len(ijk_map)
+    basis = np.empty(N, dtype=np.int32)
+    cell_R = np.empty((N, 2), dtype=np.float64)
+    for (i, j, k), s in ijk_map.items():
+        basis[s] = k
+        cell_R[s] = i * v1 + j * v2
+    bulk = set(bulk_sites)
+    in_bulk = np.zeros(N, dtype=np.int32)
+    for j in range(ny + 1):
+        for i in range(nx + 1):
+            atoms = [ijk_map.get((i, j, k)) for k in range(6)]
+            if all(s is not None and s in bulk for s in atoms):
+                for s in atoms:
+                    in_bulk[s] = 1
+    return cell_R, basis, in_bulk
+
+
+def _build_occ2_sf_geometry_tri(nx, ny, a, ijk_map):
+    """kagome_bond_triangle version of _build_occ2_sf_geometry: up+down
+    triangle-pair cells over the oversized void grid, kept when all 6 member
+    atoms survive the crop.  Atoms not in any kept pair get basis = -1."""
+    v1 = np.array([a, 0.0]); v2 = np.array([a/2.0, a*np.sqrt(3)/2.0])
+    N = len(ijk_map)
+    basis = np.full(N, -1, dtype=np.int32)
+    cell_R = np.zeros((N, 2), dtype=np.float64)
+    for J in range(ny + 1):
+        for I in range(nx + 1):
+            members = [ijk_map.get(q) for q in (
+                (I, J, 0), (I + 1, J, 2), (I, J + 1, 4),
+                (I + 1, J, 1), (I, J + 1, 5), (I + 1, J + 1, 3))]
+            if any(s is None for s in members):
+                continue
+            R = I * v1 + J * v2
+            for alpha, s in enumerate(members):
+                basis[s] = alpha
+                cell_R[s] = R
+    return cell_R, basis
+
+
+def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None):
+    """bulk sites, loop/string translation sets (+meta), and A_v vertex sets
+    for either kagome bond lattice.  Returns (bulk, loop_sets, string_sets,
+    loop_meta, string_meta, vertex_sets, ijk_map) — ijk_map is None for
+    kagome_bond and the (i,j,k)->index map for kagome_bond_triangle."""
+    if lattice == 'kagome_bond_triangle':
+        from src.rydberg.lattices import (
+            kagome_triangle_bulk_sites,
+            kagome_triangle_ijk_map,
+            kagome_triangle_multi_size_translations,
+            kagome_triangle_vertex_sites,
+        )
+        ijk_map = kagome_triangle_ijk_map(nx, ny, 1.0)
+        # The oversized void grid admits one more valid size than the plain
+        # bond lattice; sizes that end up with zero surviving copies are
+        # dropped by the builder.
+        if loop_sizes is None:
+            loop_sizes = list(range(2, min(nx, ny) + 1))
+        if string_sizes is None:
+            string_sizes = list(range(1, min(nx, ny) + 1))
+        bulk = kagome_triangle_bulk_sites(nx, ny, 1.0, ijk_map=ijk_map)
+        loop_sets, string_sets, loop_meta, string_meta = (
+            kagome_triangle_multi_size_translations(
+                nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes,
+                a=1.0, ijk_map=ijk_map))
+        vertex_sets = kagome_triangle_vertex_sites(nx, ny, 1.0, ijk_map=ijk_map)
+        return bulk, loop_sets, string_sets, loop_meta, string_meta, vertex_sets, ijk_map
+
+    if loop_sizes is None:
+        loop_sizes = list(range(2, min(nx, ny)))
+    if string_sizes is None:
+        string_sizes = list(range(1, min(nx, ny)))
+    bulk = kagome_bulk_sites(nx, ny)
+    loop_sets, string_sets, loop_meta, string_meta = kagome_multi_size_translations(
+        nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
+    vertex_sets = kagome_vertex_sites(nx, ny)
+    return bulk, loop_sets, string_sets, loop_meta, string_meta, vertex_sets, None
+
+
 def _build_occ_q_grid(grid_n, a):
     """2D q-grid over one BZ of the triangular Bravais lattice.
     Returns (q_points (grid_n², 2), frac (grid_n², 2) fractional coords for plotting)."""
@@ -424,7 +546,8 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                      measure_every=1, filepath='data/qaqmc_onthefly.h5',
                      neighbor_cutoff=None, delta_groups=600, omp_threads=0,
                      nx=6, ny=6,
-                     loop_sizes=None, string_sizes=None, verbose=True):
+                     loop_sizes=None, string_sizes=None,
+                     lattice='kagome_bond', verbose=True):
     """
     MPI-parallel QAQMC with on-the-fly observable computation.
 
@@ -476,21 +599,14 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     if engine._cpp_engine is None:
         raise RuntimeError("On-the-fly mode requires the C++ backend")
 
-    # Set bulk sites for density (interior atoms only)
-    bulk = kagome_bulk_sites(nx, ny)
+    # Lattice-aware bulk sites + loop/string observable sites (multi-size).
+    (bulk, loop_sets, string_sets, loop_meta, string_meta,
+     _vertex_sets, _tri_map) = _lattice_observables(
+        lattice, nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
     engine._cpp_engine.set_bulk_sites(bulk)
-
-    # Set loop/string observable sites (multi-size).
-    # Default: enumerate all geometrically valid sizes for this lattice:
-    #   loop sizes   = 2 .. min(nx, ny) - 1
-    #   string sizes = 1 .. min(nx, ny) - 1
-    if loop_sizes is None:
-        loop_sizes = list(range(2, min(nx, ny)))
-    if string_sizes is None:
-        string_sizes = list(range(1, min(nx, ny)))
-    loop_sets, string_sets, loop_meta, string_meta = kagome_multi_size_translations(
-        nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
     engine._cpp_engine.set_observable_sites(loop_sets, string_sets)
+    loop_sizes = [m['size'] for m in loop_meta]
+    string_sizes = [m['size'] for m in string_meta]
 
     if verbose and rank == 0:
         print(f"[MPI-OTF] bulk sites: {len(bulk)} / {N} (interior atoms only)")
@@ -705,6 +821,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     sf_q_points=None, sf_delta_points=None,
                     snapshot_deltas=None, n_snapshots=0,
                     occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
+                    lattice='kagome_bond',
                     verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
@@ -758,21 +875,13 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     if engine._cpp_engine is None:
         raise RuntimeError("Profile mode requires the C++ backend")
 
-    bulk = kagome_bulk_sites(nx, ny)
+    # Lattice-aware observable geometry (kagome_bond or kagome_bond_triangle).
+    (bulk, loop_sets, string_sets, loop_meta, string_meta,
+     vertex_sets, tri_ijk_map) = _lattice_observables(
+        lattice, nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
     engine._cpp_engine.set_bulk_sites(bulk)
 
-    # Default: enumerate all geometrically valid loop/string sizes:
-    #   loop sizes   = 2 .. min(nx, ny) - 1   (n_copies = (nx-s)(ny-s))
-    #   string sizes = 1 .. min(nx, ny) - 1
-    if loop_sizes is None:
-        loop_sizes = list(range(2, min(nx, ny)))
-    if string_sizes is None:
-        string_sizes = list(range(1, min(nx, ny)))
-    loop_sets, string_sets, loop_meta, string_meta = kagome_multi_size_translations(
-        nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
-
     # A_v vertex operator: append to loop_sets, track offset
-    vertex_sets = kagome_vertex_sites(nx, ny)
     n_vertex    = len(vertex_sets)
     vertex_offset = len(loop_sets)
     all_loop_sets = loop_sets + vertex_sets
@@ -780,8 +889,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     engine._cpp_engine.set_observable_sites(all_loop_sets, string_sets)
 
     # VBS/SS order parameters (paper Eq. 5-6): measured at every profile point,
-    # batched like Z_l.  Always on for kagome_bond lattices large enough.
-    vbs_tri = _build_vbs_triangles(nx, ny)
+    # batched like Z_l.  Always on for kagome lattices large enough.
+    if lattice == 'kagome_bond_triangle':
+        vbs_tri = _build_vbs_triangles_tri(nx, ny, tri_ijk_map)
+    else:
+        vbs_tri = _build_vbs_triangles(nx, ny)
     do_vbs = vbs_tri is not None
     if do_vbs:
         corners, par, vsign, ssign, ref00, ref10 = vbs_tri
@@ -822,7 +934,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     if do_occ:
         # q·R phases are dimensionless (the lattice constant cancels between the
         # reciprocal vectors and the cell positions), so use a=1.0 internally.
-        occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry(nx, ny, 1.0)
+        if lattice == 'kagome_bond_triangle':
+            occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry_tri(
+                nx, ny, 1.0, tri_ijk_map, bulk)
+        else:
+            occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry(nx, ny, 1.0)
         occ_q_points, occ_q_frac = _build_occ_q_grid(int(occ_sf_grid_n), 1.0)
         req = np.asarray(occ_sf_delta_points, dtype=np.float64)
         occ_pt_indices = np.unique(np.array(
@@ -831,7 +947,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         engine._cpp_engine.set_occ_sf_q_points(occ_q_points)
         engine._cpp_engine.set_occ_sf_point_indices(occ_pt_indices)
         # Second unit cell: up+down triangle pair (bulk tiling), same q-grid.
-        occ2_cell_R, occ2_basis = _build_occ2_sf_geometry(nx, ny, 1.0)
+        if lattice == 'kagome_bond_triangle':
+            occ2_cell_R, occ2_basis = _build_occ2_sf_geometry_tri(
+                nx, ny, 1.0, tri_ijk_map)
+        else:
+            occ2_cell_R, occ2_basis = _build_occ2_sf_geometry(nx, ny, 1.0)
         engine._cpp_engine.set_occ2_sf_site_map(occ2_cell_R, occ2_basis, 6)
     n_occ_pts = len(occ_pt_indices)
 
@@ -857,9 +977,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                   f"δ-points (δ≈{np.round(prof_delta[snap_pt_indices], 3).tolist()})")
         if do_occ:
             n_bulk_cells = int(occ_in_bulk.sum() // 6)
+            n_cells_total = ((nx + 1) * (ny + 1)
+                             if lattice == 'kagome_bond_triangle' else nx * ny)
             print(f"[MPI-PROF]   occ-SF matrix: {occ_sf_grid_n}×{occ_sf_grid_n} q-grid, "
                   f"{n_occ_pts} δ-points (δ≈{np.round(prof_delta[occ_pt_indices],3).tolist()}), "
-                  f"{occ_sf_nbatch} super-bins/rank, bulk cells={n_bulk_cells}/{nx*ny}")
+                  f"{occ_sf_nbatch} super-bins/rank, bulk cells={n_bulk_cells}/{n_cells_total}")
 
     # Equilibration
     comm.Barrier()
@@ -1425,7 +1547,7 @@ def main():
     parser.add_argument('--omp_threads', type=int, default=1)
     parser.add_argument('--filepath', type=str, default='data/qaqmc_mpi.h5')
     parser.add_argument('--lattice', type=str, default='kagome_bond',
-                        help='Lattice type: kagome_bond')
+                        help='Lattice type: kagome_bond | kagome_bond_triangle')
     parser.add_argument('--nx', type=int, default=1)
     parser.add_argument('--ny', type=int, default=1)
     parser.add_argument('--a', type=float, default=4.0, help='Lattice constant')
@@ -1515,6 +1637,14 @@ def main():
             a=config.get('a', 4.0)
         )
         config['N'] = len(pos)
+    elif config.get('lattice') == 'kagome_bond_triangle':
+        from src.rydberg.lattices import generate_kagome_bond_triangle_lattice
+        pos = generate_kagome_bond_triangle_lattice(
+            nx=config.get('nx', 1),
+            ny=config.get('ny', 1),
+            a=config.get('a', 4.0)
+        )
+        config['N'] = len(pos)
 
     mode = config.get('mode', 'store')
 
@@ -1547,6 +1677,7 @@ def main():
             occ_sf_delta_points=config.get('occ_sf_delta_points'),
             occ_sf_grid_n=config.get('occ_sf_grid_n', 0),
             occ_sf_nbatch=config.get('occ_sf_nbatch', 4),
+            lattice=config.get('lattice', 'kagome_bond'),
         )
     elif mode == 'onthefly':
         run_mpi_onthefly(
@@ -1561,6 +1692,7 @@ def main():
             delta_groups=config.get('delta_groups', 600),
             omp_threads=config.get('omp_threads', 1),
             nx=config.get('nx', 1), ny=config.get('ny', 1),
+            lattice=config.get('lattice', 'kagome_bond'),
         )
     else:
         run_mpi(
