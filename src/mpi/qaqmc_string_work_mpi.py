@@ -239,7 +239,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="MPI driver for the QAQMC off-diagonal string-work engine")
     parser.add_argument("--lattice", type=str, default="1d_chain",
-                        choices=["1d_chain", "kagome_bond"])
+                        choices=["1d_chain", "kagome_bond", "kagome_bond_triangle"])
     parser.add_argument("--N", type=int, default=0,
                         help="(1d_chain) number of sites")
     parser.add_argument("--nx", type=int, default=6, help="(kagome_bond) cells in x")
@@ -286,6 +286,12 @@ def main():
             raise ValueError("--N must be >0 for 1d_chain")
         pos = np.asarray(generate_1d_chain(args.N, args.a), dtype=np.float64)
         N = args.N
+    elif args.lattice == "kagome_bond_triangle":
+        from src.rydberg.lattices import generate_kagome_bond_triangle_lattice
+        pos = np.ascontiguousarray(
+            generate_kagome_bond_triangle_lattice(args.nx, args.ny, args.a),
+            dtype=np.float64)
+        N = len(pos)
     else:
         pos = np.ascontiguousarray(
             generate_kagome_bond_lattice(args.nx, args.ny, args.a), dtype=np.float64)
