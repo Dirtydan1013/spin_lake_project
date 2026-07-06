@@ -266,6 +266,133 @@ def qaqmc_exact_asymmetric_observables(
     }
 
 
+def qaqmc_exact_renyi2_at_cut(
+    N: int,
+    Omega: float,
+    delta_min: float,
+    delta_max: float,
+    Rb: float,
+    M: int,
+    A_mask,
+    m_star: int | None = None,
+    pos: np.ndarray = None,
+    psi0: np.ndarray = None,
+    epsilon: float = 0.01,
+    neighbor_cutoff: int | None = None,
+    normalize_each_step: bool = True,
+):
+    """
+    Exact Renyi-2 swap estimator at an arbitrary QAQMC imaginary-time cut.
+
+    The cut sits before operator index ``m_star``.  The right state contains
+    operators ``0 .. m_star-1`` and the left state contains operators
+    ``m_star .. 2M-1``.  For an off-center cut these two states differ, so the
+    quantity matched by the two-replica swap estimator is
+
+        rho_A = Tr_Ac |R><L| / <L|R>,
+        S2(A) = -log Tr_A rho_A^2.
+
+    Near the turning point this approaches the usual midpoint pure-state
+    Renyi-2 entropy as the QAQMC discretization is refined, but at finite M the
+    exact swap estimator is this left/right transition-density quantity.
+    """
+    if M <= 0:
+        raise ValueError("M must be positive.")
+
+    A_mask = np.asarray(A_mask, dtype=np.uint8)
+    if A_mask.shape != (N,):
+        raise ValueError(f"A_mask must have shape ({N},), got {A_mask.shape}.")
+
+    dim = 1 << N
+    if psi0 is None:
+        psi = np.zeros(dim, dtype=np.float64)
+        psi[0] = 1.0
+    else:
+        psi = np.asarray(psi0, dtype=np.float64).copy()
+        n0 = np.linalg.norm(psi)
+        if n0 == 0.0:
+            raise ValueError("psi0 must have non-zero norm.")
+        psi /= n0
+
+    M_total = 2 * M
+    if m_star is None:
+        m_star = M
+    if not (0 <= m_star <= M_total):
+        raise ValueError(f"m_star must be in [0, {M_total}], got {m_star}.")
+
+    V, _, _, vij_list, bond_sites, coord_number = build_rydberg_vij(
+        N, Omega, Rb, pos, verbose=False, neighbor_cutoff=neighbor_cutoff,
+    )
+    n_tot, _dens_val, _mz_val, v_diag = _build_diag_terms_numba(N, dim, V)
+
+    d_lambda = (delta_max - delta_min) / M
+    lambdas = np.empty(M_total, dtype=np.float64)
+    for p in range(M):
+        lambdas[p] = delta_min + p * d_lambda
+    for p in range(M, M_total):
+        lambdas[p] = delta_max - (p - M) * d_lambda
+
+    offsets = np.empty(M_total, dtype=np.float64)
+    for t in range(M_total):
+        offsets[t] = _qaqmc_slice_offset(lambdas[t], vij_list, bond_sites, coord_number, epsilon)
+
+    r_state = psi.copy()
+    tmp = np.empty(dim, dtype=np.float64)
+    for t in range(m_star):
+        _apply_minus_h_inplace_numba(r_state, tmp, lambdas[t], Omega, N, n_tot, v_diag, offsets[t])
+        r_state, tmp = tmp, r_state
+        if normalize_each_step:
+            nr = np.linalg.norm(r_state)
+            if nr > 0.0:
+                r_state /= nr
+
+    l_state = psi.copy()
+    for t in range(M_total - 1, m_star - 1, -1):
+        _apply_minus_h_inplace_numba(l_state, tmp, lambdas[t], Omega, N, n_tot, v_diag, offsets[t])
+        l_state, tmp = tmp, l_state
+        if normalize_each_step:
+            nl = np.linalg.norm(l_state)
+            if nl > 0.0:
+                l_state /= nl
+
+    overlap = float(np.dot(l_state, r_state))
+    if abs(overlap) < 1e-300:
+        raise RuntimeError(f"Asymmetric Renyi denominator nearly zero at m_star={m_star}.")
+
+    A_sites = [i for i in range(N) if A_mask[i] == 1]
+    Ac_sites = [i for i in range(N) if A_mask[i] == 0]
+    nA, nAc = len(A_sites), len(Ac_sites)
+    r_mat = np.zeros((1 << nA, 1 << nAc), dtype=np.float64)
+    l_mat = np.zeros_like(r_mat)
+    for s in range(dim):
+        bits = [(s >> i) & 1 for i in range(N)]
+        a = sum(bits[A_sites[j]] << j for j in range(nA))
+        ac = sum(bits[Ac_sites[j]] << j for j in range(nAc))
+        r_mat[a, ac] = r_state[s]
+        l_mat[a, ac] = l_state[s]
+
+    rho_A = (r_mat @ l_mat.T) / overlap
+    purity = float(np.trace(rho_A @ rho_A))
+    if purity <= 0.0:
+        raise RuntimeError(f"Asymmetric Renyi purity is non-positive: {purity}.")
+
+    if m_star < M_total:
+        delta_at_cut = float(lambdas[m_star])
+    else:
+        delta_at_cut = float(delta_min)
+
+    return {
+        "m_star": int(m_star),
+        "delta_at_cut": delta_at_cut,
+        "overlap": overlap,
+        "purity": purity,
+        "S2": -float(np.log(purity)),
+        "rho_A": rho_A,
+        "right_state": r_state,
+        "left_state": l_state,
+    }
+
+
 def qaqmc_exact_string_zratio(
     N: int,
     Omega: float,
