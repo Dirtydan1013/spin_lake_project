@@ -211,7 +211,10 @@ def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None):
             loop_sizes = list(range(2, min(nx, ny) + 1))
         if string_sizes is None:
             string_sizes = list(range(1, min(nx, ny) + 1))
-        bulk = kagome_triangle_bulk_sites(nx, ny, 1.0, ijk_map=ijk_map)
+        # No bulk restriction on the cropped triangle lattice: every atom
+        # (including boundary ones) belongs to at least one complete blockade
+        # triangle, so density / SF measurements use ALL sites.
+        bulk = sorted(ijk_map.values())
         loop_sets, string_sets, loop_meta, string_meta = (
             kagome_triangle_multi_size_translations(
                 nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes,
@@ -960,7 +963,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         n_points = M_total // profile_step
         print(f"[MPI-PROF] M_total={M_total}, profile_step={profile_step}, "
               f"n_points={n_points}")
-        print(f"[MPI-PROF] bulk={len(bulk)}/{N} (interior atoms only), "
+        bulk_note = ("all atoms; complete blockade triangles everywhere"
+                     if lattice == 'kagome_bond_triangle' else "interior atoms only")
+        print(f"[MPI-PROF] bulk={len(bulk)}/{N} ({bulk_note}), "
               f"{len(loop_sets)} loop copies / {len(string_sets)} string copies / "
               f"{n_vertex} A_v vertices")
         for m in loop_meta:
