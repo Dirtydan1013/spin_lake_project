@@ -91,6 +91,43 @@ void QAQMCRenyiWorkEngine::set_lambda_schedule(const std::vector<double>& lambda
     lambda_schedule_ = lambdas;
 }
 
+void QAQMCRenyiWorkEngine::export_start_config(
+    std::vector<int32_t>& types0, std::vector<int32_t>& sites0,
+    std::vector<int32_t>& types1, std::vector<int32_t>& sites1) const {
+    if (backend_.has_op_string_checkpoint()) {
+        // The checkpoint is refreshed at each trajectory start and is always
+        // a clean A_start-sector configuration.
+        types0 = backend_.get_checkpoint_op_types(0);
+        sites0 = backend_.get_checkpoint_op_sites(0);
+        types1 = backend_.get_checkpoint_op_types(1);
+        sites1 = backend_.get_checkpoint_op_sites(1);
+    } else {
+        types0 = backend_.get_op_types(0);
+        sites0 = backend_.get_op_sites(0);
+        types1 = backend_.get_op_types(1);
+        sites1 = backend_.get_op_sites(1);
+    }
+}
+
+void QAQMCRenyiWorkEngine::import_start_config(
+    const int32_t* types0, const int32_t* sites0,
+    const int32_t* types1, const int32_t* sites1, int len) {
+    if (len != 2 * backend_.get_M()) {
+        throw std::runtime_error(
+            "import_start_config: op-string length must equal M_total");
+    }
+    // Walk the backend to the A_start sector (mask + mode), then install the
+    // configuration and seed the checkpoint chain so run_trajectories'
+    // reset_to_start_sector restores it without any thermalization.
+    B_mask_.assign(N_, 0);
+    backend_.set_A_mask(A_start_mask_.data(), N_);
+    backend_.set_mode(QAQMCRenyiEngine::Mode::Work);
+    backend_.set_replica_op_string(0, types0, sites0, len);
+    backend_.set_replica_op_string(1, types1, sites1, len);
+    backend_.recompute_midpoint_states();
+    backend_.save_op_string_checkpoint();
+}
+
 void QAQMCRenyiWorkEngine::set_sweeps_per_lambda(int n_topology_sweeps, int n_qaqmc_sweeps) {
     if (n_topology_sweeps < 0 || n_qaqmc_sweeps < 0) {
         throw std::runtime_error("sweeps_per_lambda must be non-negative");

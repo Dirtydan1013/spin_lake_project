@@ -171,6 +171,14 @@ public:
     void restore_op_string_checkpoint();
     bool has_op_string_checkpoint() const { return op_ckpt_valid_; }
     void invalidate_op_string_checkpoint() { op_ckpt_valid_ = false; }
+    // Read access to the saved checkpoint (warm-start export).  Only valid
+    // when has_op_string_checkpoint() is true.
+    const std::vector<int32_t>& get_checkpoint_op_types(int replica) const {
+        return op_ckpt_types_[replica];
+    }
+    const std::vector<int32_t>& get_checkpoint_op_sites(int replica) const {
+        return op_ckpt_sites_[replica];
+    }
     void set_indicator_site(int site);
     int get_indicator_site() const { return indicator_site_; }
     void reset_indicator();

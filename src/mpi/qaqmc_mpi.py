@@ -825,6 +825,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     snapshot_deltas=None, n_snapshots=0,
                     occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
                     lattice='kagome_bond',
+                    config_in=None, config_out=None,
                     verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
@@ -877,6 +878,51 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
     if engine._cpp_engine is None:
         raise RuntimeError("Profile mode requires the C++ backend")
+
+    # ── Warm start: load a previously saved final configuration ─────────────
+    # When config_in is given, each rank installs its saved operator string
+    # (+ RNG state) and thermalization is skipped (n_equil forced to 0).
+    if config_in:
+        from src.mpi.warm_start import check_config_compat, load_rank_config
+        cfg = load_rank_config(config_in, rank, verbose=(rank == 0 and verbose))
+        if cfg is None:
+            raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
+        check_config_compat(cfg, dict(N=N, M_total=2 * M, lattice=str(lattice)),
+                            f"profile rank {rank}")
+        types = np.ascontiguousarray(cfg["op_types"], dtype=np.int32)
+        sites = np.ascontiguousarray(cfg["op_sites"], dtype=np.int32)
+        if len(types) != 2 * M:
+            raise ValueError(f"[warm-start] op string length {len(types)} != M_total {2*M}")
+        engine._cpp_engine.set_op_string(types, sites)
+        rng_state = cfg["attrs"].get("rng_state")
+        if rng_state is not None and int(cfg["attrs"].get("rank", -1)) == rank:
+            engine._cpp_engine.set_rng_state(rng_state)
+        n_equil = 0
+        if rank == 0 and verbose:
+            print(f"[MPI-PROF] warm start from {config_in} — n_equil forced to 0",
+                  flush=True)
+
+    # ── Warm start: save the final configuration at every exit ──────────────
+    # Each rank stashes its final operator string + RNG state so a later run
+    # can `config_in` it and skip thermalization entirely.
+    def _save_final_config():
+        out_dir = config_out
+        if not out_dir and filepath:
+            base = str(filepath)
+            out_dir = (base[:-3] if base.endswith('.h5') else base) + '_configs'
+        if not out_dir:
+            return
+        from src.mpi.warm_start import save_rank_config
+        save_rank_config(
+            out_dir, rank,
+            datasets=dict(
+                op_types=np.asarray(engine._cpp_engine.op_types, dtype=np.int32),
+                op_sites=np.asarray(engine._cpp_engine.op_sites, dtype=np.int32)),
+            attrs=dict(N=int(N), M_total=int(2 * M), lattice=str(lattice),
+                       seed=int(rank_seed),
+                       rng_state=engine._cpp_engine.get_rng_state()))
+        if rank == 0 and verbose:
+            print(f"[MPI-PROF] final configs saved → {out_dir}", flush=True)
 
     # Lattice-aware observable geometry (kagome_bond or kagome_bond_triangle).
     (bulk, loop_sets, string_sets, loop_meta, string_meta,
@@ -1084,6 +1130,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                            checkpoint_every_batches=int(checkpoint_every_batches)))
             print(f"[MPI-PROF] checkpoint run dir: {run_dir}", flush=True)
 
+        _save_final_config()
         comm.Barrier()
         t_sample = time.perf_counter() - t0
         if verbose and rank == 0:
@@ -1527,6 +1574,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             comm.Send(np.ascontiguousarray(my_sf_a3), dest=0, tag=820 + rank)
             comm.Send(np.ascontiguousarray(my_sf_a4), dest=0, tag=850 + rank)
 
+    _save_final_config()
     comm.Barrier()
     return filepath
 
@@ -1553,6 +1601,13 @@ def main():
     parser.add_argument('--filepath', type=str, default='data/qaqmc_mpi.h5')
     parser.add_argument('--lattice', type=str, default='kagome_bond',
                         help='Lattice type: kagome_bond | kagome_bond_triangle')
+    parser.add_argument('--config_in', type=str, default=None,
+                        help='(profile mode) warm-start directory of rank{r}.h5 final '
+                             'configurations from a previous run; when given, '
+                             'n_equil is forced to 0 (thermalization skipped)')
+    parser.add_argument('--config_out', type=str, default=None,
+                        help='(profile mode) where to save final configurations '
+                             '(default: <filepath minus .h5>_configs)')
     parser.add_argument('--nx', type=int, default=1)
     parser.add_argument('--ny', type=int, default=1)
     parser.add_argument('--a', type=float, default=4.0, help='Lattice constant')
@@ -1683,6 +1738,8 @@ def main():
             occ_sf_grid_n=config.get('occ_sf_grid_n', 0),
             occ_sf_nbatch=config.get('occ_sf_nbatch', 4),
             lattice=config.get('lattice', 'kagome_bond'),
+            config_in=config.get('config_in'),
+            config_out=config.get('config_out'),
         )
     elif mode == 'onthefly':
         run_mpi_onthefly(

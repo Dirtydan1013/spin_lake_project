@@ -1409,6 +1409,34 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         "Convenience: equivalent to set_region_pair(zeros, A_mask). "
         "Corresponds to the paper's ∅→A case.")
 
+        .def("export_start_config", [](const QAQMCRenyiWorkEngine& self) {
+            std::vector<int32_t> t0, s0, t1, s1;
+            self.export_start_config(t0, s0, t1, s1);
+            auto arr = [](const std::vector<int32_t>& v) {
+                return py::array_t<int32_t>(v.size(), v.data());
+            };
+            return py::make_tuple(arr(t0), arr(s0), arr(t1), arr(s1));
+        },
+        "Warm-start export: (types0, sites0, types1, sites1) of the clean "
+        "A_start-sector configuration (the checkpoint if one exists).")
+
+        .def("import_start_config", [](QAQMCRenyiWorkEngine& self,
+                                       py::array_t<int32_t> t0, py::array_t<int32_t> s0,
+                                       py::array_t<int32_t> t1, py::array_t<int32_t> s1) {
+            auto bt0 = t0.request(); auto bs0 = s0.request();
+            auto bt1 = t1.request(); auto bs1 = s1.request();
+            const auto len = bt0.shape[0];
+            if (bs0.shape[0] != len || bt1.shape[0] != len || bs1.shape[0] != len)
+                throw std::runtime_error("import_start_config: array length mismatch");
+            self.import_start_config(
+                static_cast<const int32_t*>(bt0.ptr), static_cast<const int32_t*>(bs0.ptr),
+                static_cast<const int32_t*>(bt1.ptr), static_cast<const int32_t*>(bs1.ptr),
+                static_cast<int>(len));
+        }, py::arg("types0"), py::arg("sites0"), py::arg("types1"), py::arg("sites1"),
+        "Warm-start import: install a previously exported A_start-sector "
+        "configuration (set_region_pair with the same pair must be called "
+        "first).  Seeds the checkpoint chain so thermalize() can be skipped.")
+
         .def("set_lambda_schedule", [](QAQMCRenyiWorkEngine& self,
                                        py::array_t<double> lambdas) {
             auto b = lambdas.request();

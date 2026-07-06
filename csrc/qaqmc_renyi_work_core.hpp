@@ -66,6 +66,18 @@ public:
     // Per-λ-step counts.  v1 defaults to 1 each, aligned with paper.
     void set_sweeps_per_lambda(int n_topology_sweeps, int n_qaqmc_sweeps);
 
+    // ── Warm-start support ────────────────────────────────────────────────
+    // export_start_config copies the A_start-sector configuration (the saved
+    // checkpoint if one exists — always a clean A_start config; otherwise the
+    // live op strings) for both replicas.  import_start_config installs a
+    // previously exported configuration: requires set_region_pair to have
+    // been called with the SAME region pair first; it recomputes the midpoint
+    // states and seeds the checkpoint chain, so thermalize() can be skipped.
+    void export_start_config(std::vector<int32_t>& types0, std::vector<int32_t>& sites0,
+                             std::vector<int32_t>& types1, std::vector<int32_t>& sites1) const;
+    void import_start_config(const int32_t* types0, const int32_t* sites0,
+                             const int32_t* types1, const int32_t* sites1, int len);
+
     // ── Execution ─────────────────────────────────────────────────────────
     // Thermalise in the start sector (backend A_mask_ = A_start, B = ∅, λ = 0).
     void thermalize(int n_steps);

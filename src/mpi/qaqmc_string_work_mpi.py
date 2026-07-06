@@ -91,7 +91,14 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         filepath: str | None = None,
                         checkpoint_every_trajectories: int = 0,
                         checkpoint_dir: str | None = None,
+                        config_in: str | None = None,
+                        config_out: str | None = None,
                         verbose: bool = True) -> dict | None:
+    """config_in: warm-start directory of rank{r}.h5 final configurations from
+    a previous run with the same (N, M, Hamiltonian); when given, per-K
+    thermalization is skipped (the loaded op string is already equilibrated —
+    the configuration is K-independent).  config_out: where each rank saves
+    its final configuration (default <filepath minus .h5>_configs)."""
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
@@ -124,7 +131,24 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             eng.set_lambda_schedule(cosine_schedule(int(K)))
         else:
             eng.set_lambda_schedule(np.linspace(0.0, 1.0, int(K) + 1))
-        eng.thermalize(n_thermalize, direction=direction)
+        if config_in:
+            from src.mpi.warm_start import check_config_compat, load_rank_config
+            cfg = load_rank_config(config_in, rank, verbose=(rank == 0 and verbose))
+            if cfg is None:
+                raise FileNotFoundError(
+                    f"[warm-start] no rank*.h5 files in {config_in}")
+            check_config_compat(cfg, dict(N=int(N), M_total=int(2 * M)),
+                                f"string-work rank {rank}")
+            eng._eng.set_op_string(
+                np.ascontiguousarray(cfg["op_types"], dtype=np.int32),
+                np.ascontiguousarray(cfg["op_sites"], dtype=np.int32))
+            # thermalize(0) still sets the seam mask for the chosen direction.
+            eng.thermalize(0, direction=direction)
+            if rank == 0 and verbose and K == K_values[0]:
+                print(f"[MPI-STRWORK] warm start from {config_in} — "
+                      f"thermalization skipped", flush=True)
+        else:
+            eng.thermalize(n_thermalize, direction=direction)
 
         ckpt = int(checkpoint_every_trajectories) if checkpoint_dir else 0
         if ckpt > 0 and my_n > 0:
@@ -165,6 +189,24 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 n_qaqmc_sweeps_per_lambda=n_qaqmc_sweeps_per_lambda,
                 direction=direction)
             local_log_j = np.asarray(local.log_j_samples, dtype=np.float64)
+
+        # Warm-start save: final op string of the last K's engine (the
+        # configuration is K-independent, any equilibrated one works).
+        if K == K_values[-1]:
+            out_dir = config_out
+            if not out_dir and filepath:
+                base = str(filepath)
+                out_dir = (base[:-3] if base.endswith(".h5") else base) + "_configs"
+            if out_dir:
+                from src.mpi.warm_start import save_rank_config
+                save_rank_config(
+                    out_dir, rank,
+                    datasets=dict(
+                        op_types=np.asarray(eng._eng.op_types, dtype=np.int32),
+                        op_sites=np.asarray(eng._eng.op_sites, dtype=np.int32)),
+                    attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
+                if rank == 0 and verbose:
+                    print(f"[MPI-STRWORK] final configs saved → {out_dir}", flush=True)
 
         all_log_j = comm.gather(local_log_j, root=0)
         t_elapsed = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
@@ -279,6 +321,12 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None,
                         help="checkpoint run directory (default: <filepath minus .h5>"
                              "_chunks when checkpointing is enabled)")
+    parser.add_argument("--config-in", type=str, default=None,
+                        help="warm-start directory of rank{r}.h5 final configurations; "
+                             "when given, thermalization is skipped")
+    parser.add_argument("--config-out", type=str, default=None,
+                        help="where to save final configurations "
+                             "(default: <filepath minus .h5>_configs)")
     args = parser.parse_args()
 
     if args.lattice == "1d_chain":
@@ -331,6 +379,8 @@ def main():
         filepath=args.filepath,
         checkpoint_every_trajectories=args.checkpoint_every_trajectories,
         checkpoint_dir=ckpt_dir,
+        config_in=args.config_in,
+        config_out=args.config_out,
     )
 
 

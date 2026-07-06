@@ -92,6 +92,8 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                  filepath: str | None = None,
                  checkpoint_every_trajectories: int = 0,
                  checkpoint_dir: str | None = None,
+                 config_in: str | None = None,
+                 config_out: str | None = None,
                  verbose: bool = True) -> dict:
     """When checkpoint_every_trajectories > 0 and checkpoint_dir is set, each
     rank additionally flushes its per-trajectory arrays every that many
@@ -138,7 +140,26 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         )
         eng.set_region_pair(A_start_mask, A_end_mask)
         eng.set_lambda_schedule(np.linspace(0.0, 1.0, K + 1))
-        eng.thermalize(n_thermalize)
+        if config_in:
+            # Warm start: install the saved A_start-sector configuration and
+            # seed the checkpoint chain — no thermalization needed.  The
+            # configuration is K-independent.
+            from src.mpi.warm_start import check_config_compat, load_rank_config
+            cfg = load_rank_config(config_in, rank, verbose=(rank == 0 and verbose))
+            if cfg is None:
+                raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
+            check_config_compat(cfg, dict(N=int(N), M_total=int(2 * M)),
+                                f"renyi-work rank {rank}")
+            eng._cpp_engine.import_start_config(
+                np.ascontiguousarray(cfg["op_types0"], dtype=np.int32),
+                np.ascontiguousarray(cfg["op_sites0"], dtype=np.int32),
+                np.ascontiguousarray(cfg["op_types1"], dtype=np.int32),
+                np.ascontiguousarray(cfg["op_sites1"], dtype=np.int32))
+            if rank == 0 and verbose and K == K_values[0]:
+                print(f"[MPI-WORK] warm start from {config_in} — "
+                      f"thermalization skipped", flush=True)
+        else:
+            eng.thermalize(n_thermalize)
 
         ckpt = int(checkpoint_every_trajectories) if checkpoint_dir else 0
         if ckpt > 0 and my_n > 0:
@@ -184,6 +205,23 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             )
         else:
             local = eng.run_trajectories(my_n, decorrelation_steps)
+
+        # Warm-start save: A_start-sector configuration from the last K.
+        if K == K_values[-1]:
+            out_dir = config_out
+            if not out_dir and filepath:
+                base = str(filepath)
+                out_dir = (base[:-3] if base.endswith(".h5") else base) + "_configs"
+            if out_dir:
+                from src.mpi.warm_start import save_rank_config
+                t0c, s0c, t1c, s1c = eng._cpp_engine.export_start_config()
+                save_rank_config(
+                    out_dir, rank,
+                    datasets=dict(op_types0=t0c, op_sites0=s0c,
+                                  op_types1=t1c, op_sites1=s1c),
+                    attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
+                if rank == 0 and verbose:
+                    print(f"[MPI-WORK] final configs saved → {out_dir}", flush=True)
 
         # Gather per-trajectory arrays to rank 0 and aggregate via log-sum-exp
         all_w           = comm.gather(local.work_samples,                root=0)
@@ -305,6 +343,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
                        neighbor_cutoff=-1, delta_groups=600, seed=7,
                        compute_ed=True, filepath=None, kp_meta=None,
                        checkpoint_every_trajectories=0, checkpoint_dir=None,
+                       config_in=None, config_out=None,
                        verbose=True) -> dict | None:
     """Run the work engine for a list of (region_name, A_start_mask, A_end_mask).
 
@@ -345,6 +384,10 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
             checkpoint_every_trajectories=checkpoint_every_trajectories,
             checkpoint_dir=(os.path.join(checkpoint_dir, str(region_name))
                             if checkpoint_dir else None),
+            config_in=(os.path.join(config_in, str(region_name))
+                       if config_in else None),
+            config_out=(os.path.join(config_out, str(region_name))
+                        if config_out else None),
             verbose=verbose,
         )
         if rank == 0:
@@ -554,10 +597,18 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None,
                         help="checkpoint run directory (default: <filepath minus .h5>_chunks "
                              "when checkpointing is enabled)")
+    parser.add_argument("--config-in", type=str, default=None,
+                        help="warm-start directory of rank{r}.h5 final configurations "
+                             "([region/]rank{r}.h5 in KP-regions mode); when given, "
+                             "thermalization is skipped")
+    parser.add_argument("--config-out", type=str, default=None,
+                        help="where to save final configurations "
+                             "(default: <filepath minus .h5>_configs)")
     parser.add_argument("--skip-ed", action="store_true",
                         help="skip ED reference computation (forced if N > 16)")
     args = parser.parse_args()
 
+    cfg_out_dir = args.config_out
     ckpt_dir = args.checkpoint_dir
     if int(args.checkpoint_every_trajectories) > 0 and ckpt_dir is None:
         if args.filepath:
@@ -649,6 +700,8 @@ def main():
             filepath=args.filepath,
             checkpoint_every_trajectories=args.checkpoint_every_trajectories,
             checkpoint_dir=ckpt_dir,
+            config_in=args.config_in,
+            config_out=cfg_out_dir,
             kp_meta=dict(
                 lattice=args.lattice, nx=args.nx, ny=args.ny, a=args.a,
                 m=args.kp_m, center_label=spec.center_label,
@@ -680,6 +733,8 @@ def main():
         filepath=args.filepath,
         checkpoint_every_trajectories=args.checkpoint_every_trajectories,
         checkpoint_dir=ckpt_dir,
+        config_in=args.config_in,
+        config_out=cfg_out_dir,
     )
 
 
