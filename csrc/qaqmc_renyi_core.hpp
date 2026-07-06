@@ -79,6 +79,7 @@ public:
     int get_N() const { return N_; }
     int get_M() const { return M_; }
     int get_M_total() const { return M_total_; }
+    int get_cut() const { return cut_; }
 
     const std::vector<int32_t>& get_op_types(int replica) const { return replicas_[replica].op_types; }
     const std::vector<int32_t>& get_op_sites(int replica) const { return replicas_[replica].op_sites; }
@@ -133,6 +134,13 @@ public:
     }
 
     void set_A_mask(const uint8_t* mask, int len);
+    // Move the entanglement cut (swap boundary) to slice m_star in
+    // [0, M_total].  Default is the schedule midpoint M.  The A-mask swap and
+    // the "midpoint" state capture then act at p >= m_star / p < m_star.
+    // MUST be called while the operator strings are valid under BOTH the old
+    // and new mapping — in practice: right after construction, or through
+    // QAQMCRenyiWorkEngine::set_cut which vacuum-resets the ops.
+    void set_cut(int m_star);
     void set_topology_pair(const uint8_t* A_k, const uint8_t* A_kp1, int len, int diff_site);
     void reset_visit_counts();
     void set_ensemble_ladder(const std::vector<std::vector<uint8_t>>& masks,
@@ -191,6 +199,7 @@ public:
 
 private:
     int N_, M_, M_total_;
+    int cut_;  // swap-boundary slice; default M_ (schedule midpoint)
     double Omega_, Rb_, delta_min_, delta_max_, epsilon_;
     int delta_groups_{0};
 
@@ -287,23 +296,23 @@ private:
 
     inline int replica_for_with_mask(int channel, int site, int p,
                                      const std::vector<uint8_t>& mask) const {
-        if (p < M_) return channel;
+        if (p < cut_) return channel;
         return mask[site] ? (1 - channel) : channel;
     }
 
     inline int channel_for_actual_with_mask(int replica, int site, int p,
                                             const std::vector<uint8_t>& mask) const {
-        if (p < M_) return replica;
+        if (p < cut_) return replica;
         return mask[site] ? (1 - replica) : replica;
     }
 
     inline int replica_for(int channel, int site, int p) const {
-        if (p < M_) return channel;
+        if (p < cut_) return channel;
         return A_mask_[site] ? (1 - channel) : channel;
     }
 
     inline int channel_for_actual(int replica, int site, int p) const {
-        if (p < M_) return replica;
+        if (p < cut_) return replica;
         return A_mask_[site] ? (1 - replica) : replica;
     }
 

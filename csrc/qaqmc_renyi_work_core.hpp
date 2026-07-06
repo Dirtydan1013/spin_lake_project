@@ -63,6 +63,14 @@ public:
     // λ schedule (must be monotonically non-decreasing, start at 0, end at 1).
     void set_lambda_schedule(const std::vector<double>& lambdas);
 
+    // Move the entanglement cut (swap boundary) to slice m_star in
+    // [0, M_total]; default is M (the ramp turning point).  Vacuum-resets the
+    // operator strings (a previous configuration is generally invalid under
+    // the new channel mapping) and invalidates any warm-start checkpoint —
+    // call BEFORE thermalize()/import_start_config().
+    void set_cut(int m_star);
+    int get_cut() const { return backend_.get_cut(); }
+
     // Per-λ-step counts.  v1 defaults to 1 each, aligned with paper.
     void set_sweeps_per_lambda(int n_topology_sweeps, int n_qaqmc_sweeps);
 

@@ -1409,6 +1409,12 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         "Convenience: equivalent to set_region_pair(zeros, A_mask). "
         "Corresponds to the paper's ∅→A case.")
 
+        .def("set_cut", &QAQMCRenyiWorkEngine::set_cut, py::arg("m_star"),
+             "Move the entanglement cut (swap boundary) to slice m_star in "
+             "[0, M_total]; default M.  Vacuum-resets the operator strings — "
+             "call before thermalize()/import_start_config().")
+        .def("get_cut", &QAQMCRenyiWorkEngine::get_cut)
+
         .def("export_start_config", [](const QAQMCRenyiWorkEngine& self) {
             std::vector<int32_t> t0, s0, t1, s1;
             self.export_start_config(t0, s0, t1, s1);

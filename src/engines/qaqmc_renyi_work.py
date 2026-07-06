@@ -122,6 +122,15 @@ class QAQMCRenyiWorkRydberg:
             raise ValueError(f"masks must have shape ({self.N},)")
         self._cpp_engine.set_region_pair(s, e)
 
+    def set_cut(self, m_star: int) -> None:
+        """Move the entanglement cut (swap boundary) to slice m_star in
+        [0, M_total]; default is M (the ramp turning point).  Vacuum-resets
+        the operator strings, so call BEFORE thermalize()."""
+        self._cpp_engine.set_cut(int(m_star))
+
+    def get_cut(self) -> int:
+        return int(self._cpp_engine.get_cut())
+
     def set_lambda_schedule(self, lambdas: np.ndarray) -> None:
         """Forward λ schedule; must start at 0, end at 1, monotonic non-decreasing."""
         arr = np.ascontiguousarray(lambdas, dtype=np.float64)

@@ -91,6 +91,16 @@ void QAQMCRenyiWorkEngine::set_lambda_schedule(const std::vector<double>& lambda
     lambda_schedule_ = lambdas;
 }
 
+void QAQMCRenyiWorkEngine::set_cut(int m_star) {
+    backend_.set_cut(m_star);
+    // A configuration equilibrated under the old cut is generally invalid
+    // under the new channel mapping: reset to the trivially-valid vacuum in
+    // the A_start sector and drop any saved checkpoint.
+    B_mask_.assign(N_, 0);
+    backend_.invalidate_op_string_checkpoint();
+    backend_.set_A_mask_for_work(A_start_mask_.data(), N_);
+}
+
 void QAQMCRenyiWorkEngine::export_start_config(
     std::vector<int32_t>& types0, std::vector<int32_t>& sites0,
     std::vector<int32_t>& types1, std::vector<int32_t>& sites1) const {

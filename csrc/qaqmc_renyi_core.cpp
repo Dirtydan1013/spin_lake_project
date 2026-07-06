@@ -29,6 +29,7 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
     : N_(N),
       M_(M),
       M_total_(2 * M),
+      cut_(M),
       Omega_(Omega),
       Rb_(Rb),
       delta_min_(delta_min),
@@ -528,6 +529,15 @@ void QAQMCRenyiEngine::set_replica_op_string(int replica, const int32_t* types, 
     std::memcpy(replicas_[replica].op_sites.data(), sites, len * sizeof(int32_t));
 }
 
+void QAQMCRenyiEngine::set_cut(int m_star) {
+    if (m_star < 0 || m_star > M_total_) {
+        throw std::runtime_error("set_cut: m_star must be in [0, M_total]");
+    }
+    if (m_star == cut_) return;
+    cut_ = m_star;
+    recompute_midpoint_states_from_ops();
+}
+
 void QAQMCRenyiEngine::recompute_midpoint_states() {
     recompute_midpoint_states_from_ops();
 }
@@ -537,7 +547,7 @@ void QAQMCRenyiEngine::recompute_midpoint_states_from_ops() {
         std::fill(replica.state_at_M.begin(), replica.state_at_M.end(), 0);
     }
     for (int replica = 0; replica < 2; ++replica) {
-        for (int p = 0; p < M_; ++p) {
+        for (int p = 0; p < cut_; ++p) {
             if (replicas_[replica].op_types[p] == -1) {
                 int site = replicas_[replica].op_sites[p];
                 if (site >= 0 && site < N_) {
@@ -664,7 +674,7 @@ void QAQMCRenyiEngine::reproject_site_ops_at_site_with_paths(
     const OffdiagPaths& paths) {
     if (diff_site < 0 || diff_site >= N_) return;
     for (int replica = 0; replica < 2; ++replica) {
-        for (int p = M_; p < M_total_; ++p) {
+        for (int p = cut_; p < M_total_; ++p) {
             int& ot = replicas_[replica].op_types[p];
             if (ot != 1 && ot != -1) continue;
             if (replicas_[replica].op_sites[p] != diff_site) continue;
