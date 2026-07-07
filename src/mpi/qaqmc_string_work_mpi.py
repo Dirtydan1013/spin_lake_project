@@ -137,8 +137,10 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             if cfg is None:
                 raise FileNotFoundError(
                     f"[warm-start] no rank*.h5 files in {config_in}")
-            check_config_compat(cfg, dict(N=int(N), M_total=int(2 * M)),
-                                f"string-work rank {rank}")
+            check_config_compat(
+                cfg, dict(N=int(N), M_total=int(2 * M),
+                          boundary=("periodic" if box_vectors is not None else "open")),
+                f"string-work rank {rank}")
             eng._eng.set_op_string(
                 np.ascontiguousarray(cfg["op_types"], dtype=np.int32),
                 np.ascontiguousarray(cfg["op_sites"], dtype=np.int32))
@@ -208,7 +210,9 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         datasets=dict(
                             op_types=np.asarray(eng._eng.op_types, dtype=np.int32),
                             op_sites=np.asarray(eng._eng.op_sites, dtype=np.int32)),
-                        attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
+                        attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed),
+                                   boundary=("periodic" if box_vectors is not None
+                                             else "open")))
                 if rank == 0 and verbose:
                     print(f"[MPI-STRWORK] final configs saved → {out_dir}", flush=True)
 

@@ -924,7 +924,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
         if cfg is None:
             raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
-        check_config_compat(cfg, dict(N=N, M_total=2 * M, lattice=str(lattice)),
+        check_config_compat(cfg, dict(N=N, M_total=2 * M, lattice=str(lattice),
+                                      boundary=str(boundary)),
                             f"profile rank {rank}")
         types = np.ascontiguousarray(cfg["op_types"], dtype=np.int32)
         sites = np.ascontiguousarray(cfg["op_sites"], dtype=np.int32)
@@ -958,7 +959,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             op_types=np.asarray(engine._cpp_engine.op_types, dtype=np.int32),
             op_sites=np.asarray(engine._cpp_engine.op_sites, dtype=np.int32))
         config_attrs = dict(N=int(N), M_total=int(2 * M), lattice=str(lattice),
-                            seed=int(rank_seed),
+                            boundary=str(boundary), seed=int(rank_seed),
                             rng_state=engine._cpp_engine.get_rng_state())
         from src.mpi.chunk_io import RankChunkWriter
         with RankChunkWriter(out_dir, rank) as w:

@@ -114,7 +114,8 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
         cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
         if cfg is None:
             raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
-        check_config_compat(cfg, dict(N=int(N), lattice=str(lattice)),
+        check_config_compat(cfg, dict(N=int(N), lattice=str(lattice),
+                                      boundary=str(boundary)),
                             f"sse rank {rank}")
         cpp.set_config(
             np.ascontiguousarray(cfg["state"], dtype=np.int32),
@@ -180,8 +181,9 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
                 state=np.asarray(cpp.state, dtype=np.int32),
                 op_types=np.asarray(cpp.op_types, dtype=np.int32),
                 op_sites=np.asarray(cpp.op_sites, dtype=np.int32)),
-            attrs=dict(N=int(N), lattice=str(lattice), beta=float(beta),
-                       seed=int(rank_seed), rng_state=cpp.get_rng_state()))
+            attrs=dict(N=int(N), lattice=str(lattice), boundary=str(boundary),
+                       beta=float(beta), seed=int(rank_seed),
+                       rng_state=cpp.get_rng_state()))
 
     t_sample = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
     comm.Barrier()

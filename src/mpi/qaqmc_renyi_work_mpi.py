@@ -149,8 +149,10 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
             if cfg is None:
                 raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
-            check_config_compat(cfg, dict(N=int(N), M_total=int(2 * M)),
-                                f"renyi-work rank {rank}")
+            check_config_compat(
+                cfg, dict(N=int(N), M_total=int(2 * M),
+                          boundary=("periodic" if box_vectors is not None else "open")),
+                f"renyi-work rank {rank}")
             eng._cpp_engine.import_start_config(
                 np.ascontiguousarray(cfg["op_types0"], dtype=np.int32),
                 np.ascontiguousarray(cfg["op_sites0"], dtype=np.int32),
@@ -224,7 +226,9 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                     w.write_final_config(
                         datasets=dict(op_types0=t0c, op_sites0=s0c,
                                       op_types1=t1c, op_sites1=s1c),
-                        attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
+                        attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed),
+                                   boundary=("periodic" if box_vectors is not None
+                                             else "open")))
                 if rank == 0 and verbose:
                     print(f"[MPI-WORK] final configs saved → {out_dir}", flush=True)
 
