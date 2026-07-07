@@ -1321,6 +1321,26 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def("set_rng_state", &SSEEngine::set_rng_state,
              "Restore RNG state from a previously saved string")
 
+        .def("set_config", [](SSEEngine& self,
+                              py::array_t<int32_t> state,
+                              py::array_t<int32_t> op_types,
+                              py::array_t<int32_t> op_sites) {
+            auto sb = state.request();
+            auto tb = op_types.request();
+            auto ob = op_sites.request();
+            if (sb.ndim != 1 || tb.ndim != 1 || ob.ndim != 1)
+                throw std::runtime_error("set_config: arrays must be 1D");
+            if (tb.shape[0] != ob.shape[0])
+                throw std::runtime_error("set_config: op_types/op_sites length mismatch");
+            self.set_config(static_cast<const int32_t*>(sb.ptr), (int)sb.shape[0],
+                            static_cast<const int32_t*>(tb.ptr),
+                            static_cast<const int32_t*>(ob.ptr), (int)tb.shape[0]);
+        },
+        py::arg("state"), py::arg("op_types"), py::arg("op_sites"),
+        "Warm start: install a saved configuration (tau=0 spin state + operator\n"
+        "string).  Combined with set_rng_state this resumes the exact chain;\n"
+        "with a fresh seed it just skips thermalization.")
+
         // Profiling
         .def_property_readonly("time_diag", &SSEEngine::get_time_diag,
                                "Cumulative wall-clock time in diagonal_update (s)")

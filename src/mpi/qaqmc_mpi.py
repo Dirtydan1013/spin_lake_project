@@ -791,6 +791,24 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     return filepath
 
 
+# Occupation-SF matrices dominate the on-disk chunk size.  They are accumulated
+# in float64 inside the C++ engine (full precision through the sum), but stored
+# as float32 — a structure-factor bin doesn't need double precision, and this
+# halves the largest datasets.  The raw occ_state snapshot (int8) is untouched.
+_OCC_FLOAT32_KEYS = frozenset({
+    'occ_S_full_re', 'occ_S_full_im', 'occ_S_bulk_re', 'occ_S_bulk_im',
+    'occ_nprof', 'occ2_S_re', 'occ2_S_im',
+})
+
+
+def _store_array(key, value):
+    """Cast occ-SF float64 matrices to float32 for storage; pass others through."""
+    arr = np.ascontiguousarray(value)
+    if key in _OCC_FLOAT32_KEYS and arr.dtype == np.float64:
+        return arr.astype(np.float32)
+    return arr
+
+
 def _write_result_h5(path, arrays, attrs=None):
     """Atomically write a dict of arrays to a self-contained HDF5 file.
 
@@ -816,7 +834,7 @@ def _write_result_h5(path, arrays, attrs=None):
 def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     pos=None, epsilon=0.01, seed=42, n_equil=0, n_samples=1000,
                     measure_every=1, profile_step=10000, batch_size=1000,
-                    checkpoint_every_batches=0,
+                    checkpoint=0, checkpoint_every_batches=0,
                     filepath='data/qaqmc_profile.h5',
                     neighbor_cutoff=None,
                     loop_sizes=None, string_sizes=None,
@@ -883,8 +901,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     # When config_in is given, each rank installs its saved operator string
     # (+ RNG state) and thermalization is skipped (n_equil forced to 0).
     if config_in:
-        from src.mpi.warm_start import check_config_compat, load_rank_config
-        cfg = load_rank_config(config_in, rank, verbose=(rank == 0 and verbose))
+        from src.mpi.chunk_io import check_config_compat, load_warm_config
+        cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
         if cfg is None:
             raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
         check_config_compat(cfg, dict(N=N, M_total=2 * M, lattice=str(lattice)),
@@ -904,23 +922,28 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
     # ── Warm start: save the final configuration at every exit ──────────────
     # Each rank stashes its final operator string + RNG state so a later run
-    # can `config_in` it and skip thermalization entirely.
-    def _save_final_config():
-        out_dir = config_out
+    # can `config_in` it and skip thermalization entirely.  Configs live in
+    # their OWN dir (one rank{r}.h5 each), never inside the observable chunk
+    # files — so the whole set is reclaimable with a single `rm -rf` and the
+    # data files never need an h5repack.  In the chunked run the config dir is
+    # <run_dir>/configs (default_dir); the legacy single-call path uses
+    # config_out or <filepath>_configs.  An explicit --config_out always wins.
+    def _save_final_config(default_dir=None):
+        out_dir = config_out or default_dir
         if not out_dir and filepath:
             base = str(filepath)
             out_dir = (base[:-3] if base.endswith('.h5') else base) + '_configs'
         if not out_dir:
             return
-        from src.mpi.warm_start import save_rank_config
-        save_rank_config(
-            out_dir, rank,
-            datasets=dict(
-                op_types=np.asarray(engine._cpp_engine.op_types, dtype=np.int32),
-                op_sites=np.asarray(engine._cpp_engine.op_sites, dtype=np.int32)),
-            attrs=dict(N=int(N), M_total=int(2 * M), lattice=str(lattice),
-                       seed=int(rank_seed),
-                       rng_state=engine._cpp_engine.get_rng_state()))
+        config_datasets = dict(
+            op_types=np.asarray(engine._cpp_engine.op_types, dtype=np.int32),
+            op_sites=np.asarray(engine._cpp_engine.op_sites, dtype=np.int32))
+        config_attrs = dict(N=int(N), M_total=int(2 * M), lattice=str(lattice),
+                            seed=int(rank_seed),
+                            rng_state=engine._cpp_engine.get_rng_state())
+        from src.mpi.chunk_io import RankChunkWriter
+        with RankChunkWriter(out_dir, rank) as w:
+            w.write_final_config(datasets=config_datasets, attrs=config_attrs)
         if rank == 0 and verbose:
             print(f"[MPI-PROF] final configs saved → {out_dir}", flush=True)
 
@@ -1055,16 +1078,25 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     # Sampling
     t0 = time.perf_counter()
 
-    # ── Level-1 incremental checkpointing ────────────────────────────────────
-    # When checkpoint_every_batches > 0, each rank runs its (already-equilibrated)
-    # chain in chunks of that many batches and writes a self-contained HDF5 file
-    # after every chunk, so a crash loses at most one chunk instead of the whole
-    # run.  Repeated run_profile(n_equil=0, ...) calls continue the SAME Markov
-    # chain (engine state persists), so this is statistically identical to one
-    # long call.  Layout:  data/M={M}_{nx}x{ny}_{timestamp}/rank{r}/chunk{c}.h5
-    # (one subdirectory per rank) plus a one-time meta.h5 (geometry + params)
-    # written by rank 0 at the run-dir root.
-    if checkpoint_every_batches and checkpoint_every_batches > 0:
+    # ── Merged bin==chunk checkpointing ──────────────────────────────────────
+    # When checkpoint > 0 it sets the merged bin==flush size: every `checkpoint`
+    # samples each rank forms ONE bin (run_profile with batch_size=checkpoint →
+    # a single batch row) and appends it as the next chunk{i} group in its
+    # single file  data/M={M}_{nx}x{ny}_{timestamp}/rank{r}.h5  (flat, plus a
+    # final_config group for warm start).  A deprecated --checkpoint_every_batches
+    # still works (bin size stays --batch_size).  Repeated run_profile(0, ...)
+    # calls continue the SAME Markov chain, so this is statistically identical
+    # to one long call.  Rank 0 also writes a one-time meta.h5 (geometry/params).
+    use_checkpoint = (checkpoint and checkpoint > 0) or \
+                     (checkpoint_every_batches and checkpoint_every_batches > 0)
+    if use_checkpoint:
+        from src.mpi.chunk_io import RankChunkWriter
+        if checkpoint and checkpoint > 0:
+            bin_size = int(checkpoint)          # merged: one bin per chunk
+        else:
+            bin_size = int(checkpoint_every_batches) * batch_size
+        bin_size = max(1, bin_size)
+
         if rank == 0:
             base_dir = os.path.dirname(filepath) or '.'
             stamp = time.strftime('%Y%m%d_%H%M%S')
@@ -1074,36 +1106,38 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             run_dir = None
         run_dir = comm.bcast(run_dir, root=0)
 
-        chunk_samples = int(checkpoint_every_batches) * batch_size
-        n_chunks = ((my_n_samples + chunk_samples - 1) // chunk_samples
+        n_chunks = ((my_n_samples + bin_size - 1) // bin_size
                     if my_n_samples > 0 else 0)
-
-        # One subdirectory per rank: run_dir/rank{r}/chunk{c}.h5
-        rank_dir = os.path.join(run_dir, f'rank{rank}')
-        os.makedirs(rank_dir, exist_ok=True)
 
         samples_done = 0
         c = 0
-        while samples_done < my_n_samples:
-            n = min(chunk_samples, my_n_samples - samples_done)
-            res = engine._cpp_engine.run_profile(
-                0, n, me_density, me_zl, me_cml, profile_step,
-                batch_size,
-                None, 1,
-                n_snapshots if n_snap_pts > 0 else 0,
-                occ_sf_nbatch if do_occ else 0)
-            _write_result_h5(
-                os.path.join(rank_dir, f'chunk{c}.h5'),
-                {k: np.asarray(v) for k, v in res.items()},
-                attrs=dict(rank=rank, chunk=c, n_samples=n, batch_size=batch_size,
-                           samples_cumulative=samples_done + n,
-                           my_n_samples=my_n_samples))
-            samples_done += n
-            c += 1
-            if verbose and rank == 0:
-                el = time.perf_counter() - t0
-                print(f"[MPI-PROF] rank0 chunk {c}/{n_chunks} written "
-                      f"({samples_done}/{my_n_samples} samples, {el:.0f}s)", flush=True)
+        with RankChunkWriter(run_dir, rank,
+                             run_attrs=dict(N=int(N), M=int(M), nx=int(nx), ny=int(ny),
+                                            lattice=str(lattice), seed=int(seed),
+                                            profile_step=int(profile_step),
+                                            samples_per_bin=int(bin_size),
+                                            my_n_samples=int(my_n_samples))) as writer:
+            while samples_done < my_n_samples:
+                n = min(bin_size, my_n_samples - samples_done)
+                res = engine._cpp_engine.run_profile(
+                    0, n, me_density, me_zl, me_cml, profile_step,
+                    n,                       # batch_size = bin size → one bin/chunk
+                    None, 1,
+                    n_snapshots if n_snap_pts > 0 else 0,
+                    occ_sf_nbatch if do_occ else 0)
+                writer.write_chunk(
+                    c, {k: _store_array(k, v) for k, v in res.items()},
+                    attrs=dict(n_samples=n, samples_cumulative=samples_done + n))
+                samples_done += n
+                c += 1
+                if verbose and rank == 0:
+                    el = time.perf_counter() - t0
+                    print(f"[MPI-PROF] rank0 chunk {c}/{n_chunks} written "
+                          f"({samples_done}/{my_n_samples} samples, {el:.0f}s)", flush=True)
+
+        # Warm-start config → <run_dir>/configs/rank{r}.h5 (separate from the
+        # observable chunk files, so it can be reclaimed independently).
+        _save_final_config(default_dir=os.path.join(run_dir, 'configs'))
 
         # One-time run metadata (geometry + params) from rank 0.
         if rank == 0:
@@ -1125,12 +1159,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 os.path.join(run_dir, 'meta.h5'), meta,
                 attrs=dict(N=N, M=M, nx=nx, ny=ny, Omega=Omega, Rb=Rb,
                            delta_min=delta_min, delta_max=delta_max, epsilon=epsilon,
-                           seed=seed, profile_step=profile_step, batch_size=batch_size,
-                           n_samples=n_samples, n_ranks=n_ranks,
-                           checkpoint_every_batches=int(checkpoint_every_batches)))
+                           seed=seed, profile_step=profile_step,
+                           samples_per_bin=int(bin_size),
+                           n_samples=n_samples, n_ranks=n_ranks))
             print(f"[MPI-PROF] checkpoint run dir: {run_dir}", flush=True)
 
-        _save_final_config()
         comm.Barrier()
         t_sample = time.perf_counter() - t0
         if verbose and rank == 0:
@@ -1527,11 +1560,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 ocg.create_dataset('q_frac',    data=occ_q_frac)        # (n_q, 2) fractional (m/G, n/G)
                 ocg.create_dataset('delta',     data=prof_delta[occ_pt_indices])
                 ocg.create_dataset('p_indices', data=prof_p_idx[occ_pt_indices].astype(np.int32))
-                ocg.create_dataset('S_full_re', data=all_occ['occ_S_full_re'])
-                ocg.create_dataset('S_full_im', data=all_occ['occ_S_full_im'])
-                ocg.create_dataset('S_bulk_re', data=all_occ['occ_S_bulk_re'])
-                ocg.create_dataset('S_bulk_im', data=all_occ['occ_S_bulk_im'])
-                ocg.create_dataset('nprof',     data=all_occ['occ_nprof'])  # (n_sb, n_δ, N) all sites
+                ocg.create_dataset('S_full_re', data=_store_array('occ_S_full_re', all_occ['occ_S_full_re']))
+                ocg.create_dataset('S_full_im', data=_store_array('occ_S_full_im', all_occ['occ_S_full_im']))
+                ocg.create_dataset('S_bulk_re', data=_store_array('occ_S_bulk_re', all_occ['occ_S_bulk_re']))
+                ocg.create_dataset('S_bulk_im', data=_store_array('occ_S_bulk_im', all_occ['occ_S_bulk_im']))
+                ocg.create_dataset('nprof',     data=_store_array('occ_nprof', all_occ['occ_nprof']))  # (n_sb, n_δ, N) all sites
                 # geometry for reconstructing F_α(q)
                 ocg.create_dataset('cell_R',       data=occ_cell_R)      # (N,2) per-site cell pos (a=1)
                 ocg.create_dataset('site_basis',   data=occ_basis)       # (N,) α index
@@ -1541,8 +1574,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 ocg.attrs['nbatch_per_rank'] = int(occ_sf_nbatch)
                 # Alternate triangle-pair unit cell (bulk tiling), same q-grid/δ.
                 if 'occ2_S_re' in all_occ:
-                    ocg.create_dataset('S_tri_re',   data=all_occ['occ2_S_re'])
-                    ocg.create_dataset('S_tri_im',   data=all_occ['occ2_S_im'])
+                    ocg.create_dataset('S_tri_re',   data=_store_array('occ2_S_re', all_occ['occ2_S_re']))
+                    ocg.create_dataset('S_tri_im',   data=_store_array('occ2_S_im', all_occ['occ2_S_im']))
                     ocg.create_dataset('tri_cell_R', data=occ2_cell_R)    # (N,2) per-site cell pos
                     ocg.create_dataset('tri_basis',  data=occ2_basis)     # (N,) α (−1 if excluded)
 
@@ -1627,13 +1660,17 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1000,
                         help='(profile mode) Number of Z_l/C_m_l samples per batch for '
                              'memory-efficient per-copy storage. Default 1000.')
+    parser.add_argument('--checkpoint', type=int, default=0,
+                        help='(profile mode) Merged bin==flush size: every N samples each '
+                             'rank forms ONE bin and appends it as the next chunk{i} group '
+                             'in data/M=..._<nx>x<ny>_<timestamp>/rank{r}.h5 (flat, one '
+                             'file per rank, plus a final_config group for warm start). '
+                             '0 = disabled (single combined file). Supersedes '
+                             '--checkpoint_every_batches / --batch_size.')
     parser.add_argument('--checkpoint_every_batches', type=int, default=0,
-                        help='(profile mode) Level-1 incremental checkpointing: flush a '
-                             'self-contained HDF5 file every N batches per rank into a '
-                             'per-rank subfolder (data/M=..._<nx>x<ny>_<timestamp>/'
-                             'rank{r}/chunk{c}.h5). 0 = disabled (single combined file). '
-                             'A crash then loses at most one chunk. Pick N so N*batch_size '
-                             'samples ~= 30-60 min of wall time.')
+                        help='(profile mode) DEPRECATED alias — use --checkpoint. Legacy '
+                             'chunk size in batches; still writes the new flat rank{r}.h5 '
+                             'layout with bin size = --batch_size.')
     # Loop / string sizes are auto-selected from (nx, ny):
     #   loop sizes   = 2 .. min(nx, ny) - 1
     #   string sizes = 1 .. min(nx, ny) - 1
@@ -1724,6 +1761,7 @@ def main():
             measure_every=config.get('measure_every', 1),
             profile_step=config.get('profile_step', 10000),
             batch_size=config.get('batch_size', 1000),
+            checkpoint=config.get('checkpoint', 0),
             checkpoint_every_batches=config.get('checkpoint_every_batches', 0),
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),

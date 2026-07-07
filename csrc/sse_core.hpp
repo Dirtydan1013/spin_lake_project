@@ -1,5 +1,5 @@
 #pragma once
-#include "qaqmc_core.hpp"  // RydbergVij, build_rydberg_vij, QAQMCEngine::compute_bond_W_inline
+#include "qaqmc_core.hpp"  // RydbergVij, build_rydberg_vij, AliasEntry, RNG helpers
 #include <string>
 #include <cstdint>
 
@@ -64,15 +64,24 @@ public:
     int    get_mc_steps()  const { return mc_steps_; }
     void   reset_timers()        { time_diag_ = 0; time_clus_ = 0; mc_steps_ = 0; }
 
-    // ── RNG checkpoint ───────────────────────────────────────────────────────
+    // ── Checkpoint / warm start ──────────────────────────────────────────────
     std::string get_rng_state() const;
     void        set_rng_state(const std::string& s);
+
+    // Install a saved configuration: spin state at the tau=0 boundary plus the
+    // full operator string (length = new M_).  Used by warm-started MPI runs to
+    // skip thermalization.  Validates op types / site+bond indices and throws
+    // std::runtime_error on inconsistent input.
+    void set_config(const int32_t* state, int n_state,
+                    const int32_t* types, const int32_t* sites, int len);
 
 private:
     int    N_, M_, n_ops_;
     double Omega_, delta_, Rb_, beta_, epsilon_;
-    double norm_N_;        // total alias-table normalisation constant
-    double energy_shift_;  // sum_b W[b,0] = sum_b cij_b
+    double norm_N_;         // total alias-table normalisation constant
+    double beta_norm_;      // beta * norm_N_ (insert-acceptance numerator)
+    double inv_beta_norm_;  // 1 / (beta * norm_N_) — no division in the sweep
+    double energy_shift_;   // sum_b W[b,0] = sum_b cij_b
 
     double time_diag_{0}, time_clus_{0};
     int    mc_steps_{0};
@@ -82,14 +91,12 @@ private:
 
     // Bond weights: flat (n_bonds_pad * 4), index = b*4 + (ni*2+nj)
     std::vector<double>  bond_W_;
-    std::vector<double>  bond_W_max_;  // max over 4 spin states for bond b
+    std::vector<double>  bond_W_rmax_;  // 1/max_s W[b,s] (0 if max <= 0)
 
-    // Single alias table (one per beta/delta, not per time-slice)
-    int                  n_alias_;
-    std::vector<double>  alias_prob_;
-    std::vector<int64_t> alias_idx_;
-    std::vector<int>     op_map_kind_;  // 0 = site op, 1 = bond op
-    std::vector<int>     op_map_loc_;   // site index or bond index
+    // Single alias table (one per beta/delta, not per time-slice), stored as
+    // 16-byte AoS entries so each proposal touches 1-2 cache lines.
+    int                     n_alias_;
+    std::vector<AliasEntry> alias_entries_;
 
     std::vector<int32_t> state_;     // current spin state (boundary at tau=0)
     std::vector<int32_t> op_types_;  // length M_
@@ -102,9 +109,21 @@ private:
 
     std::vector<int32_t> site_bond_count_; // [N_] # bond ops touching each site
     std::vector<int32_t> site_bond_head_;  // [N_] offset into site_bond_list_
-    std::vector<int32_t> site_bond_list_;  // packed positions of bond ops per site
+    // Packed bond-op vertex events: [ p : 32 ][ b : 31 ][ endpoint : 1 ]
+    // (endpoint = 0 if the owning site is bonds_i[b], 1 if bonds_j[b]).
+    // Filled in ascending p per site with p in the high bits, so packed order
+    // == p order and upper_bound can search the packed key directly.  Carrying
+    // b avoids the dependent op_sites_[p] load in the segment-Metropolis loop.
+    std::vector<int64_t> site_bond_list_;
 
-    std::vector<int32_t> bond_spin_;       // [M_] spin-index (ni*2+nj) at bond-op positions
+    // Bond-op spin cache, values 0..3 — int8 quarters the footprint of the
+    // random-access reads/XORs in the segment Metropolis.
+    std::vector<int8_t>  bond_spin_;
+    // True while site_op_count_/site_bond_count_ filled by the last diagonal
+    // sweep still describe op_types_/op_sites_ (cluster's 1 <-> -1 toggles are
+    // count-neutral); cleared by set_config.
+    bool vertex_counts_valid_{false};
+
     std::vector<int32_t> spin_now_;        // [N_] working spin array
     std::vector<int8_t>  seg_flipped_;     // scratch for segment flip decisions
 

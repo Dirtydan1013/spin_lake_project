@@ -144,8 +144,8 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             # Warm start: install the saved A_start-sector configuration and
             # seed the checkpoint chain — no thermalization needed.  The
             # configuration is K-independent.
-            from src.mpi.warm_start import check_config_compat, load_rank_config
-            cfg = load_rank_config(config_in, rank, verbose=(rank == 0 and verbose))
+            from src.mpi.chunk_io import check_config_compat, load_warm_config
+            cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
             if cfg is None:
                 raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
             check_config_compat(cfg, dict(N=int(N), M_total=int(2 * M)),
@@ -165,34 +165,38 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         if ckpt > 0 and my_n > 0:
             from types import SimpleNamespace
 
-            from src.mpi.kp_tee_common import write_rank_chunk_h5
+            from src.mpi.chunk_io import RankChunkWriter
 
+            # Flat per-rank layout: checkpoint_dir/K{K}/rank{r}.h5 with one
+            # chunk{i} group per flushed block of `ckpt` trajectories.
             k_dir = os.path.join(checkpoint_dir, f"K{K}")
             parts = []
             done = 0
             c = 0
-            while done < my_n:
-                n_chunk = min(ckpt, my_n - done)
-                part = eng.run_trajectories(n_chunk, decorrelation_steps)
-                parts.append(part)
-                done += n_chunk
-                write_rank_chunk_h5(
-                    k_dir, rank, c,
-                    datasets=dict(
-                        work_samples=part.work_samples,
-                        final_swap_counts=part.final_swap_counts,
-                        unjoined_counts_per_traj=part.unjoined_counts_per_traj,
-                        topology_attempts_per_traj=part.topology_attempts_per_traj,
-                        topology_accepts_per_traj=part.topology_accepts_per_traj,
-                    ),
-                    attrs=dict(K=int(K), n_trajectories=int(n_chunk),
-                               trajectories_cumulative=int(done),
-                               my_n_trajectories=int(my_n), seed=int(seed)),
-                )
-                c += 1
-                if rank == 0 and verbose:
-                    print(f"[MPI-WORK] K={K} rank0 chunk {c} written "
-                          f"({done}/{my_n} trajectories)", flush=True)
+            with RankChunkWriter(k_dir, rank,
+                                 run_attrs=dict(K=int(K), seed=int(seed),
+                                                my_n_trajectories=int(my_n))) as writer:
+                while done < my_n:
+                    n_chunk = min(ckpt, my_n - done)
+                    part = eng.run_trajectories(n_chunk, decorrelation_steps)
+                    parts.append(part)
+                    done += n_chunk
+                    writer.write_chunk(
+                        c,
+                        datasets=dict(
+                            work_samples=part.work_samples,
+                            final_swap_counts=part.final_swap_counts,
+                            unjoined_counts_per_traj=part.unjoined_counts_per_traj,
+                            topology_attempts_per_traj=part.topology_attempts_per_traj,
+                            topology_accepts_per_traj=part.topology_accepts_per_traj,
+                        ),
+                        attrs=dict(K=int(K), n_trajectories=int(n_chunk),
+                                   trajectories_cumulative=int(done)),
+                    )
+                    c += 1
+                    if rank == 0 and verbose:
+                        print(f"[MPI-WORK] K={K} rank0 chunk {c} written "
+                              f"({done}/{my_n} trajectories)", flush=True)
             local = SimpleNamespace(
                 work_samples=np.concatenate([p.work_samples for p in parts]),
                 final_swap_counts=np.concatenate([p.final_swap_counts for p in parts]),
@@ -213,13 +217,13 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 base = str(filepath)
                 out_dir = (base[:-3] if base.endswith(".h5") else base) + "_configs"
             if out_dir:
-                from src.mpi.warm_start import save_rank_config
+                from src.mpi.chunk_io import RankChunkWriter
                 t0c, s0c, t1c, s1c = eng._cpp_engine.export_start_config()
-                save_rank_config(
-                    out_dir, rank,
-                    datasets=dict(op_types0=t0c, op_sites0=s0c,
-                                  op_types1=t1c, op_sites1=s1c),
-                    attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
+                with RankChunkWriter(out_dir, rank) as w:
+                    w.write_final_config(
+                        datasets=dict(op_types0=t0c, op_sites0=s0c,
+                                      op_types1=t1c, op_sites1=s1c),
+                        attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
                 if rank == 0 and verbose:
                     print(f"[MPI-WORK] final configs saved → {out_dir}", flush=True)
 

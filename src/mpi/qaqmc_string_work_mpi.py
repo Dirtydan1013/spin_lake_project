@@ -43,7 +43,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from src.engines.qaqmc_string_work import QAQMCStringWorkRydberg, cosine_schedule
-from src.mpi.kp_tee_common import write_rank_chunk_h5
+from src.mpi.chunk_io import RankChunkWriter
 from src.rydberg.lattices import (
     generate_1d_chain,
     generate_kagome_bond_lattice,
@@ -132,8 +132,8 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         else:
             eng.set_lambda_schedule(np.linspace(0.0, 1.0, int(K) + 1))
         if config_in:
-            from src.mpi.warm_start import check_config_compat, load_rank_config
-            cfg = load_rank_config(config_in, rank, verbose=(rank == 0 and verbose))
+            from src.mpi.chunk_io import check_config_compat, load_warm_config
+            cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
             if cfg is None:
                 raise FileNotFoundError(
                     f"[warm-start] no rank*.h5 files in {config_in}")
@@ -154,32 +154,37 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         if ckpt > 0 and my_n > 0:
             # Chunked sampling: run_trajectories resets the seam sector per
             # trajectory, so repeated calls continue the same chain and are
-            # statistically identical to a single long call.
+            # statistically identical to a single long call.  Flat per-rank
+            # layout: checkpoint_dir/K{K}/rank{r}.h5 with one chunk{i} group
+            # per flushed block of `ckpt` trajectories.
             k_dir = os.path.join(checkpoint_dir, f"K{K}")
             parts = []
             done = 0
             c = 0
-            while done < my_n:
-                n_chunk = min(ckpt, my_n - done)
-                part = eng.run_trajectories(
-                    n_chunk, decorrelation_steps,
-                    n_topology_sweeps_per_lambda=n_topology_sweeps_per_lambda,
-                    n_qaqmc_sweeps_per_lambda=n_qaqmc_sweeps_per_lambda,
-                    direction=direction)
-                parts.append(part.log_j_samples)
-                done += n_chunk
-                write_rank_chunk_h5(
-                    k_dir, rank, c,
-                    datasets=dict(log_j_samples=part.log_j_samples),
-                    attrs=dict(K=int(K), n_trajectories=int(n_chunk),
-                               trajectories_cumulative=int(done),
-                               my_n_trajectories=int(my_n),
-                               direction=str(direction), seed=int(seed)),
-                )
-                c += 1
-                if rank == 0 and verbose:
-                    print(f"[MPI-STRWORK] K={K} rank0 chunk {c} written "
-                          f"({done}/{my_n} trajectories)", flush=True)
+            with RankChunkWriter(k_dir, rank,
+                                 run_attrs=dict(K=int(K), seed=int(seed),
+                                                direction=str(direction),
+                                                my_n_trajectories=int(my_n))) as writer:
+                while done < my_n:
+                    n_chunk = min(ckpt, my_n - done)
+                    part = eng.run_trajectories(
+                        n_chunk, decorrelation_steps,
+                        n_topology_sweeps_per_lambda=n_topology_sweeps_per_lambda,
+                        n_qaqmc_sweeps_per_lambda=n_qaqmc_sweeps_per_lambda,
+                        direction=direction)
+                    parts.append(part.log_j_samples)
+                    done += n_chunk
+                    writer.write_chunk(
+                        c,
+                        datasets=dict(log_j_samples=part.log_j_samples),
+                        attrs=dict(K=int(K), n_trajectories=int(n_chunk),
+                                   trajectories_cumulative=int(done),
+                                   direction=str(direction)),
+                    )
+                    c += 1
+                    if rank == 0 and verbose:
+                        print(f"[MPI-STRWORK] K={K} rank0 chunk {c} written "
+                              f"({done}/{my_n} trajectories)", flush=True)
             local_log_j = (np.concatenate(parts) if parts
                            else np.empty(0, dtype=np.float64))
         else:
@@ -198,13 +203,12 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 base = str(filepath)
                 out_dir = (base[:-3] if base.endswith(".h5") else base) + "_configs"
             if out_dir:
-                from src.mpi.warm_start import save_rank_config
-                save_rank_config(
-                    out_dir, rank,
-                    datasets=dict(
-                        op_types=np.asarray(eng._eng.op_types, dtype=np.int32),
-                        op_sites=np.asarray(eng._eng.op_sites, dtype=np.int32)),
-                    attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
+                with RankChunkWriter(out_dir, rank) as w:
+                    w.write_final_config(
+                        datasets=dict(
+                            op_types=np.asarray(eng._eng.op_types, dtype=np.int32),
+                            op_sites=np.asarray(eng._eng.op_sites, dtype=np.int32)),
+                        attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed)))
                 if rank == 0 and verbose:
                     print(f"[MPI-STRWORK] final configs saved → {out_dir}", flush=True)
 

@@ -1,255 +1,248 @@
 """
-MPI-parallel SSE: each rank runs an independent Markov chain.
-Rank 0 gathers samples and writes a single HDF5 file.
+MPI-parallel finite-temperature SSE: each rank runs an independent Markov chain
+and writes a single self-contained HDF5 file ``<run_dir>/rank{r}.h5`` holding
+one ``chunk{i}`` group per bin plus a ``final_config`` group for warm starting.
+
+Storage model (shared with the profile / work drivers, see src.mpi.chunk_io):
+``--checkpoint`` is the merged bin==flush size.  Every ``checkpoint`` samples
+each rank forms one bin (means of energy / density / mz / n_ops over those
+samples) and appends it as the next chunk; a crash loses at most one bin.  The
+final spin configuration + operator string + RNG state are saved in the same
+file so a later run pointed at this directory (``--config-in``) resumes without
+re-thermalizing.
 
 Usage:
-    mpirun -np 4 python -m src.mpi.sse_mpi --N 64 --beta 10 --delta 2.0 ...
+    mpirun -np 4 python -m src.mpi.sse_mpi \\
+        --lattice kagome_bond_triangle --nx 6 --ny 6 --a 4.0 \\
+        --beta 10 --delta 2.0 --Rb 2.4 \\
+        --n-equil 5000 --n-samples 50000 --checkpoint 250 \\
+        --run-dir data/sse_6x6
 
 Requires: mpi4py, h5py, numpy
 """
 
-import numpy as np
-import h5py
-import time
-import datetime
 import argparse
+import datetime
 import json
 import os
+import sys
+import time
+
+import numpy as np
 
 try:
     from mpi4py import MPI
 except ImportError:
     raise ImportError("mpi4py is required for MPI mode. Install with: pip install mpi4py")
 
-try:
-    from tqdm import tqdm
-    HAS_TQDM = True
-except ImportError:
-    HAS_TQDM = False
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from src.engines.sse import SSE_Rydberg
+from src.mpi.chunk_io import RankChunkWriter, check_config_compat, load_warm_config
 
 
-def _make_tqdm_callback(total, desc):
-    """Create a progress bar (rank 0 only)."""
-    if not HAS_TQDM:
-        return None
-    return tqdm(total=total, desc=desc, unit='step', leave=True)
+def _make_pos(lattice, N, nx, ny, a):
+    """Build atom positions for the requested lattice; returns (pos, N)."""
+    if lattice == "1d_chain":
+        from src.rydberg.lattices import generate_1d_chain
+        if N <= 0:
+            raise ValueError("--N must be > 0 for 1d_chain")
+        return np.ascontiguousarray(generate_1d_chain(N, a), dtype=np.float64), N
+    if lattice == "kagome_bond":
+        from src.rydberg.lattices import generate_kagome_bond_lattice
+        pos = np.ascontiguousarray(generate_kagome_bond_lattice(nx, ny, a),
+                                   dtype=np.float64)
+        return pos, len(pos)
+    if lattice == "kagome_bond_triangle":
+        from src.rydberg.lattices import generate_kagome_bond_triangle_lattice
+        pos = np.ascontiguousarray(
+            generate_kagome_bond_triangle_lattice(nx, ny, a), dtype=np.float64)
+        return pos, len(pos)
+    raise ValueError(f"unsupported lattice {lattice!r}")
 
 
-def run_mpi(*, N, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
-            pos=None, epsilon=0.01, seed=42,
-            n_equil=5000, n_samples=50000,
-            filepath='data/sse_mpi.h5', neighbor_cutoff=None,
-            compression='gzip', compression_opts=4,
-            verbose=True):
-    """
-    MPI-parallel SSE simulation.
+def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
+            epsilon=0.01, seed=42, n_equil=5000, n_samples=50000,
+            checkpoint=250, run_dir="data/sse_mpi", neighbor_cutoff=None,
+            config_in=None, verbose=True):
+    """MPI-parallel SSE with per-rank chunked output and warm start.
 
-    Each rank runs an independent Markov chain with a different seed.
-    Rank 0 gathers scalar observable arrays and writes a single HDF5 file.
-
-    Parameters
-    ----------
-    N, Omega, delta, Rb, beta, pos, epsilon, seed:
-        Same as SSE_Rydberg.__init__
-    n_equil, n_samples:
-        Per-rank equilibration and total samples (split across ranks)
-    filepath:
-        Output HDF5 path (written by rank 0)
-    neighbor_cutoff:
-        Keep only first N neighbor shells (-1 = all bonds)
-    compression, compression_opts:
-        HDF5 compression settings
-    verbose:
-        Print progress info (only rank 0 prints)
+    Each rank runs an independent chain (seed = seed + rank*9973), bins its
+    per-step scalar observables every ``checkpoint`` samples into a chunk, and
+    saves its final configuration for warm starting.  ``n_samples`` is the
+    total across ranks; each rank gets ``ceil`` its share.
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
 
-    # Split total samples across ranks
-    base = n_samples // n_ranks
-    rem = n_samples % n_ranks
-    my_n_samples = base + (1 if rank < rem else 0)
+    pos, N = _make_pos(lattice, N, nx, ny, a)
 
-    # Compute write offsets
-    counts = np.array([base + (1 if r < rem else 0) for r in range(n_ranks)])
-    offsets = np.zeros(n_ranks, dtype=int)
-    for r in range(1, n_ranks):
-        offsets[r] = offsets[r - 1] + counts[r - 1]
-    my_offset = offsets[rank]
+    # Per-rank sample budget, rounded up to a whole number of bins.
+    base = -(-int(n_samples) // n_ranks)  # ceil so every rank has >= n_samples/n_ranks
+    if checkpoint <= 0:
+        raise ValueError("--checkpoint (samples per bin) must be > 0")
+    n_bins = max(1, -(-base // int(checkpoint)))
+    my_n_samples = n_bins * int(checkpoint)
 
     if verbose and rank == 0:
-        print(f"[MPI-SSE] {n_ranks} ranks, {n_samples} total samples "
-              f"({my_n_samples} per rank +/- 1)")
+        print(f"[MPI-SSE] {lattice} N={N}, {n_ranks} ranks, "
+              f"{n_bins} bins × {checkpoint} samples = {my_n_samples}/rank "
+              f"({n_ranks * my_n_samples} total)", flush=True)
 
-    # Each rank gets a different seed
     rank_seed = seed + rank * 9973
-
-    # Create engine
     engine = SSE_Rydberg(
-        N=N, Omega=Omega, delta=delta, Rb=Rb,
-        beta=beta, epsilon=epsilon, seed=rank_seed,
-        pos=pos, use_cpp=True, verbose=False,
-        neighbor_cutoff=neighbor_cutoff,
+        N=N, Omega=Omega, delta=delta, Rb=Rb, beta=beta,
+        epsilon=epsilon, seed=rank_seed, pos=pos, use_cpp=True,
+        verbose=False, neighbor_cutoff=neighbor_cutoff,
+    )
+    cpp = engine._cpp_engine
+    if cpp is None:
+        raise RuntimeError("SSE MPI mode requires the C++ backend")
+
+    # ── Warm start: install a saved configuration, skip thermalization ──────
+    if config_in:
+        cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
+        if cfg is None:
+            raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
+        check_config_compat(cfg, dict(N=int(N), lattice=str(lattice)),
+                            f"sse rank {rank}")
+        cpp.set_config(
+            np.ascontiguousarray(cfg["state"], dtype=np.int32),
+            np.ascontiguousarray(cfg["op_types"], dtype=np.int32),
+            np.ascontiguousarray(cfg["op_sites"], dtype=np.int32))
+        rng_state = cfg["attrs"].get("rng_state")
+        if rng_state is not None and int(cfg["attrs"].get("rank", -1)) == rank:
+            cpp.set_rng_state(rng_state)
+        n_equil = 0
+        if rank == 0 and verbose:
+            print(f"[MPI-SSE] warm start from {config_in} — thermalization skipped",
+                  flush=True)
+
+    # ── Equilibration ───────────────────────────────────────────────────────
+    comm.Barrier()
+    t0 = time.perf_counter()
+    for _ in range(n_equil):
+        cpp.mc_step()
+    t_equil = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
+    if verbose and rank == 0:
+        print(f"[MPI-SSE] Equilibration done in {t_equil:.1f}s (slowest rank)",
+              flush=True)
+
+    # ── Sampling in bins → chunks ───────────────────────────────────────────
+    comm.Barrier()
+    t0 = time.perf_counter()
+
+    run_attrs = dict(
+        lattice=str(lattice), N=int(N), Omega=float(Omega), delta=float(delta),
+        Rb=float(Rb), beta=float(beta), epsilon=float(epsilon), seed=int(seed),
+        rank_seed=int(rank_seed), n_ranks=int(n_ranks), checkpoint=int(checkpoint),
+        n_bins=int(n_bins), samples_per_bin=int(checkpoint),
+        neighbor_cutoff=(-1 if neighbor_cutoff is None else int(neighbor_cutoff)),
+        timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
     )
 
-    # Equilibration
-    comm.Barrier()
-    t0 = time.perf_counter()
-    bar = _make_tqdm_callback(n_equil, "[MPI-SSE] Equil (rank0)") if (verbose and rank == 0) else None
-    for i in range(n_equil):
-        engine.mc_step()
-        if bar is not None and (i + 1) % 1000 == 0:
-            bar.update(1000)
-    if bar is not None:
-        bar.update(n_equil - bar.n)
-        bar.close()
-    t_equil = time.perf_counter() - t0
-    comm.Barrier()
+    with RankChunkWriter(run_dir, rank, run_attrs=run_attrs) as writer:
+        for c in range(n_bins):
+            raw = cpp.run(n_equil=0, n_samples=int(checkpoint),
+                          progress_callback=None, progress_every=1)
+            e = np.asarray(raw["energies"], dtype=np.float64)
+            d = np.asarray(raw["densities"], dtype=np.float64)
+            m = np.asarray(raw["mz"], dtype=np.float64)
+            no = np.asarray(raw["n_ops"], dtype=np.float64)
+            writer.write_chunk(c, datasets=dict(
+                energy=float(e.mean()), energy_sq=float((e**2).mean()),
+                density=float(d.mean()), density_sq=float((d**2).mean()),
+                mz=float(m.mean()), mz_abs=float(np.abs(m).mean()),
+                n_ops=float(no.mean()),
+            ), attrs=dict(n_samples=int(checkpoint), M=int(cpp.M)))
+            if verbose and rank == 0:
+                el = time.perf_counter() - t0
+                print(f"[MPI-SSE] rank0 chunk {c + 1}/{n_bins} "
+                      f"(⟨n⟩={d.mean():.4f}, {el:.0f}s)", flush=True)
 
-    if verbose and rank == 0:
-        max_eq = comm.reduce(t_equil, op=MPI.MAX, root=0)
-        print(f"[MPI-SSE] Equilibration done in {max_eq:.1f}s (slowest rank)")
-    else:
-        comm.reduce(t_equil, op=MPI.MAX, root=0)
+    # Warm-start config (spin state + operator string + RNG state) →
+    # <run_dir>/configs/rank{r}.h5, separate from the observable chunk files so
+    # it can be reclaimed independently (rm -rf <run_dir>/configs).
+    with RankChunkWriter(os.path.join(run_dir, "configs"), rank) as cfg_writer:
+        cfg_writer.write_final_config(
+            datasets=dict(
+                state=np.asarray(cpp.state, dtype=np.int32),
+                op_types=np.asarray(cpp.op_types, dtype=np.int32),
+                op_sites=np.asarray(cpp.op_sites, dtype=np.int32)),
+            attrs=dict(N=int(N), lattice=str(lattice), beta=float(beta),
+                       seed=int(rank_seed), rng_state=cpp.get_rng_state()))
 
-    # Sampling
-    t0 = time.perf_counter()
-    if engine._cpp_engine is not None:
-        raw = engine._cpp_engine.run(
-            n_equil=0, n_samples=my_n_samples,
-            progress_callback=None, progress_every=1
-        )
-        my_e = np.asarray(raw['energies'],  dtype=np.float64)
-        my_d = np.asarray(raw['densities'], dtype=np.float64)
-        my_m = np.asarray(raw['mz'],        dtype=np.float64)
-        my_n = np.asarray(raw['n_ops'],     dtype=np.int32)
-        M_final = int(engine._cpp_engine.M)
-    else:
-        my_e = np.empty(my_n_samples, dtype=np.float64)
-        my_d = np.empty(my_n_samples, dtype=np.float64)
-        my_m = np.empty(my_n_samples, dtype=np.float64)
-        my_n = np.empty(my_n_samples, dtype=np.int32)
-        bar = _make_tqdm_callback(my_n_samples, "[MPI-SSE] Samp (rank0)") if (verbose and rank == 0) else None
-        for i in range(my_n_samples):
-            engine.mc_step()
-            obs = engine.measure_observables()
-            my_e[i] = obs['energy']
-            my_d[i] = obs['density']
-            my_m[i] = obs['m_z']
-            my_n[i] = engine.n_ops
-            if bar is not None and (i + 1) % 1000 == 0:
-                bar.update(1000)
-        if bar is not None:
-            bar.update(my_n_samples - bar.n)
-            bar.close()
-        M_final = engine.M
-
-    t_sample = time.perf_counter() - t0
+    t_sample = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
     comm.Barrier()
 
-    if verbose and rank == 0:
-        max_sa = comm.reduce(t_sample, op=MPI.MAX, root=0)
-        print(f"[MPI-SSE] Sampling done in {max_sa:.1f}s (slowest rank)")
-    else:
-        comm.reduce(t_sample, op=MPI.MAX, root=0)
-
-    # ── Rank 0 writes HDF5 ───────────────────────────────────────────────
+    # One-time run metadata (geometry + params) from rank 0.
     if rank == 0:
-        kw = dict(compression=compression, compression_opts=compression_opts) \
-             if compression == 'gzip' else dict(compression=compression) \
-             if compression else {}
-
-        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
-
-        with h5py.File(filepath, 'w') as f:
-            pg = f.create_group('params')
-            pg.attrs['N']         = N
-            pg.attrs['Omega']     = Omega
-            pg.attrs['delta']     = delta
-            pg.attrs['Rb']        = Rb
-            pg.attrs['beta']      = beta
-            pg.attrs['epsilon']   = epsilon
-            pg.attrs['seed']      = seed
-            pg.attrs['n_equil']   = n_equil
-            pg.attrs['n_samples'] = n_samples
-            pg.attrs['n_ranks']   = n_ranks
-            pg.attrs['M_final']   = M_final
-            pg.attrs['backend']   = 'cpp' if engine._cpp_engine is not None else 'python'
-            pg.attrs['timestamp'] = datetime.datetime.utcnow().isoformat()
-            if neighbor_cutoff is not None:
-                pg.attrs['neighbor_cutoff'] = neighbor_cutoff
-
-            gg = f.create_group('geometry')
-            pos_stored = pos if pos is not None \
-                         else np.arange(N).reshape(-1, 1).astype(np.float64)
-            gg.create_dataset('pos', data=pos_stored.astype(np.float64))
-
-            sg = f.create_group('samples')
-            ds_e = sg.create_dataset('energies',  shape=(n_samples,), dtype='float64', **kw)
-            ds_d = sg.create_dataset('densities', shape=(n_samples,), dtype='float64', **kw)
-            ds_m = sg.create_dataset('mz',        shape=(n_samples,), dtype='float64', **kw)
-            ds_n = sg.create_dataset('n_ops',     shape=(n_samples,), dtype='int32',   **kw)
-
-            # Write rank 0's data
-            ds_e[my_offset:my_offset + my_n_samples] = my_e
-            ds_d[my_offset:my_offset + my_n_samples] = my_d
-            ds_m[my_offset:my_offset + my_n_samples] = my_m
-            ds_n[my_offset:my_offset + my_n_samples] = my_n
-
-            # Receive and write data from other ranks
-            for src in range(1, n_ranks):
-                src_count = int(counts[src])
-                src_offset = int(offsets[src])
-                buf_e = np.empty(src_count, dtype=np.float64)
-                buf_d = np.empty(src_count, dtype=np.float64)
-                buf_m = np.empty(src_count, dtype=np.float64)
-                buf_n = np.empty(src_count, dtype=np.int32)
-                comm.Recv(buf_e, source=src, tag=100 + src)
-                comm.Recv(buf_d, source=src, tag=200 + src)
-                comm.Recv(buf_m, source=src, tag=300 + src)
-                comm.Recv(buf_n, source=src, tag=400 + src)
-                ds_e[src_offset:src_offset + src_count] = buf_e
-                ds_d[src_offset:src_offset + src_count] = buf_d
-                ds_m[src_offset:src_offset + src_count] = buf_m
-                ds_n[src_offset:src_offset + src_count] = buf_n
-
+        import h5py
+        with h5py.File(os.path.join(run_dir, "meta.h5"), "w") as f:
+            for k, v in run_attrs.items():
+                f.attrs[k] = v
+            f.attrs["n_samples_total"] = int(n_ranks * my_n_samples)
+            f.create_dataset("pos", data=np.asarray(pos, dtype=np.float64))
         if verbose:
-            print(f"[MPI-SSE] Saved {n_samples} samples -> {filepath}")
-    else:
-        # Non-root ranks send their data to rank 0
-        comm.Send(np.ascontiguousarray(my_e), dest=0, tag=100 + rank)
-        comm.Send(np.ascontiguousarray(my_d), dest=0, tag=200 + rank)
-        comm.Send(np.ascontiguousarray(my_m), dest=0, tag=300 + rank)
-        comm.Send(np.ascontiguousarray(my_n), dest=0, tag=400 + rank)
+            print(f"[MPI-SSE] Sampling done in {t_sample:.1f}s; "
+                  f"{n_bins} chunk(s)/rank → {run_dir}", flush=True)
+    return run_dir
 
-    comm.Barrier()
-    return filepath
+
+def combine_run(run_dir, burn_in_fraction=0.5):
+    """Read all rank files and return burn-in-trimmed observable means/errors.
+
+    Convenience aggregator (rank-0 / post-processing use).  Each chunk is one
+    bin; per-rank burn-in drops the first ``burn_in_fraction`` of chunks.
+    """
+    from src.mpi.chunk_io import iter_rank_chunks
+    keys = ("energy", "density", "mz", "mz_abs", "n_ops")
+    acc = {k: [] for k in keys}
+    for _r, _c, g in iter_rank_chunks(run_dir, burn_in_fraction=burn_in_fraction):
+        for k in keys:
+            if k in g:
+                acc[k].append(float(g[k][()]))
+    out = {}
+    for k, vals in acc.items():
+        if vals:
+            arr = np.asarray(vals)
+            out[k] = float(arr.mean())
+            out[k + "_err"] = float(arr.std(ddof=1) / np.sqrt(len(arr))) if len(arr) > 1 else 0.0
+    out["n_bins_kept"] = len(acc["density"])
+    return out
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='MPI-parallel SSE simulation')
-    parser.add_argument('--config', type=str, help='JSON config file')
-    parser.add_argument('--N', type=int, default=8)
-    parser.add_argument('--Omega', type=float, default=1.0)
-    parser.add_argument('--delta', type=float, default=0.0)
-    parser.add_argument('--Rb', type=float, default=1.4)
-    parser.add_argument('--beta', type=float, default=10.0)
-    parser.add_argument('--epsilon', type=float, default=0.01)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--n_equil', type=int, default=5000)
-    parser.add_argument('--n_samples', type=int, default=50000)
-    parser.add_argument('--neighbor_cutoff', type=int, default=None)
-    parser.add_argument('--filepath', type=str, default='data/sse_mpi.h5')
-    parser.add_argument('--lattice', type=str, default='1d_chain',
-                        help='Lattice type: 1d_chain, kagome_bond')
-    parser.add_argument('--a', type=float, default=1.0, help='Lattice constant')
-    parser.add_argument('--nx', type=int, default=1)
-    parser.add_argument('--ny', type=int, default=1)
+    parser = argparse.ArgumentParser(description="MPI-parallel SSE simulation")
+    parser.add_argument("--config", type=str, help="JSON config file")
+    parser.add_argument("--lattice", type=str, default="kagome_bond_triangle",
+                        choices=["1d_chain", "kagome_bond", "kagome_bond_triangle"])
+    parser.add_argument("--N", type=int, default=0, help="(1d_chain) site count")
+    parser.add_argument("--nx", type=int, default=6)
+    parser.add_argument("--ny", type=int, default=6)
+    parser.add_argument("--a", type=float, default=4.0, help="lattice constant")
+    parser.add_argument("--Omega", type=float, default=1.0)
+    parser.add_argument("--delta", type=float, default=0.0)
+    parser.add_argument("--Rb", type=float, default=2.4)
+    parser.add_argument("--beta", type=float, default=10.0)
+    parser.add_argument("--epsilon", type=float, default=0.01)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-equil", type=int, default=5000)
+    parser.add_argument("--n-samples", type=int, default=50000,
+                        help="total samples across ranks")
+    parser.add_argument("--checkpoint", type=int, default=250,
+                        help="samples per bin == chunk flush size (merged)")
+    parser.add_argument("--neighbor-cutoff", type=int, default=-1)
+    parser.add_argument("--run-dir", type=str, default="data/sse_mpi",
+                        help="output directory; each rank writes rank{r}.h5 here")
+    parser.add_argument("--config-in", type=str, default=None,
+                        help="warm-start dir of a previous run (rank{r}.h5 with "
+                             "final_config); when given, thermalization is skipped")
     args = parser.parse_args()
 
     config = vars(args)
@@ -257,28 +250,17 @@ def main():
         with open(args.config) as f:
             config.update(json.load(f))
 
-    # Generate lattice
-    pos = None
-    lattice = config.get('lattice', '1d_chain')
-    if lattice == '1d_chain':
-        from src.rydberg.lattices import generate_1d_chain
-        pos = generate_1d_chain(config['N'], config.get('a', 1.0))
-    elif lattice == 'kagome_bond':
-        from src.rydberg.lattices import generate_kagome_bond_lattice
-        pos = generate_kagome_bond_lattice(
-            nx=config.get('nx', 1), ny=config.get('ny', 1),
-            a=config.get('a', 4.0))
-        config['N'] = len(pos)
+    neighbor_cutoff = None if int(config["neighbor_cutoff"]) < 0 else int(config["neighbor_cutoff"])
 
     run_mpi(
-        N=config['N'], Omega=config['Omega'], delta=config['delta'],
-        Rb=config['Rb'], beta=config['beta'],
-        pos=pos, epsilon=config['epsilon'], seed=config['seed'],
-        n_equil=config['n_equil'], n_samples=config['n_samples'],
-        filepath=config['filepath'],
-        neighbor_cutoff=config.get('neighbor_cutoff'),
+        lattice=config["lattice"], N=config["N"], nx=config["nx"], ny=config["ny"],
+        a=config["a"], Omega=config["Omega"], delta=config["delta"], Rb=config["Rb"],
+        beta=config["beta"], epsilon=config["epsilon"], seed=config["seed"],
+        n_equil=config["n_equil"], n_samples=config["n_samples"],
+        checkpoint=config["checkpoint"], run_dir=config["run_dir"],
+        neighbor_cutoff=neighbor_cutoff, config_in=config.get("config_in"),
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

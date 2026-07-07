@@ -5,17 +5,21 @@
 #include <cmath>
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 
-// ─── RNG helpers (local to this translation unit) ────────────────────────────
+// RNG: uniform01 / randint from qaqmc_core.hpp (Lemire bounded int + top-53-bit
+// uniform) — same helpers as the QAQMC engines, no per-call distribution objects.
 
-static inline double sse_u01(std::mt19937_64& rng) {
-    std::uniform_real_distribution<double> d(0.0, 1.0);
-    return d(rng);
+// ─── Packed bond-op vertex entries: [ p : 32 ][ b : 31 ][ endpoint : 1 ] ─────
+
+static inline int64_t sse_pack_bond_entry(int p, int b, int endpoint) {
+    return (static_cast<int64_t>(p) << 32)
+         | (static_cast<int64_t>(static_cast<uint32_t>(b)) << 1)
+         | static_cast<int64_t>(endpoint & 1);
 }
-static inline int sse_randi(std::mt19937_64& rng, int n) {
-    std::uniform_int_distribution<int> d(0, n - 1);
-    return d(rng);
-}
+static inline int sse_entry_p(int64_t e)        { return static_cast<int>(e >> 32); }
+static inline int sse_entry_b(int64_t e)        { return static_cast<int>((e >> 1) & 0x7FFFFFFF); }
+static inline int sse_entry_endpoint(int64_t e) { return static_cast<int>(e & 1); }
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Constructor
@@ -37,7 +41,7 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
 
     // ── Compute bond weights ──────────────────────────────────────────────────
     bond_W_.assign(n_bonds_pad * 4, 0.0);
-    bond_W_max_.assign(n_bonds_pad, 0.0);
+    bond_W_rmax_.assign(n_bonds_pad, 0.0);
     energy_shift_ = 0.0;
 
     std::vector<double> weights;
@@ -67,7 +71,7 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
 
         // SSE-specific cij: raw0 = 0 is deliberately excluded from m_abs so
         // that the epsilon safety margin stays effective.  This guarantees
-        // W[|11>] > 0, which prevents log(0) in the cluster update.
+        // W[|11>] > 0, which prevents zero weights in the cluster update.
         //
         // Raw diagonal elements of (-H_bond):
         //   raw0 = 0            (|00>)
@@ -94,7 +98,7 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
         bond_W_[b * 4 + 1] = W[1];
         bond_W_[b * 4 + 2] = W[2];
         bond_W_[b * 4 + 3] = W[3];
-        bond_W_max_[b] = bmax;
+        bond_W_rmax_[b] = (bmax > 0.0) ? 1.0 / bmax : 0.0;
 
         energy_shift_ += W[0];  // W[0] == cij (bond offset constant)
         norm_N_        += bmax;
@@ -110,32 +114,35 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
     // shifting the energy by -N*Omega/2.  Correct for this here.
     energy_shift_ += N * Omega / 2.0;
 
+    beta_norm_     = beta_ * norm_N_;
+    inv_beta_norm_ = (beta_norm_ > 0.0) ? 1.0 / beta_norm_ : 0.0;
+
     // ── Build alias table (Vose's algorithm) ─────────────────────────────────
     n_alias_ = (int)weights.size();
-    alias_prob_.resize(n_alias_);
-    alias_idx_.resize(n_alias_);
-    op_map_kind_.resize(n_alias_);
-    op_map_loc_.resize(n_alias_);
-
+    std::vector<double>  prob(n_alias_);
+    std::vector<int32_t> alias(n_alias_);
     for (int i = 0; i < n_alias_; ++i) {
-        op_map_kind_[i] = op_kind[i];
-        op_map_loc_[i]  = op_loc[i];
-        alias_prob_[i]  = weights[i] * n_alias_ / norm_N_;
-        alias_idx_[i]   = i;
+        prob[i]  = weights[i] * n_alias_ / norm_N_;
+        alias[i] = i;
     }
-
     std::vector<int> small, large;
     for (int i = 0; i < n_alias_; ++i) {
-        if (alias_prob_[i] < 1.0) small.push_back(i);
-        else                       large.push_back(i);
+        if (prob[i] < 1.0) small.push_back(i);
+        else               large.push_back(i);
     }
     while (!small.empty() && !large.empty()) {
         int s = small.back(); small.pop_back();
         int l = large.back(); large.pop_back();
-        alias_idx_[s]    = l;
-        alias_prob_[l]  -= (1.0 - alias_prob_[s]);
-        if (alias_prob_[l] < 1.0) small.push_back(l);
-        else                       large.push_back(l);
+        alias[s]  = l;
+        prob[l]  -= (1.0 - prob[s]);
+        if (prob[l] < 1.0) small.push_back(l);
+        else               large.push_back(l);
+    }
+    alias_entries_.resize(n_alias_);
+    for (int i = 0; i < n_alias_; ++i) {
+        alias_entries_[i].prob     = prob[i];
+        alias_entries_[i].alias    = alias[i];
+        alias_entries_[i].loc_kind = (op_loc[i] << 1) | op_kind[i];
     }
 
     // ── Initial spin state (random) ───────────────────────────────────────────
@@ -157,7 +164,7 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Checkpoint
+// Checkpoint / warm start
 // ═════════════════════════════════════════════════════════════════════════════
 
 std::string SSEEngine::get_rng_state() const {
@@ -169,6 +176,41 @@ std::string SSEEngine::get_rng_state() const {
 void SSEEngine::set_rng_state(const std::string& s) {
     std::istringstream iss(s);
     iss >> rng_;
+}
+
+void SSEEngine::set_config(const int32_t* state, int n_state,
+                           const int32_t* types, const int32_t* sites, int len) {
+    if (n_state != N_)
+        throw std::runtime_error("set_config: state length != N");
+    if (len <= 0)
+        throw std::runtime_error("set_config: empty operator string");
+    for (int i = 0; i < N_; ++i)
+        if (state[i] != 0 && state[i] != 1)
+            throw std::runtime_error("set_config: state entries must be 0/1");
+
+    int n_ops = 0;
+    for (int p = 0; p < len; ++p) {
+        int ot = types[p];
+        if (ot == 0) continue;
+        if (ot == 1 || ot == -1) {
+            if (sites[p] < 0 || sites[p] >= N_)
+                throw std::runtime_error("set_config: site index out of range");
+        } else if (ot == 2) {
+            if (sites[p] < 0 || sites[p] >= vij_.n_bonds)
+                throw std::runtime_error("set_config: bond index out of range");
+        } else {
+            throw std::runtime_error("set_config: op type must be in {-1,0,1,2}");
+        }
+        ++n_ops;
+    }
+
+    std::copy(state, state + N_, state_.begin());
+    op_types_.assign(types, types + len);
+    op_sites_.assign(sites, sites + len);
+    M_ = len;
+    n_ops_ = n_ops;
+    bond_spin_.assign(M_, 0);
+    vertex_counts_valid_ = false;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -212,7 +254,7 @@ void SSEEngine::adjust_M_if_needed() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Diagonal Update
+// Diagonal Update  (+ fused vertex-list counting)
 // ═════════════════════════════════════════════════════════════════════════════
 //
 // For each position p in the operator string:
@@ -223,90 +265,116 @@ void SSEEngine::adjust_M_if_needed() {
 // Insertion is a two-step process:
 //   1. Sample category (site vs bond) from alias table — O(1)
 //   2. For bond ops: acceptance/rejection based on state-specific weight
+//
+// The per-site op/bond counting that build_vertex_lists' first pass used to
+// do is fused here: the op at each slot is final once this sweep passes it,
+// and cluster_update's 1 <-> -1 toggles are count-neutral.
 
 void SSEEngine::diagonal_update() {
     const int* bond_sites = vij_.bond_sites_flat.data();
+    const AliasEntry* tab = alias_entries_.data();
+
+    std::fill(site_op_count_.begin(), site_op_count_.end(), 0);
+    std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
 
     for (int p = 0; p < M_; ++p) {
         int ot = op_types_[p];
 
         if (ot == -1) {
             // ── Off-diagonal: propagate state ─────────────────────────────
-            state_[op_sites_[p]] ^= 1;
+            int s = op_sites_[p];
+            state_[s] ^= 1;
+            site_op_count_[s]++;
 
         } else if (ot == 1 || ot == 2) {
             // ── Diagonal: try removal ─────────────────────────────────────
+            // accept prob = min(1, (M-n+1) / (beta*normN)); the clipping is
+            // implicit in the u < prob comparison.
             double prob_remove = static_cast<double>(M_ - n_ops_ + 1)
-                                 / (beta_ * norm_N_);
-            if (prob_remove > 1.0) prob_remove = 1.0;
-            if (sse_u01(rng_) < prob_remove) {
+                                 * inv_beta_norm_;
+            if (uniform01(rng_) < prob_remove) {
                 op_types_[p] = 0;
                 op_sites_[p] = -1;
                 n_ops_--;
+            } else if (ot == 1) {
+                site_op_count_[op_sites_[p]]++;
+            } else {
+                int b = op_sites_[p];
+                site_bond_count_[bond_sites[b * 2 + 0]]++;
+                site_bond_count_[bond_sites[b * 2 + 1]]++;
             }
 
         } else {
             // ot == 0: identity — try insertion
             if (n_ops_ == M_) continue;  // buffer full (should not normally occur)
 
-            double prob_insert = beta_ * norm_N_
-                                 / static_cast<double>(M_ - n_ops_);
-            if (prob_insert > 1.0) prob_insert = 1.0;
-
-            if (sse_u01(rng_) < prob_insert) {
+            // accept prob = min(1, beta*normN / (M-n)):
+            //   u < bn/(M-n)  ⟺  u*(M-n) < bn   (division-free, same test)
+            if (uniform01(rng_) * static_cast<double>(M_ - n_ops_) < beta_norm_) {
                 // Sample from alias table
-                int i   = sse_randi(rng_, n_alias_);
-                int idx = (sse_u01(rng_) < alias_prob_[i]) ? i : (int)alias_idx_[i];
+                int i   = randint(rng_, n_alias_);
+                const AliasEntry& e = tab[i];
+                int idx = (uniform01(rng_) < e.prob) ? i : (int)e.alias;
 
-                int kind = op_map_kind_[idx];
-                int loc  = op_map_loc_[idx];
+                int lk  = tab[idx].loc_kind;
+                int loc = lk >> 1;
 
-                if (kind == 0) {
+                if ((lk & 1) == 0) {
                     // Single-site diagonal op
                     op_types_[p] = 1;
                     op_sites_[p] = loc;
+                    site_op_count_[loc]++;
                     n_ops_++;
                 } else {
                     // Bond diagonal op — additional acceptance/rejection
+                    // against the precomputed reciprocal envelope (rmax == 0
+                    // when W_max <= 0, making the test false).
                     int b      = loc;
                     int si     = bond_sites[b * 2 + 0];
                     int sj     = bond_sites[b * 2 + 1];
                     int w_idx  = state_[si] * 2 + state_[sj];
-                    double w_act = bond_W_[b * 4 + w_idx];
-                    double w_max = bond_W_max_[b];
-                    if (w_max > 0.0 && sse_u01(rng_) < w_act / w_max) {
+                    if (uniform01(rng_) < bond_W_[b * 4 + w_idx] * bond_W_rmax_[b]) {
                         op_types_[p] = 2;
                         op_sites_[p] = b;
+                        site_bond_count_[si]++;
+                        site_bond_count_[sj]++;
                         n_ops_++;
                     }
                 }
             }
         }
     }
+    vertex_counts_valid_ = true;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// build_vertex_lists  —  O(M + N) two-pass counting sort
+// build_vertex_lists  —  O(M + N) counting sort
 // ═════════════════════════════════════════════════════════════════════════════
+//
+// The counting pass is normally fused into diagonal_update (the op at each
+// slot is final once the diagonal sweep passes it, and the cluster update's
+// 1 <-> -1 toggles are count-neutral), so this only re-counts when the
+// configuration was replaced externally (set_config).  The fill pass is
+// additionally fused with the former cluster Phase B: it propagates
+// spin_now_ from state_ (tau=0 boundary) and records bond_spin_[p] in the
+// same sweep.
 
 void SSEEngine::build_vertex_lists() {
     const int M = M_, N = N_;
     const int* bond_sites = vij_.bond_sites_flat.data();
 
-    // Pass 1: count
-    std::fill(site_op_count_.begin(), site_op_count_.end(), 0);
-    std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
-
-    for (int p = 0; p < M; ++p) {
-        int ot = op_types_[p];
-        if (ot == 1 || ot == -1) {
-            site_op_count_[op_sites_[p]]++;
-        } else if (ot == 2) {
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            int sj = bond_sites[b * 2 + 1];
-            site_bond_count_[si]++;
-            site_bond_count_[sj]++;
+    if (!vertex_counts_valid_) {
+        std::fill(site_op_count_.begin(), site_op_count_.end(), 0);
+        std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
+        for (int p = 0; p < M; ++p) {
+            int ot = op_types_[p];
+            if (ot == 1 || ot == -1) {
+                site_op_count_[op_sites_[p]]++;
+            } else if (ot == 2) {
+                int b = op_sites_[p];
+                site_bond_count_[bond_sites[b * 2 + 0]]++;
+                site_bond_count_[bond_sites[b * 2 + 1]]++;
+            }
         }
     }
 
@@ -323,23 +391,25 @@ void SSEEngine::build_vertex_lists() {
     site_op_list_.resize(total_sops);
     site_bond_list_.resize(total_bents);
 
-    // Pass 2: fill (use bond_count as cursor, reset after)
-    // Temporary cursors — reuse spin_now_ wouldn't be safe; use local vectors.
-    // To avoid allocation, reuse site_op_count_ as cursor then restore.
     std::vector<int32_t> cur_op(N, 0);
     std::vector<int32_t> cur_bond(N, 0);
+
+    // Fill pass + former Phase B (bond_spin_ from tau=0 state_ propagation).
+    std::copy(state_.begin(), state_.end(), spin_now_.begin());
 
     for (int p = 0; p < M; ++p) {
         int ot = op_types_[p];
         if (ot == 1 || ot == -1) {
             int s = op_sites_[p];
             site_op_list_[site_op_head_[s] + cur_op[s]++] = p;
+            if (ot == -1) spin_now_[s] ^= 1;
         } else if (ot == 2) {
             int b  = op_sites_[p];
             int si = bond_sites[b * 2 + 0];
             int sj = bond_sites[b * 2 + 1];
-            site_bond_list_[site_bond_head_[si] + cur_bond[si]++] = p;
-            site_bond_list_[site_bond_head_[sj] + cur_bond[sj]++] = p;
+            bond_spin_[p] = (int8_t)(spin_now_[si] * 2 + spin_now_[sj]);
+            site_bond_list_[site_bond_head_[si] + cur_bond[si]++] = sse_pack_bond_entry(p, b, 0);
+            site_bond_list_[site_bond_head_[sj] + cur_bond[sj]++] = sse_pack_bond_entry(p, b, 1);
         }
     }
 }
@@ -348,88 +418,86 @@ void SSEEngine::build_vertex_lists() {
 // Cluster (Line) Update  —  O(M) via vertex lists
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// Phase A: build per-site vertex lists (O(M+N))
-// Phase B: single O(M) pass to record bond_spin_[p] at each bond-op position
+// Phase A: build per-site vertex lists (+ fused bond_spin_ fill)
 // Phase C: per-site segment Metropolis using only per-site bond-op lists
 // Phase D: reassign op_types using segment flip decisions (O(n_ops_total))
+//
+// PERIODIC boundary conditions: segments wrap across tau = 0, and a flipped
+// wrapping segment (or a site with no single-site ops) also flips state_.
 
 void SSEEngine::cluster_update() {
     if (M_ == 0) return;
 
-    const int* bond_sites = vij_.bond_sites_flat.data();
-    const int  M = M_, N = N_;
+    const int N = N_;
 
-    // ── Phase A: build vertex lists ──────────────────────────────────────────
+    // ── Phase A (+ fused former Phase B: bond_spin_ fill) ────────────────────
     build_vertex_lists();
 
-    // ── Phase B: compute bond_spin_[p] for every bond op ─────────────────────
-    //   Single O(M) forward pass propagating spin from state_ (tau=0 boundary).
-    std::copy(state_.begin(), state_.end(), spin_now_.begin());
-    for (int p = 0; p < M; ++p) {
-        int ot = op_types_[p];
-        if (ot == 2) {
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            int sj = bond_sites[b * 2 + 1];
-            bond_spin_[p] = spin_now_[si] * 2 + spin_now_[sj];
-        } else if (ot == -1) {
-            spin_now_[op_sites_[p]] ^= 1;
-        }
-    }
+    // Metropolis accumulator for flipping one segment: plain product of
+    // weight ratios Π w_new/w_old (no std::log in the hot loop — the same
+    // accept probability as the previous log-sum form).  Zero weights are
+    // tallied separately so "excluded → allowed" (inf) and "allowed →
+    // excluded" (0) factors can't produce inf*0 = NaN; the running product is
+    // renormalised by 1e±100 so long segments can't over/underflow.  A
+    // wrapping segment accumulates two ranges (tail + head) before the single
+    // accept decision.
+    struct RatioAcc {
+        double ratio = 1.0;
+        int shift = 0;      // ratio_total = ratio * 1e100^shift
+        int inf_ct = 0;     // factors with w_old == 0 < w_new  (force-accept)
+        int zero_ct = 0;    // factors with w_new == 0 < w_old  (force-reject)
+    };
 
-    // ── Phase C: per-site segment processing ─────────────────────────────────
-    //   For each site, iterate only over that site's bond ops (from vertex list).
-    //   Segments between consecutive single-site ops; Metropolis accept/reject.
-
-    // Helper: compute log(W_new/W_old) for a range of bond-op indices
-    // [j_begin, j_end) in site_bond_list_, flipping site_i.
-    auto lr_for_range = [&](int site_i, int bop_base, int j_begin, int j_end) -> double {
-        double lr = 0.0;
+    auto accum_range = [&](RatioAcc& a, int bop_base, int j_begin, int j_end) {
         for (int j = j_begin; j < j_end; ++j) {
-            int p  = site_bond_list_[bop_base + j];
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            int sj = bond_sites[b * 2 + 1];
-            int w_idx = bond_spin_[p];
-            double w_old = bond_W_[b * 4 + w_idx];
-            double w_new;
-            if (si == site_i) {
-                int ni = w_idx >> 1, nj = w_idx & 1;
-                w_new = bond_W_[b * 4 + (1 - ni) * 2 + nj];
-            } else {
-                int ni = w_idx >> 1, nj = w_idx & 1;
-                w_new = bond_W_[b * 4 + ni * 2 + (1 - nj)];
+            const int64_t e = site_bond_list_[bop_base + j];
+            const int p  = sse_entry_p(e);
+            const int b  = sse_entry_b(e);
+            const int ep = sse_entry_endpoint(e);
+            const int w_idx   = bond_spin_[p];
+            const int new_idx = w_idx ^ (ep == 0 ? 2 : 1);
+            const double w_old = bond_W_[b * 4 + w_idx];
+            const double w_new = bond_W_[b * 4 + new_idx];
+
+            if (w_new > 1e-300) {
+                if (w_old > 1e-300) {
+                    a.ratio *= w_new / w_old;
+                    if (a.ratio > 1e100)       { a.ratio *= 1e-100; ++a.shift; }
+                    else if (a.ratio < 1e-100) { a.ratio *= 1e100;  --a.shift; }
+                } else {
+                    ++a.inf_ct;
+                }
+            } else if (w_old > 1e-300) {
+                ++a.zero_ct;
             }
-            lr += ((w_new > 1e-300) ? std::log(w_new) : -1e30)
-                - ((w_old > 1e-300) ? std::log(w_old) : -1e30);
+            // w_new == w_old == 0: neutral factor (matches the old
+            // (-1e30) - (-1e30) = 0 convention).
         }
-        return lr;
     };
 
-    // Helper: flip site_i bit in bond_spin_[p] for range [j_begin, j_end)
-    auto flip_bond_range = [&](int site_i, int bop_base, int j_begin, int j_end) {
+    auto accept = [&](const RatioAcc& a) -> bool {
+        if (a.inf_ct != a.zero_ct) return a.inf_ct > a.zero_ct;
+        if (a.shift >= 1) return true;
+        if (a.shift <= -2) return false;
+        const double r = (a.shift == -1) ? a.ratio * 1e-100 : a.ratio;
+        return (r >= 1.0) || (uniform01(rng_) < r);
+    };
+
+    // Helper: flip this site's bit in bond_spin_[p] for range [j_begin, j_end)
+    auto flip_bond_range = [&](int bop_base, int j_begin, int j_end) {
         for (int j = j_begin; j < j_end; ++j) {
-            int p  = site_bond_list_[bop_base + j];
-            int b  = op_sites_[p];
-            int si = bond_sites[b * 2 + 0];
-            if (si == site_i)
-                bond_spin_[p] ^= 2;  // flip bit 1 (ni)
-            else
-                bond_spin_[p] ^= 1;  // flip bit 0 (nj)
+            const int64_t e = site_bond_list_[bop_base + j];
+            bond_spin_[sse_entry_p(e)] ^= (sse_entry_endpoint(e) == 0 ? 2 : 1);
         }
     };
 
-    // Helper: find first index j in site_bond_list_[bop_base..bop_base+n_bops-1]
-    // where site_bond_list_[bop_base + j] > val.  (list is sorted ascending)
+    // Helper: first index j in the site's packed list with entry_p > val.
+    // Entries are packed [p:32][b:31][endpoint:1] in ascending p order; the
+    // key below is the largest packed value with entry_p == val.
     auto upper_bound_idx = [&](int bop_base, int n_bops, int val) -> int {
-        const int32_t* base = site_bond_list_.data() + bop_base;
-        return (int)(std::upper_bound(base, base + n_bops, val) - base);
-    };
-
-    // Helper: find first index j where site_bond_list_[bop_base + j] >= val.
-    auto lower_bound_idx = [&](int bop_base, int n_bops, int val) -> int {
-        const int32_t* base = site_bond_list_.data() + bop_base;
-        return (int)(std::lower_bound(base, base + n_bops, val) - base);
+        const int64_t* base = site_bond_list_.data() + bop_base;
+        const int64_t key = (static_cast<int64_t>(val) << 32) | 0xFFFFFFFFll;
+        return (int)(std::upper_bound(base, base + n_bops, key) - base);
     };
 
     for (int site_i = 0; site_i < N; ++site_i) {
@@ -440,10 +508,10 @@ void SSEEngine::cluster_update() {
 
         if (n_sops == 0) {
             // No single-site ops: try flipping entire worldline
-            double lr = lr_for_range(site_i, bop_base, 0, n_bops);
-            bool do_flip = (lr >= 0.0) || (sse_u01(rng_) < std::exp(lr));
-            if (do_flip) {
-                flip_bond_range(site_i, bop_base, 0, n_bops);
+            RatioAcc a;
+            accum_range(a, bop_base, 0, n_bops);
+            if (accept(a)) {
+                flip_bond_range(bop_base, 0, n_bops);
                 state_[site_i] ^= 1;
             }
             continue;
@@ -457,34 +525,28 @@ void SSEEngine::cluster_update() {
             int p_start = site_op_list_[sop_base + seg];
             int p_end   = site_op_list_[sop_base + (seg + 1) % n_sops];
 
-            double lr;
             bool wraps = (p_end <= p_start);  // includes full-circle if n_sops==1
 
             if (!wraps) {
-                // Non-wrapping segment (p_start, p_end]
-                // bond ops with position in (p_start, p_end]
+                // Non-wrapping segment: bond ops with position in (p_start, p_end]
                 int j0 = upper_bound_idx(bop_base, n_bops, p_start);
                 int j1 = upper_bound_idx(bop_base, n_bops, p_end);
-                lr = lr_for_range(site_i, bop_base, j0, j1);
-
-                bool do_flip = (lr >= 0.0) || (sse_u01(rng_) < std::exp(lr));
-                if (do_flip) {
-                    flip_bond_range(site_i, bop_base, j0, j1);
+                RatioAcc a;
+                accum_range(a, bop_base, j0, j1);
+                if (accept(a)) {
+                    flip_bond_range(bop_base, j0, j1);
                     seg_flipped_[seg] = 1;
                 }
             } else {
                 // Wrapping segment: (p_start, M-1] + [0, p_end]
                 int j0a = upper_bound_idx(bop_base, n_bops, p_start);
-                int j0b = lower_bound_idx(bop_base, n_bops, 0);        // always 0
                 int j1b = upper_bound_idx(bop_base, n_bops, p_end);
-
-                lr  = lr_for_range(site_i, bop_base, j0a, n_bops);  // tail
-                lr += lr_for_range(site_i, bop_base, j0b, j1b);     // head
-
-                bool do_flip = (lr >= 0.0) || (sse_u01(rng_) < std::exp(lr));
-                if (do_flip) {
-                    flip_bond_range(site_i, bop_base, j0a, n_bops);
-                    flip_bond_range(site_i, bop_base, j0b, j1b);
+                RatioAcc a;
+                accum_range(a, bop_base, j0a, n_bops);  // tail
+                accum_range(a, bop_base, 0,   j1b);     // head
+                if (accept(a)) {
+                    flip_bond_range(bop_base, j0a, n_bops);
+                    flip_bond_range(bop_base, 0,   j1b);
                     state_[site_i] ^= 1;  // wrapping always contains tau=0
                     seg_flipped_[seg] = 1;
                 }
@@ -493,10 +555,7 @@ void SSEEngine::cluster_update() {
 
         // ── Phase D: reassign op_types for this site's single-site ops ───────
         // new_type toggles from orig iff the two adjacent segments have
-        // different flip status:  flip_xor = seg_flipped[seg_before] ^ seg_flipped[seg_after]
-        // seg_before for op k = segment (k-1+n_sops)%n_sops  (the one ending at op k)
-        // seg_after  for op k = segment k  (the one starting at op k)
-        // Wait: segment k is between op k and op (k+1). So:
+        // different flip status.  Segment k lies between op k and op (k+1), so:
         //   - segment BEFORE op k = segment (k-1+n_sops)%n_sops
         //   - segment AFTER  op k = segment k
         for (int k = 0; k < n_sops; ++k) {
