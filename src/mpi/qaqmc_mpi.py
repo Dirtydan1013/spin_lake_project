@@ -59,10 +59,12 @@ def _build_vbs_triangles(nx, ny):
             np.array(vbs, np.int32), np.array(ss, np.int32), ref00, ref10)
 
 
-def _build_occ_sf_geometry(nx, ny, a):
+def _build_occ_sf_geometry(nx, ny, a, boundary='open'):
     """Per-site (cell Bravais position R, sublattice α, bulk-complete-cell flag)
     for the kagome bond lattice.  site = (j*nx+i)*6+k → α=k, cell (i,j).
-    A cell is 'bulk' if ALL 6 of its atoms are in kagome_bulk_sites."""
+    A cell is 'bulk' if ALL 6 of its atoms are in kagome_bulk_sites.  With
+    boundary='periodic' the torus has no edge, so EVERY cell is bulk-complete
+    (S_bulk == S_full)."""
     from src.rydberg.lattices import kagome_bulk_sites
     v1 = np.array([a, 0.0]); v2 = np.array([a/2.0, a*np.sqrt(3)/2.0])
     N = 6 * nx * ny
@@ -72,6 +74,9 @@ def _build_occ_sf_geometry(nx, ny, a):
         k = s % 6; cell = s // 6; i = cell % nx; j = cell // nx
         basis[s] = k
         cell_R[s] = i * v1 + j * v2
+    if boundary == 'periodic':
+        in_bulk = np.ones(N, dtype=np.int32)
+        return cell_R, basis, in_bulk
     bulk = set(kagome_bulk_sites(nx, ny))
     # cell (i,j) is bulk-complete iff all 6 atoms are bulk
     in_bulk = np.zeros(N, dtype=np.int32)
@@ -191,11 +196,16 @@ def _build_occ2_sf_geometry_tri(nx, ny, a, ijk_map):
     return cell_R, basis
 
 
-def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None):
+def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None,
+                         boundary='open'):
     """bulk sites, loop/string translation sets (+meta), and A_v vertex sets
     for either kagome bond lattice.  Returns (bulk, loop_sets, string_sets,
     loop_meta, string_meta, vertex_sets, ijk_map) — ijk_map is None for
-    kagome_bond and the (i,j,k)->index map for kagome_bond_triangle."""
+    kagome_bond and the (i,j,k)->index map for kagome_bond_triangle.
+
+    With boundary='periodic' (kagome_bond only) there is no edge, so the bulk
+    restriction is dropped and density/SF use ALL sites — same as the triangle
+    lattice's every-atom convention."""
     if lattice == 'kagome_bond_triangle':
         from src.rydberg.lattices import (
             kagome_triangle_bulk_sites,
@@ -226,7 +236,12 @@ def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None):
         loop_sizes = list(range(2, min(nx, ny)))
     if string_sizes is None:
         string_sizes = list(range(1, min(nx, ny)))
-    bulk = kagome_bulk_sites(nx, ny)
+    # Periodic torus has no boundary → every atom is a valid bulk site (density
+    # and structure factors over ALL sites); open patch keeps interior-only bulk.
+    if boundary == 'periodic':
+        bulk = list(range(6 * nx * ny))
+    else:
+        bulk = kagome_bulk_sites(nx, ny)
     loop_sets, string_sets, loop_meta, string_meta = kagome_multi_size_translations(
         nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
     vertex_sets = kagome_vertex_sites(nx, ny)
@@ -952,9 +967,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             print(f"[MPI-PROF] final configs saved → {out_dir}", flush=True)
 
     # Lattice-aware observable geometry (kagome_bond or kagome_bond_triangle).
+    # periodic kagome_bond drops the bulk restriction (density/SF over ALL sites).
     (bulk, loop_sets, string_sets, loop_meta, string_meta,
      vertex_sets, tri_ijk_map) = _lattice_observables(
-        lattice, nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes)
+        lattice, nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes,
+        boundary=boundary)
     engine._cpp_engine.set_bulk_sites(bulk)
 
     # A_v vertex operator: append to loop_sets, track offset
@@ -1014,7 +1031,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry_tri(
                 nx, ny, 1.0, tri_ijk_map, bulk)
         else:
-            occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry(nx, ny, 1.0)
+            occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry(
+                nx, ny, 1.0, boundary=boundary)
         occ_q_points, occ_q_frac = _build_occ_q_grid(int(occ_sf_grid_n), 1.0)
         req = np.asarray(occ_sf_delta_points, dtype=np.float64)
         occ_pt_indices = np.unique(np.array(
@@ -1036,8 +1054,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         n_points = M_total // profile_step
         print(f"[MPI-PROF] M_total={M_total}, profile_step={profile_step}, "
               f"n_points={n_points}")
-        bulk_note = ("all atoms; complete blockade triangles everywhere"
-                     if lattice == 'kagome_bond_triangle' else "interior atoms only")
+        if lattice == 'kagome_bond_triangle':
+            bulk_note = "all atoms; complete blockade triangles everywhere"
+        elif boundary == 'periodic':
+            bulk_note = "all atoms; periodic torus (no boundary)"
+        else:
+            bulk_note = "interior atoms only"
         print(f"[MPI-PROF] bulk={len(bulk)}/{N} ({bulk_note}), "
               f"{len(loop_sets)} loop copies / {len(string_sets)} string copies / "
               f"{n_vertex} A_v vertices")
