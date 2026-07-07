@@ -60,3 +60,9 @@ docs/
 specs/
 
 tex/
+
+specs/csrc
+
+build_asan/
+
+build_dbg/
