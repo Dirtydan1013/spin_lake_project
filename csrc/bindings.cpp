@@ -8,6 +8,22 @@
 
 namespace py = pybind11;
 
+// Parse an optional (n_box, dim) periodic box-vectors array into a raw pointer.
+// Returns nullptr / n_box=0 when the argument is None (open boundary).  The
+// backing array is kept alive in `holder`, which the caller must keep in scope
+// until the engine constructor (which copies distances out) has run.
+static const double* parse_box(py::object obj, int& n_box,
+                               py::array_t<double>& holder) {
+    n_box = 0;
+    if (obj.is_none()) return nullptr;
+    holder = obj.cast<py::array_t<double>>();
+    auto buf = holder.request();
+    if (buf.ndim != 2)
+        throw std::runtime_error("box_vectors must be a 2D array (n_box, dim)");
+    n_box = static_cast<int>(buf.shape[0]);
+    return static_cast<const double*>(buf.ptr);
+}
+
 PYBIND11_MODULE(qaqmc_cpp, m) {
     m.doc() = "C++ QAQMC and SSE core engines with pybind11 bindings";
 
@@ -30,20 +46,22 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
                          py::array_t<double> pos_arr, int neighbor_cutoff,
-                         int delta_groups) {
+                         int delta_groups, py::object box_vectors) {
             auto buf = pos_arr.request();
             if (buf.ndim != 2)
                 throw std::runtime_error("pos must be a 2D array (N, dim)");
             int pos_dim = (int)buf.shape[1];
             const double* pos_ptr = static_cast<const double*>(buf.ptr);
+            int n_box; py::array_t<double> box_holder;
+            const double* box_ptr = parse_box(box_vectors, n_box, box_holder);
             return new QAQMCEngine(N, Omega, delta_min, delta_max, Rb, M,
                                     epsilon, seed, pos_ptr, pos_dim,
-                                    neighbor_cutoff, delta_groups);
+                                    neighbor_cutoff, delta_groups, box_ptr, n_box);
         }),
         py::arg("N"), py::arg("Omega"), py::arg("delta_min"), py::arg("delta_max"),
         py::arg("Rb"), py::arg("M"), py::arg("epsilon"), py::arg("seed"),
         py::arg("pos"), py::arg("neighbor_cutoff") = -1,
-        py::arg("delta_groups") = 600)
+        py::arg("delta_groups") = 600, py::arg("box_vectors") = py::none())
 
         .def("mc_step", &QAQMCEngine::mc_step,
              "Run one diagonal update + cluster update")
@@ -1003,19 +1021,22 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
                          py::array_t<double> pos_arr, int neighbor_cutoff,
-                         int delta_groups) {
+                         int delta_groups, py::object box_vectors) {
             auto buf = pos_arr.request();
             if (buf.ndim != 2)
                 throw std::runtime_error("pos must be a 2D array (N, dim)");
             int pos_dim = static_cast<int>(buf.shape[1]);
             const double* pos_ptr = static_cast<const double*>(buf.ptr);
+            int n_box; py::array_t<double> box_holder;
+            const double* box_ptr = parse_box(box_vectors, n_box, box_holder);
             return new QAQMCRenyiEngine(
                 N, Omega, delta_min, delta_max, Rb, M, epsilon, seed,
-                pos_ptr, pos_dim, neighbor_cutoff, delta_groups);
+                pos_ptr, pos_dim, neighbor_cutoff, delta_groups, box_ptr, n_box);
         }),
         py::arg("N"), py::arg("Omega"), py::arg("delta_min"), py::arg("delta_max"),
         py::arg("Rb"), py::arg("M"), py::arg("epsilon") = 0.01, py::arg("seed") = 42,
-        py::arg("pos"), py::arg("neighbor_cutoff") = -1, py::arg("delta_groups") = 0)
+        py::arg("pos"), py::arg("neighbor_cutoff") = -1, py::arg("delta_groups") = 0,
+        py::arg("box_vectors") = py::none())
 
         .def("mc_step", &QAQMCRenyiEngine::mc_step,
              "Run one two-replica QAQMC step in ratio-estimator mode.")
@@ -1214,18 +1235,21 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def(py::init([](int N, double Omega, double delta, double Rb,
                          double beta, double epsilon, uint64_t seed,
                          py::array_t<double> pos_arr,
-                         int neighbor_cutoff) {
+                         int neighbor_cutoff, py::object box_vectors) {
             auto buf = pos_arr.request();
             if (buf.ndim != 2)
                 throw std::runtime_error("pos must be a 2D array (N, dim)");
             int pos_dim = (int)buf.shape[1];
             const double* pos_ptr = static_cast<const double*>(buf.ptr);
+            int n_box; py::array_t<double> box_holder;
+            const double* box_ptr = parse_box(box_vectors, n_box, box_holder);
             return new SSEEngine(N, Omega, delta, Rb, beta, epsilon, seed,
-                                  pos_ptr, pos_dim, neighbor_cutoff);
+                                  pos_ptr, pos_dim, neighbor_cutoff, box_ptr, n_box);
         }),
         py::arg("N"), py::arg("Omega"), py::arg("delta"), py::arg("Rb"),
         py::arg("beta"), py::arg("epsilon") = 0.01, py::arg("seed") = 42,
-        py::arg("pos"), py::arg("neighbor_cutoff") = -1)
+        py::arg("pos"), py::arg("neighbor_cutoff") = -1,
+        py::arg("box_vectors") = py::none())
 
         .def("mc_step", &SSEEngine::mc_step,
              "Run one diagonal update + cluster update + adjust_M")
@@ -1393,20 +1417,24 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
                          py::array_t<double> pos_arr,
-                         int neighbor_cutoff, int delta_groups) {
+                         int neighbor_cutoff, int delta_groups,
+                         py::object box_vectors) {
             auto buf = pos_arr.request();
             if (buf.ndim != 2)
                 throw std::runtime_error("pos must be a 2D array (N, dim)");
             int pos_dim = (int)buf.shape[1];
             const double* pos_ptr = static_cast<const double*>(buf.ptr);
+            int n_box; py::array_t<double> box_holder;
+            const double* box_ptr = parse_box(box_vectors, n_box, box_holder);
             return new QAQMCRenyiWorkEngine(N, Omega, delta_min, delta_max, Rb, M,
                                             epsilon, seed, pos_ptr, pos_dim,
-                                            neighbor_cutoff, delta_groups);
+                                            neighbor_cutoff, delta_groups,
+                                            box_ptr, n_box);
         }),
         py::arg("N"), py::arg("Omega"), py::arg("delta_min"), py::arg("delta_max"),
         py::arg("Rb"), py::arg("M"), py::arg("epsilon"), py::arg("seed"),
         py::arg("pos"), py::arg("neighbor_cutoff") = -1,
-        py::arg("delta_groups") = 600)
+        py::arg("delta_groups") = 600, py::arg("box_vectors") = py::none())
 
         .def("set_region_pair", [](QAQMCRenyiWorkEngine& self,
                                    py::array_t<uint8_t> A_start, py::array_t<uint8_t> A_end) {

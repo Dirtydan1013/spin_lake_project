@@ -132,13 +132,15 @@ class QAQMC_Rydberg:
                  pos: np.ndarray = None, epsilon: float = 0.01, seed: int = 42,
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
                  use_cpp: bool = True, omp_threads: int = 0,
-                 neighbor_cutoff: int = None, delta_groups: int = 600):
+                 neighbor_cutoff: int = None, delta_groups: int = 600,
+                 box_vectors: np.ndarray = None):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
             'verbose': False, 'n_jobs': 1, 'backend': "thread",
             'use_cpp': use_cpp, 'omp_threads': omp_threads,
             'neighbor_cutoff': neighbor_cutoff, 'delta_groups': delta_groups,
+            'box_vectors': box_vectors,
         }
         
         # Set OpenMP threads environment variable before C++ engine usage
@@ -164,11 +166,13 @@ class QAQMC_Rydberg:
         # ── Try C++ backend ──────────────────────────────────────────────
         self._cpp_engine = None
         nc = neighbor_cutoff if neighbor_cutoff is not None else -1
+        box = (np.ascontiguousarray(box_vectors, dtype=np.float64)
+               if box_vectors is not None else None)
         if use_cpp and HAS_CPP:
             pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
             self._cpp_engine = qaqmc_cpp.QAQMCEngine(
                 N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
-                neighbor_cutoff=nc, delta_groups=delta_groups
+                neighbor_cutoff=nc, delta_groups=delta_groups, box_vectors=box
             )
             # Mirror key attributes for compatibility
             self.bond_sites = np.array(self._cpp_engine.bond_sites, dtype=np.int32)

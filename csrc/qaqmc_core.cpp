@@ -8,20 +8,53 @@
 // V_ij builder
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Minimum-image squared distance under periodic boundaries.  `box` holds
+// `n_box` supercell vectors (each `pos_dim` long, row-major); the nearest
+// periodic image is found by searching integer combinations in {-1,0,1}^n_box
+// (enough for the mildly-skewed triangular / linear supercells used here).
+// n_box == 0 reproduces the open (direct Euclidean) distance.
+static double rydberg_min_image_dist2(const double* diff, int pos_dim,
+                                      const double* box, int n_box) {
+    if (n_box <= 0) {
+        double d2 = 0.0;
+        for (int d = 0; d < pos_dim; ++d) d2 += diff[d] * diff[d];
+        return d2;
+    }
+    int n_combos = 1;
+    for (int k = 0; k < n_box; ++k) n_combos *= 3;
+    double best = 1e300;
+    for (int c = 0; c < n_combos; ++c) {
+        double shifted[3];
+        for (int d = 0; d < pos_dim; ++d) shifted[d] = diff[d];
+        int tmp = c;
+        for (int k = 0; k < n_box; ++k) {
+            int coef = (tmp % 3) - 1;   // -1, 0, +1
+            tmp /= 3;
+            if (coef)
+                for (int d = 0; d < pos_dim; ++d)
+                    shifted[d] -= coef * box[k * pos_dim + d];
+        }
+        double d2 = 0.0;
+        for (int d = 0; d < pos_dim; ++d) d2 += shifted[d] * shifted[d];
+        if (d2 < best) best = d2;
+    }
+    return best;
+}
+
 RydbergVij build_rydberg_vij(int N, double Omega, double Rb,
                               const double* pos, int pos_dim,
-                              int neighbor_cutoff) {
-    // Step 1: Compute all pairwise distances
+                              int neighbor_cutoff,
+                              const double* box, int n_box) {
+    // Step 1: Compute all pairwise distances (minimum-image if box given)
     std::vector<double> all_dists;
     all_dists.reserve(N * (N - 1) / 2);
+    double diff[3];
     for (int i = 0; i < N; ++i) {
         for (int j = i + 1; j < N; ++j) {
-            double dist2 = 0.0;
-            for (int d = 0; d < pos_dim; ++d) {
-                double diff = pos[i * pos_dim + d] - pos[j * pos_dim + d];
-                dist2 += diff * diff;
-            }
-            all_dists.push_back(std::sqrt(dist2));
+            for (int d = 0; d < pos_dim; ++d)
+                diff[d] = pos[i * pos_dim + d] - pos[j * pos_dim + d];
+            all_dists.push_back(
+                std::sqrt(rydberg_min_image_dist2(diff, pos_dim, box, n_box)));
         }
     }
 
@@ -222,7 +255,8 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
 QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
                           double Rb, int M, double epsilon, uint64_t seed,
                           const double* pos, int pos_dim,
-                          int neighbor_cutoff, int delta_groups)
+                          int neighbor_cutoff, int delta_groups,
+                          const double* box, int n_box)
     : N_(N), M_(M), M_total_(2 * M),
       Omega_(Omega), Rb_(Rb), delta_min_(delta_min), delta_max_(delta_max),
       epsilon_(epsilon), delta_groups_(delta_groups),
@@ -236,8 +270,8 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
     site_W_ = Omega / 2.0;
     site_W_max_ = Omega / 2.0;
 
-    // Build V_ij (with optional neighbor cutoff)
-    vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff);
+    // Build V_ij (optional neighbor cutoff; optional periodic box)
+    vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff, box, n_box);
 
     // Cache positions for downstream observables (dimer structure factor etc.)
     pos_dim_ = pos_dim;

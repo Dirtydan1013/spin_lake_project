@@ -71,7 +71,8 @@ public:
     QAQMCRenyiEngine(int N, double Omega, double delta_min, double delta_max,
                      double Rb, int M, double epsilon, uint64_t seed,
                      const double* pos, int pos_dim, int neighbor_cutoff = -1,
-                     int delta_groups = 0);
+                     int delta_groups = 0,
+                     const double* box = nullptr, int n_box = 0);
 
     void mc_step();
     void run_steps(int n_steps);

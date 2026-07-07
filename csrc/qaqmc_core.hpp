@@ -56,9 +56,13 @@ struct RydbergVij {
     int n_bonds;
 };
 
+// box: optional periodic supercell vectors (n_box vectors × pos_dim, row-major).
+// n_box == 0 → open boundary (direct Euclidean distances); n_box > 0 → periodic
+// boundary via minimum-image over those vectors.
 RydbergVij build_rydberg_vij(int N, double Omega, double Rb,
                               const double* pos, int pos_dim,
-                              int neighbor_cutoff = -1);
+                              int neighbor_cutoff = -1,
+                              const double* box = nullptr, int n_box = 0);
 
 // ─── Alias Table ─────────────────────────────────────────────────────────────
 
@@ -102,7 +106,8 @@ public:
     QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
                 double Rb, int M, double epsilon, uint64_t seed,
                 const double* pos, int pos_dim,
-                int neighbor_cutoff = -1, int delta_groups = 600);
+                int neighbor_cutoff = -1, int delta_groups = 600,
+                const double* box = nullptr, int n_box = 0);
 
     void mc_step();
 

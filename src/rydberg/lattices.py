@@ -64,6 +64,37 @@ def generate_ruby_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
     return np.array(pos)
 
 
+def lattice_box_vectors(lattice: str, nx: int, ny: int, a: float = 1.0,
+                        N: int | None = None) -> np.ndarray:
+    """Periodic supercell (torus) vectors for a given lattice.
+
+    Returns an ``(n_box, dim)`` array of the vectors that tile the finite cell
+    into an infinite periodic system — passed to the C++ engines as
+    ``box_vectors`` to switch from open to periodic boundaries via the
+    minimum-image convention.
+
+    - ``1d_chain``:      one vector ``[N*a]`` (a ring of circumference N*a).
+    - ``kagome_bond``:   ``(nx*v1, ny*v2)`` on the triangular Bravais lattice
+      (v1=(a,0), v2=(a/2, a√3/2)) — a proper torus of the nx×ny void tiling.
+    - ``kagome_bond_triangle``:  raises — the cropped protruding-boundary patch
+      is inherently open (no commensurate torus), so periodic BC is undefined.
+    """
+    if lattice == "1d_chain":
+        if N is None or N <= 0:
+            raise ValueError("periodic 1d_chain needs N > 0")
+        return np.ascontiguousarray([[N * a]], dtype=np.float64)
+    if lattice == "kagome_bond":
+        v1 = np.array([a, 0.0])
+        v2 = np.array([a / 2.0, a * np.sqrt(3) / 2.0])
+        return np.ascontiguousarray([nx * v1, ny * v2], dtype=np.float64)
+    if lattice == "kagome_bond_triangle":
+        raise ValueError(
+            "periodic boundary is undefined for the cropped "
+            "kagome_bond_triangle patch (no commensurate torus); "
+            "use open boundary for this lattice")
+    raise ValueError(f"unknown lattice {lattice!r} for box vectors")
+
+
 def generate_kagome_bond_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
     """Generate atoms at the midpoint of every Kagome hexagonal-void edge.
 

@@ -50,7 +50,8 @@ public:
     QAQMCRenyiWorkEngine(int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
                          const double* pos, int pos_dim,
-                         int neighbor_cutoff = -1, int delta_groups = 600);
+                         int neighbor_cutoff = -1, int delta_groups = 600,
+                         const double* box = nullptr, int n_box = 0);
 
     // ── Configuration ─────────────────────────────────────────────────────
     // Set nested region pair (A_start ⊆ A_end); builds D = A_end \ A_start

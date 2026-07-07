@@ -11,13 +11,14 @@ QAQMCRenyiWorkEngine::QAQMCRenyiWorkEngine(
     int N, double Omega, double delta_min, double delta_max,
     double Rb, int M, double epsilon, uint64_t seed,
     const double* pos, int pos_dim,
-    int neighbor_cutoff, int delta_groups)
+    int neighbor_cutoff, int delta_groups,
+    const double* box, int n_box)
     : N_(N),
       // Backend gets its own derived seed so its internal RNGs are decoupled
       // from this engine's topology-toggle/permutation RNG.
       backend_(N, Omega, delta_min, delta_max, Rb, M, epsilon,
                seed ^ 0x9E3779B97F4A7C15ULL,
-               pos, pos_dim, neighbor_cutoff, delta_groups),
+               pos, pos_dim, neighbor_cutoff, delta_groups, box, n_box),
       rng_(seed),
       A_start_mask_(N, 0),
       A_end_mask_(N, 0),

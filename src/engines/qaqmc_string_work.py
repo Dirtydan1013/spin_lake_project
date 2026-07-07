@@ -86,14 +86,17 @@ class QAQMCStringWorkRydberg:
                  epsilon: float = 0.01, seed: int = 42,
                  pos: np.ndarray | None = None,
                  neighbor_cutoff: int | None = None,
-                 delta_groups: int = 600):
+                 delta_groups: int = 600,
+                 box_vectors: np.ndarray | None = None):
         if pos is None:
             pos = np.arange(N).reshape(-1, 1).astype(np.float64)
         pos_arr = np.ascontiguousarray(pos, dtype=np.float64)
         nc = neighbor_cutoff if neighbor_cutoff is not None else -1
+        box = (np.ascontiguousarray(box_vectors, dtype=np.float64)
+               if box_vectors is not None else None)
         self._eng = qaqmc_cpp.QAQMCEngine(
             N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
-            neighbor_cutoff=nc, delta_groups=int(delta_groups),
+            neighbor_cutoff=nc, delta_groups=int(delta_groups), box_vectors=box,
         )
         self.N = N
         self.M = M

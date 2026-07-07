@@ -89,6 +89,7 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                  n_trajectories: int, n_thermalize: int, decorrelation_steps: int,
                  neighbor_cutoff: int = -1, delta_groups: int = 200,
                  seed: int = 7, compute_ed: bool = True,
+                 box_vectors: np.ndarray | None = None,
                  filepath: str | None = None,
                  checkpoint_every_trajectories: int = 0,
                  checkpoint_dir: str | None = None,
@@ -136,7 +137,7 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             epsilon=epsilon,
             seed=seed + 9973 * rank,
             pos=pos, neighbor_cutoff=neighbor_cutoff,
-            delta_groups=delta_groups,
+            delta_groups=delta_groups, box_vectors=box_vectors,
         )
         eng.set_region_pair(A_start_mask, A_end_mask)
         eng.set_lambda_schedule(np.linspace(0.0, 1.0, K + 1))
@@ -345,7 +346,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
                        pos, region_pairs, K_values,
                        n_trajectories, n_thermalize, decorrelation_steps,
                        neighbor_cutoff=-1, delta_groups=600, seed=7,
-                       compute_ed=True, filepath=None, kp_meta=None,
+                       compute_ed=True, box_vectors=None, filepath=None, kp_meta=None,
                        checkpoint_every_trajectories=0, checkpoint_dir=None,
                        config_in=None, config_out=None,
                        verbose=True) -> dict | None:
@@ -383,7 +384,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
             neighbor_cutoff=neighbor_cutoff,
             delta_groups=delta_groups,
             seed=seed + 7919 * (hash(region_name) & 0xFFFF),
-            compute_ed=compute_ed,
+            compute_ed=compute_ed, box_vectors=box_vectors,
             filepath=None,    # we write a combined file at the end
             checkpoint_every_trajectories=checkpoint_every_trajectories,
             checkpoint_dir=(os.path.join(checkpoint_dir, str(region_name))
@@ -561,6 +562,11 @@ def main():
     parser.add_argument("--delta-max", type=float, default=2.0)
     parser.add_argument("--epsilon", type=float, default=0.05)
     parser.add_argument("--neighbor-cutoff", type=int, default=-1)
+    parser.add_argument("--boundary", type=str, default="open",
+                        choices=["open", "periodic"],
+                        help="spatial lattice boundary: open (finite patch) or "
+                             "periodic (torus; not valid for kagome_bond_triangle "
+                             "and inconsistent with KP region geometry)")
     parser.add_argument("--delta-groups", type=int, default=600)
     # Region pair: either bit string ("1,0,1,0,...") or site index list ("0:2:5")
     parser.add_argument("--A-end", type=str, default=None,
@@ -636,6 +642,11 @@ def main():
     else:
         raise ValueError(f"unsupported lattice {args.lattice}")
 
+    box_vectors = None
+    if args.boundary == "periodic":
+        from src.rydberg.lattices import lattice_box_vectors
+        box_vectors = lattice_box_vectors(args.lattice, args.nx, args.ny, args.a, N=N)
+
     K_values = [int(k) for k in args.K_values.split(",")]
 
     kp_pair_mode  = bool(args.kp_start or args.kp_end)
@@ -700,7 +711,7 @@ def main():
             neighbor_cutoff=args.neighbor_cutoff,
             delta_groups=args.delta_groups,
             seed=args.seed,
-            compute_ed=(not args.skip_ed),
+            compute_ed=(not args.skip_ed), box_vectors=box_vectors,
             filepath=args.filepath,
             checkpoint_every_trajectories=args.checkpoint_every_trajectories,
             checkpoint_dir=ckpt_dir,
@@ -733,7 +744,7 @@ def main():
         neighbor_cutoff=args.neighbor_cutoff,
         delta_groups=args.delta_groups,
         seed=args.seed,
-        compute_ed=(not args.skip_ed),
+        compute_ed=(not args.skip_ed), box_vectors=box_vectors,
         filepath=args.filepath,
         checkpoint_every_trajectories=args.checkpoint_every_trajectories,
         checkpoint_dir=ckpt_dir,

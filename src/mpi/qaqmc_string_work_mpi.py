@@ -87,7 +87,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         n_topology_sweeps_per_lambda: int = 1,
                         n_qaqmc_sweeps_per_lambda: int = 1,
                         neighbor_cutoff: int = -1, delta_groups: int = 600,
-                        seed: int = 7,
+                        seed: int = 7, box_vectors: np.ndarray | None = None,
                         filepath: str | None = None,
                         checkpoint_every_trajectories: int = 0,
                         checkpoint_dir: str | None = None,
@@ -124,7 +124,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             epsilon=epsilon, seed=_rank_seed(seed, rank),
             pos=pos,
             neighbor_cutoff=(None if neighbor_cutoff < 0 else neighbor_cutoff),
-            delta_groups=delta_groups,
+            delta_groups=delta_groups, box_vectors=box_vectors,
         )
         eng.set_string_sites(list(string_sites), m_star)
         if schedule == "cosine":
@@ -298,6 +298,10 @@ def main():
     parser.add_argument("--delta-max", type=float, default=2.0)
     parser.add_argument("--epsilon", type=float, default=0.05)
     parser.add_argument("--neighbor-cutoff", type=int, default=-1)
+    parser.add_argument("--boundary", type=str, default="open",
+                        choices=["open", "periodic"],
+                        help="spatial lattice boundary: open (finite patch) or "
+                             "periodic (torus; not valid for kagome_bond_triangle)")
     parser.add_argument("--delta-groups", type=int, default=600)
     parser.add_argument("--string-sites", type=str, required=True,
                         help="comma-separated site indices of the string C")
@@ -353,6 +357,11 @@ def main():
     if any(s < 0 or s >= N for s in string_sites):
         raise ValueError(f"string sites out of range [0, {N})")
 
+    box_vectors = None
+    if args.boundary == "periodic":
+        from src.rydberg.lattices import lattice_box_vectors
+        box_vectors = lattice_box_vectors(args.lattice, args.nx, args.ny, args.a, N=N)
+
     ckpt_dir = args.checkpoint_dir
     if int(args.checkpoint_every_trajectories) > 0 and ckpt_dir is None:
         if args.filepath:
@@ -379,7 +388,7 @@ def main():
         n_qaqmc_sweeps_per_lambda=args.n_qaqmc_sweeps_per_lambda,
         neighbor_cutoff=args.neighbor_cutoff,
         delta_groups=args.delta_groups,
-        seed=args.seed,
+        seed=args.seed, box_vectors=box_vectors,
         filepath=args.filepath,
         checkpoint_every_trajectories=args.checkpoint_every_trajectories,
         checkpoint_dir=ckpt_dir,

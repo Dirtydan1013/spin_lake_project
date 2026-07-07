@@ -101,12 +101,14 @@ class SSE_Rydberg:
                  pos: np.ndarray = None,
                  use_cpp: bool = True,
                  neighbor_cutoff: int = None,
+                 box_vectors: np.ndarray = None,
                  verbose: bool = True):
         # Store init kwargs for multi-worker spawning (exclude seed/verbose)
         self._init_kwargs = {
             'N': N, 'Omega': Omega, 'delta': delta, 'Rb': Rb,
             'beta': beta, 'epsilon': epsilon, 'pos': pos,
             'use_cpp': use_cpp, 'neighbor_cutoff': neighbor_cutoff,
+            'box_vectors': box_vectors,
             'verbose': False,
         }
         self.N = N
@@ -125,12 +127,14 @@ class SSE_Rydberg:
         # ── Try C++ backend ──────────────────────────────────────────────────
         self._cpp_engine = None
         nc = neighbor_cutoff if neighbor_cutoff is not None else -1
+        box = (np.ascontiguousarray(box_vectors, dtype=np.float64)
+               if box_vectors is not None else None)
         if use_cpp and HAS_CPP:
             pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
             self._cpp_engine = qaqmc_cpp.SSEEngine(
                 N=N, Omega=Omega, delta=delta, Rb=Rb,
                 beta=beta, epsilon=epsilon, seed=seed,
-                pos=pos_arr, neighbor_cutoff=nc
+                pos=pos_arr, neighbor_cutoff=nc, box_vectors=box
             )
             if verbose:
                 n_bonds = len(self._cpp_engine.bond_sites)

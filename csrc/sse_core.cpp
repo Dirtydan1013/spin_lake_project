@@ -28,14 +28,15 @@ static inline int sse_entry_endpoint(int64_t e) { return static_cast<int>(e & 1)
 SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
                      double beta, double epsilon, uint64_t seed,
                      const double* pos, int pos_dim,
-                     int neighbor_cutoff)
+                     int neighbor_cutoff,
+                     const double* box, int n_box)
     : N_(N), M_(20), n_ops_(0),
       Omega_(Omega), delta_(delta), Rb_(Rb), beta_(beta), epsilon_(epsilon),
       norm_N_(0.0), energy_shift_(0.0),
       rng_(seed)
 {
-    // ── Build V_ij ────────────────────────────────────────────────────────────
-    vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff);
+    // ── Build V_ij (optional neighbor cutoff; optional periodic box) ───────────
+    vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff, box, n_box);
     int n_bonds     = vij_.n_bonds;
     int n_bonds_pad = std::max(n_bonds, 1);
 

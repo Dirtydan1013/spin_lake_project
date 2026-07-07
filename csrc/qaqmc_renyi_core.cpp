@@ -25,7 +25,8 @@ inline int renyi_randi(std::mt19937_64& rng, int n) {
 QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double delta_max,
                                    double Rb, int M, double epsilon, uint64_t seed,
                                    const double* pos, int pos_dim, int neighbor_cutoff,
-                                   int delta_groups)
+                                   int delta_groups,
+                                   const double* box, int n_box)
     : N_(N),
       M_(M),
       M_total_(2 * M),
@@ -40,7 +41,7 @@ QAQMCRenyiEngine::QAQMCRenyiEngine(int N, double Omega, double delta_min, double
     if (delta_groups_ < 0) delta_groups_ = 0;
     if (M_total_ > 0 && delta_groups_ > M_total_) delta_groups_ = M_total_;
 
-    vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff);
+    vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff, box, n_box);
 
     delta_sched_.resize(M_total_);
     for (int p = 0; p < M_; ++p) {

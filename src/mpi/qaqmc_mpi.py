@@ -842,7 +842,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     sf_q_points=None, sf_delta_points=None,
                     snapshot_deltas=None, n_snapshots=0,
                     occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
-                    lattice='kagome_bond',
+                    lattice='kagome_bond', boundary='open', box_vectors=None,
                     config_in=None, config_out=None,
                     verbose=True):
     """
@@ -886,12 +886,16 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
     rank_seed = seed + rank * 9973
 
+    if verbose and rank == 0:
+        print(f"[MPI-PROF] spatial boundary: {boundary}")
+
     engine = QAQMC_Rydberg(
         N=N, M=M, Omega=Omega, Rb=Rb,
         delta_min=delta_min, delta_max=delta_max,
         pos=pos, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
         neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
+        box_vectors=box_vectors,
     )
 
     if engine._cpp_engine is None:
@@ -1113,7 +1117,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         c = 0
         with RankChunkWriter(run_dir, rank,
                              run_attrs=dict(N=int(N), M=int(M), nx=int(nx), ny=int(ny),
-                                            lattice=str(lattice), seed=int(seed),
+                                            lattice=str(lattice), boundary=str(boundary),
+                                            seed=int(seed),
                                             profile_step=int(profile_step),
                                             samples_per_bin=int(bin_size),
                                             my_n_samples=int(my_n_samples))) as writer:
@@ -1708,6 +1713,11 @@ def main():
     parser.add_argument('--occ_sf_nbatch', type=int, default=4,
                         help='(profile mode) Coarse super-bins PER RANK for the occ-SF matrix '
                              '(controls storage; total = nbatch × n_ranks). Default 4.')
+    parser.add_argument('--boundary', type=str, default='open',
+                        choices=['open', 'periodic'],
+                        help='Spatial lattice boundary: open (finite cropped patch) or '
+                             'periodic (torus via minimum-image). periodic is undefined '
+                             'for kagome_bond_triangle.')
     args = parser.parse_args()
 
     # Load config file if provided (overrides CLI args)
@@ -1745,6 +1755,16 @@ def main():
 
     mode = config.get('mode', 'store')
 
+    # Periodic supercell vectors (open → None); raises for the cropped triangle.
+    boundary = config.get('boundary', 'open')
+    box_vectors = None
+    if boundary == 'periodic':
+        from src.rydberg.lattices import lattice_box_vectors
+        box_vectors = lattice_box_vectors(
+            config.get('lattice', 'kagome_bond'),
+            config.get('nx', 1), config.get('ny', 1),
+            config.get('a', 4.0), N=config.get('N'))
+
     if mode == 'profile':
         sf_q_points = _build_sf_q_points(
             sf_q_points_file=config.get('sf_q_points_file'),
@@ -1776,6 +1796,7 @@ def main():
             occ_sf_grid_n=config.get('occ_sf_grid_n', 0),
             occ_sf_nbatch=config.get('occ_sf_nbatch', 4),
             lattice=config.get('lattice', 'kagome_bond'),
+            boundary=boundary, box_vectors=box_vectors,
             config_in=config.get('config_in'),
             config_out=config.get('config_out'),
         )

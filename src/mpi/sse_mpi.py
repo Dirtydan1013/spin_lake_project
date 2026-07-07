@@ -66,19 +66,26 @@ def _make_pos(lattice, N, nx, ny, a):
 def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             epsilon=0.01, seed=42, n_equil=5000, n_samples=50000,
             checkpoint=250, run_dir="data/sse_mpi", neighbor_cutoff=None,
-            config_in=None, verbose=True):
+            boundary="open", config_in=None, verbose=True):
     """MPI-parallel SSE with per-rank chunked output and warm start.
 
     Each rank runs an independent chain (seed = seed + rank*9973), bins its
     per-step scalar observables every ``checkpoint`` samples into a chunk, and
     saves its final configuration for warm starting.  ``n_samples`` is the
-    total across ranks; each rank gets ``ceil`` its share.
+    total across ranks; each rank gets ``ceil`` its share.  ``boundary`` selects
+    the spatial lattice boundary: 'open' (finite patch) or 'periodic' (torus via
+    minimum-image; undefined for the cropped kagome_bond_triangle patch).
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
 
     pos, N = _make_pos(lattice, N, nx, ny, a)
+
+    box_vectors = None
+    if boundary == "periodic":
+        from src.rydberg.lattices import lattice_box_vectors
+        box_vectors = lattice_box_vectors(lattice, nx, ny, a, N=N)
 
     # Per-rank sample budget, rounded up to a whole number of bins.
     base = -(-int(n_samples) // n_ranks)  # ceil so every rank has >= n_samples/n_ranks
@@ -88,7 +95,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
     my_n_samples = n_bins * int(checkpoint)
 
     if verbose and rank == 0:
-        print(f"[MPI-SSE] {lattice} N={N}, {n_ranks} ranks, "
+        print(f"[MPI-SSE] {lattice} N={N}, {n_ranks} ranks, {boundary} boundary, "
               f"{n_bins} bins × {checkpoint} samples = {my_n_samples}/rank "
               f"({n_ranks * my_n_samples} total)", flush=True)
 
@@ -96,7 +103,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
     engine = SSE_Rydberg(
         N=N, Omega=Omega, delta=delta, Rb=Rb, beta=beta,
         epsilon=epsilon, seed=rank_seed, pos=pos, use_cpp=True,
-        verbose=False, neighbor_cutoff=neighbor_cutoff,
+        verbose=False, neighbor_cutoff=neighbor_cutoff, box_vectors=box_vectors,
     )
     cpp = engine._cpp_engine
     if cpp is None:
@@ -141,6 +148,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
         rank_seed=int(rank_seed), n_ranks=int(n_ranks), checkpoint=int(checkpoint),
         n_bins=int(n_bins), samples_per_bin=int(checkpoint),
         neighbor_cutoff=(-1 if neighbor_cutoff is None else int(neighbor_cutoff)),
+        boundary=str(boundary),
         timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
     )
 
@@ -238,6 +246,10 @@ def main():
     parser.add_argument("--checkpoint", type=int, default=250,
                         help="samples per bin == chunk flush size (merged)")
     parser.add_argument("--neighbor-cutoff", type=int, default=-1)
+    parser.add_argument("--boundary", type=str, default="open",
+                        choices=["open", "periodic"],
+                        help="spatial lattice boundary: open (finite patch) or "
+                             "periodic (torus; not valid for kagome_bond_triangle)")
     parser.add_argument("--run-dir", type=str, default="data/sse_mpi",
                         help="output directory; each rank writes rank{r}.h5 here")
     parser.add_argument("--config-in", type=str, default=None,
@@ -258,7 +270,8 @@ def main():
         beta=config["beta"], epsilon=config["epsilon"], seed=config["seed"],
         n_equil=config["n_equil"], n_samples=config["n_samples"],
         checkpoint=config["checkpoint"], run_dir=config["run_dir"],
-        neighbor_cutoff=neighbor_cutoff, config_in=config.get("config_in"),
+        neighbor_cutoff=neighbor_cutoff, boundary=config.get("boundary", "open"),
+        config_in=config.get("config_in"),
     )
 
 

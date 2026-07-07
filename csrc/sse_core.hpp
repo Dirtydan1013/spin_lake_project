@@ -35,7 +35,8 @@ public:
     SSEEngine(int N, double Omega, double delta, double Rb,
               double beta, double epsilon, uint64_t seed,
               const double* pos, int pos_dim,
-              int neighbor_cutoff = -1);
+              int neighbor_cutoff = -1,
+              const double* box = nullptr, int n_box = 0);
 
     // ── Core update ──────────────────────────────────────────────────────────
     void mc_step();
