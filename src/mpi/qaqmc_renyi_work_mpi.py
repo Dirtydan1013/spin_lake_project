@@ -98,7 +98,7 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                  config_in: str | None = None,
                  config_out: str | None = None,
                  equil_progress_every: int = 500,
-                 permute_site_labels: bool = False,
+                 permute_site_labels: bool = True,
                  verbose: bool = True) -> dict:
     """When checkpoint_every_trajectories > 0 and checkpoint_dir is set, each
     rank additionally flushes its per-trajectory arrays every that many
@@ -379,7 +379,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
                        compute_ed=True, box_vectors=None, filepath=None, kp_meta=None,
                        checkpoint_every_trajectories=0, checkpoint_dir=None,
                        config_in=None, config_out=None,
-                       equil_progress_every=500, permute_site_labels=False,
+                       equil_progress_every=500, permute_site_labels=True,
                        verbose=True) -> dict | None:
     """Run the work engine for a list of (region_name, A_start_mask, A_end_mask).
 
@@ -652,7 +652,8 @@ def main():
                              "(default: <filepath minus .h5>_configs)")
     parser.add_argument("--skip-ed", action="store_true",
                         help="skip ED reference computation (forced if N > 16)")
-    parser.add_argument("--permute-site-labels", action="store_true",
+    parser.add_argument("--permute-site-labels",
+                        action=argparse.BooleanOptionalAction, default=True,
                         help="per-rank random site-label permutation (identical "
                              "physics, different update scan order) — decorrelates "
                              "the ordered-phase domain selection across ranks; see "

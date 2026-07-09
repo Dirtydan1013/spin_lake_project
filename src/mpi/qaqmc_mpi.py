@@ -884,7 +884,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     lattice='kagome_bond', boundary='open', box_vectors=None,
                     config_in=None, config_out=None,
                     equil_progress_every=500,
-                    permute_site_labels=False,
+                    permute_site_labels=True,
                     verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
@@ -948,24 +948,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         if cfg is None:
             raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
 
-    site_perm = None
-    if cfg is not None and "site_perm" in cfg:
-        # op strings in the saved config are engine-labelled — must keep its perm
-        site_perm = np.asarray(cfg["site_perm"], dtype=np.int64)
-    elif permute_site_labels:
-        if cfg is not None:
-            raise ValueError(
-                "[MPI-PROF] --permute_site_labels with a warm-start config that "
-                "has no site_perm: the saved op string uses canonical labels — "
-                "refusing to mix labellings")
-        site_perm = np.random.RandomState(104729 + rank_seed).permutation(N)
-
-    if site_perm is not None:
-        inv_perm = np.argsort(site_perm)          # canonical s ↔ engine inv_perm[s]
-        pos_engine = np.ascontiguousarray(np.asarray(pos)[site_perm])
-    else:
-        inv_perm = None
-        pos_engine = pos
+    from src.mpi.site_permutation import resolve_site_permutation
+    site_perm, inv_perm = resolve_site_permutation(
+        N, rank_seed, permute_site_labels, cfg=cfg, label="MPI-PROF")
+    pos_engine = (pos if site_perm is None
+                  else np.ascontiguousarray(np.asarray(pos)[site_perm]))
 
     def _to_engine(idx):
         """Map canonical site indices to engine labels."""
@@ -1839,7 +1826,8 @@ def main():
                         choices=['forward', 'backward'],
                         help='(profile mode) which δ ramp --occ_sf_delta_points snap to '
                              '(default forward = up-ramp).')
-    parser.add_argument('--permute_site_labels', action='store_true',
+    parser.add_argument('--permute_site_labels',
+                        action=argparse.BooleanOptionalAction, default=True,
                         help='(profile mode) give each rank a random site-label '
                              'permutation (identical physics, different update scan '
                              'order). Decorrelates the ordered-phase domain pattern '
@@ -1935,7 +1923,7 @@ def main():
             config_in=config.get('config_in'),
             config_out=config.get('config_out'),
             equil_progress_every=config.get('equil_progress_every', 500),
-            permute_site_labels=config.get('permute_site_labels', False),
+            permute_site_labels=config.get('permute_site_labels', True),
         )
     elif mode == 'onthefly':
         run_mpi_onthefly(

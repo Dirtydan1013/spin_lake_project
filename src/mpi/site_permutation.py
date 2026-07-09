@@ -22,9 +22,10 @@ import numpy as np
 def resolve_site_permutation(N, rank_seed, requested, cfg=None, label=""):
     """(site_perm, inv_perm) for this rank, or (None, None) when unpermuted.
 
-    A warm-start ``cfg`` carrying ``site_perm`` always wins (its op strings are
-    engine-labelled).  Requesting a permutation with a canonical warm-start
-    config is refused — the labellings cannot be mixed.
+    A warm-start ``cfg``'s labelling ALWAYS wins (its op strings are
+    engine-labelled): a saved ``site_perm`` is continued, and a canonical
+    config forces canonical labels even when a permutation was requested
+    (with a warning) — labellings can never be mixed.
     """
     site_perm = None
     if cfg is not None and "site_perm" in cfg:
@@ -34,11 +35,11 @@ def resolve_site_permutation(N, rank_seed, requested, cfg=None, label=""):
                              f"{site_perm.size}, expected N={N}")
     elif requested:
         if cfg is not None:
-            raise ValueError(
-                f"[{label}] permute_site_labels with a warm-start config that "
-                f"has no site_perm: the saved op string uses canonical labels "
-                f"— refusing to mix labellings")
-        site_perm = np.random.RandomState(104729 + int(rank_seed)).permutation(N)
+            print(f"[{label}] warm-start config has no site_perm (canonical "
+                  f"labels) — continuing WITHOUT site permutation", flush=True)
+        else:
+            site_perm = np.random.RandomState(
+                104729 + int(rank_seed)).permutation(N)
     if site_perm is None:
         return None, None
     return site_perm, np.argsort(site_perm)

@@ -163,7 +163,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             epsilon=0.01, seed=42, n_equil=5000, n_samples=50000,
             checkpoint=250, run_dir="data/sse_mpi", neighbor_cutoff=None,
             boundary="open", config_in=None, equil_progress_every=500,
-            occ_sf_grid_n=0, n_snapshots=0, permute_site_labels=False,
+            occ_sf_grid_n=0, n_snapshots=0, permute_site_labels=True,
             verbose=True):
     """MPI-parallel SSE with per-rank chunked output and warm start.
 
@@ -421,7 +421,8 @@ def main():
                         help="full-state snapshots per rank per chunk (int8, "
                              "for real-space excitation-pattern plots). "
                              "0 = disabled.")
-    parser.add_argument("--permute-site-labels", action="store_true",
+    parser.add_argument("--permute-site-labels",
+                        action=argparse.BooleanOptionalAction, default=True,
                         help="per-rank random site-label permutation (identical "
                              "physics, different update scan order) — decorrelates "
                              "the domain selection across ranks. Files stay in "
@@ -452,7 +453,7 @@ def main():
         equil_progress_every=config.get("equil_progress_every", 500),
         occ_sf_grid_n=config.get("occ_sf_grid_n", 0),
         n_snapshots=config.get("n_snapshots", 0),
-        permute_site_labels=config.get("permute_site_labels", False),
+        permute_site_labels=config.get("permute_site_labels", True),
     )
 
 

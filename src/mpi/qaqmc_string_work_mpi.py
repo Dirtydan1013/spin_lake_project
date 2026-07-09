@@ -97,7 +97,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         config_in: str | None = None,
                         config_out: str | None = None,
                         equil_progress_every: int = 500,
-                        permute_site_labels: bool = False,
+                        permute_site_labels: bool = True,
                         verbose: bool = True) -> dict | None:
     """config_in: warm-start directory of rank{r}.h5 final configurations from
     a previous run with the same (N, M, Hamiltonian); when given, per-K
@@ -368,7 +368,8 @@ def main():
     parser.add_argument("--config-out", type=str, default=None,
                         help="where to save final configurations "
                              "(default: <filepath minus .h5>_configs)")
-    parser.add_argument("--permute-site-labels", action="store_true",
+    parser.add_argument("--permute-site-labels",
+                        action=argparse.BooleanOptionalAction, default=True,
                         help="per-rank random site-label permutation (identical "
                              "physics, different update scan order) — decorrelates "
                              "the ordered-phase domain selection across ranks; see "

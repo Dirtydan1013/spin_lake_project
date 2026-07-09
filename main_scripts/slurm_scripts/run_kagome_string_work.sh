@@ -65,9 +65,10 @@ CKPT_TRAJ=${CKPT_TRAJ:-250}
 # (default <filepath>_configs).
 CONFIG_IN=${CONFIG_IN:-""}
 CONFIG_OUT=${CONFIG_OUT:-""}
-# PERMUTE_SITES=1: per-rank random site-label permutation (breaks the shared
-# update-scan-order domain selection; see scripts/experiments/).
-PERMUTE_SITES=${PERMUTE_SITES:-""}
+# Per-rank random site-label permutation (breaks the shared update-scan-order
+# domain selection; see scripts/experiments/).  Default ON; PERMUTE_SITES=0
+# restores pre-2026-07 fixed-seed trajectories.
+PERMUTE_SITES=${PERMUTE_SITES:-1}
 
 # String selection.  Either give explicit site indices via STRING_SITES
 # ("s0,s1,..."), or set STRING_SIZE to auto-pick the most central size-s
@@ -135,7 +136,7 @@ $MPIEXEC \
     --checkpoint-every-trajectories "$CKPT_TRAJ" \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"} \
     ${CONFIG_OUT:+--config-out "$CONFIG_OUT"} \
-    ${PERMUTE_SITES:+--permute-site-labels} \
+    $( [ "$PERMUTE_SITES" = "1" ] || printf %s --no-permute-site-labels ) \
     --filepath "$FILEPATH"
 
 echo

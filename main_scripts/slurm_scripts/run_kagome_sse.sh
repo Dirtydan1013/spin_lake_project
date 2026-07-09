@@ -57,9 +57,10 @@ CHECKPOINT=${CHECKPOINT:-250}
 # occ-SF matrix q-grid side (0 = off) and full-state snapshots per rank/chunk.
 OCC_SF_GRID_N=${OCC_SF_GRID_N:-12}
 N_SNAPSHOTS=${N_SNAPSHOTS:-4}
-# PERMUTE_SITES=1: per-rank random site-label permutation (breaks the shared
-# update-scan-order domain selection; see scripts/experiments/).
-PERMUTE_SITES=${PERMUTE_SITES:-""}
+# Per-rank random site-label permutation (breaks the shared update-scan-order
+# domain selection; see scripts/experiments/).  Default ON; PERMUTE_SITES=0
+# restores pre-2026-07 fixed-seed trajectories.
+PERMUTE_SITES=${PERMUTE_SITES:-1}
 SEED=${SEED:-42}
 RUN_DIR=${RUN_DIR:-"data/sse_${NX}x${NY}_${LATTICE}_beta${BETA}_delta${DELTA}"}
 # Warm start: point CONFIG_IN at a previous run's RUN_DIR (rank{r}.h5 with a
@@ -91,7 +92,7 @@ $MPIEXEC \
     --checkpoint "$CHECKPOINT" \
     --occ-sf-grid-n "$OCC_SF_GRID_N" \
     --n-snapshots "$N_SNAPSHOTS" \
-    ${PERMUTE_SITES:+--permute-site-labels} \
+    $( [ "$PERMUTE_SITES" = "1" ] || printf %s --no-permute-site-labels ) \
     --run-dir "$RUN_DIR" \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"}
     # NOTES:
