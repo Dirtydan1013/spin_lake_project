@@ -97,6 +97,8 @@ python plots/plot_diagonal/plot_vbs_ss.py         --run_dir ...                 
 python plots/plot_diagonal/plot_bffm.py           --run_dir ...                        # BFFM: C_m(l−1)/√|Z(l)|
 python plots/plot_diagonal/plot_occ_sf_bz.py      --run_dir ...  # S_αβ(q) BZ heatmap；--mode connected|unconnected --stat max_eig|trace
 python plots/plot_diagonal/plot_snapshots.py      --run_dir ...  # 實空間激發圖案（各 δ 點）
+python plots/plot_diagonal/plot_m_domains.py      --run_dir ... --delta 5.5  # per-bin M-domain 分析
+                                       # （取向分類/互斥檢驗；也吃 SSE run dir——domain 平均下看秩序用這個）
 ```
 
 **SSE**（吃 `data/sse_*` run dir；單參數點）：
