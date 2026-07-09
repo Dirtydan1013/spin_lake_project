@@ -35,24 +35,15 @@
 
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qaqmc
+# Shared env: conda, PMIx workarounds, OMP threads, NTASKS/CPT/JOB_TAG/MPIEXEC.
+# Works under sbatch AND as plain `bash <script>` on a server without SLURM.
+# Run from the repo root.
+source main_scripts/common/env.sh
 
 mkdir -p logs data
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-
-# Avoid Open MPI / Slurm PMIx conflicts
-unset PMI_SIZE PMI_RANK PMI_FD PMI_PORT
-unset PMIX_RANK PMIX_SERVER_URI2 PMIX_SECURITY_MODE
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
 
 echo "QAQMC Renyi work-engine production run"
-echo "Node: $SLURM_NODELIST, ranks=$SLURM_NTASKS, omp_threads/rank=$OMP_NUM_THREADS"
+echo "Node: $NODE_DESC, ranks=$NTASKS, omp_threads/rank=$CPT"
 echo "Started: $(date --iso-8601=seconds)"
 echo
 
@@ -120,7 +111,7 @@ fi
 A_END=${A_END:-""}
 A_START=${A_START:-""}
 
-OUT_NAME=${OUT_NAME:-"work_kpkag_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${SLURM_JOB_ID}.h5"}
+OUT_NAME=${OUT_NAME:-"work_kpkag_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${JOB_TAG}.h5"}
 FILEPATH="data/${OUT_NAME}"
 
 echo "Geometry: $LATTICE nx=$NX, ny=$NY, a=$A_LAT"
@@ -151,8 +142,8 @@ else
     [ -n "$A_START" ] && EXTRA_ARGS+=(--A-start "$A_START")
 fi
 
-# Bind each rank to its own block of cores (NUMA-local memory).
-mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS python -u -m src.mpi.qaqmc_renyi_work_mpi \
+# $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
+$MPIEXEC python -u -m src.mpi.qaqmc_renyi_work_mpi \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --a "$A_LAT" \
     --M "$M" \

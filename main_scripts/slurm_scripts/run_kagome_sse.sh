@@ -24,21 +24,12 @@
 
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qaqmc
+# Shared env: conda, PMIx workarounds, OMP threads, NTASKS/CPT/JOB_TAG/MPIEXEC.
+# Works under sbatch AND as plain `bash <script>` on a server without SLURM.
+# Run from the repo root.
+source main_scripts/common/env.sh
 
 mkdir -p logs data
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-
-# Avoid Open MPI / Slurm PMIx conflicts
-unset PMI_SIZE PMI_RANK PMI_FD PMI_PORT
-unset PMIX_RANK PMIX_SERVER_URI2 PMIX_SECURITY_MODE
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 LATTICE=${LATTICE:-kagome_bond_triangle}
@@ -68,12 +59,12 @@ RUN_DIR=${RUN_DIR:-"data/sse_${NX}x${NY}_${LATTICE}_beta${BETA}_delta${DELTA}"}
 CONFIG_IN=${CONFIG_IN:-""}
 
 echo "Starting SSE ${NX}x${NY} ${LATTICE} thermal simulation (beta=${BETA})"
-echo "Target Node: $SLURM_NODELIST"
-echo "Total MPI Tasks: $SLURM_NTASKS"
+echo "Node(s): $NODE_DESC"
+echo "MPI tasks: $NTASKS (omp_threads/rank=$CPT)"
 echo "Run dir: $RUN_DIR"
 
-# Bind each rank to its own block of cores (NUMA-local memory).
-mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS \
+# $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
+$MPIEXEC \
     python -m src.mpi.sse_mpi \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" \

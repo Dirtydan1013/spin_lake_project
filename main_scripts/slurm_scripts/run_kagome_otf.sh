@@ -28,21 +28,13 @@
 
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qaqmc
+# Shared env: conda, PMIx workarounds, OMP threads, NTASKS/CPT/JOB_TAG/MPIEXEC.
+# Works under sbatch AND as plain `bash <script>` on a server without SLURM
+# (resources then come from NTASKS/CPT env vars or autodetect).  Run from the
+# repo root.
+source main_scripts/common/env.sh
 
 mkdir -p logs data
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-
-# Avoid Open MPI / Slurm PMIx conflicts
-unset PMI_SIZE PMI_RANK PMI_FD PMI_PORT
-unset PMIX_RANK PMIX_SERVER_URI2 PMIX_SECURITY_MODE
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 LATTICE=${LATTICE:-kagome_bond}
@@ -77,8 +69,8 @@ CONFIG_IN=${CONFIG_IN:-""}
 CONFIG_OUT=${CONFIG_OUT:-""}
 
 echo "Starting QAQMC ${NX}x${NY} ${LATTICE} Profile Simulation"
-echo "Target Node: $SLURM_NODELIST"
-echo "Total MPI Tasks: $SLURM_NTASKS"
+echo "Node(s): $NODE_DESC"
+echo "MPI tasks: $NTASKS (omp_threads/rank=$CPT)"
 
 # Resolve qaqmc_mpi module path (handles both flat `src/qaqmc_mpi.py` on main
 # and nested `src/mpi/qaqmc_mpi.py` on feature branches).
@@ -95,9 +87,8 @@ if [ -z "$QAQMC_MPI_MOD" ]; then
 fi
 echo "Using module: $QAQMC_MPI_MOD"
 
-# Bind each rank to its own block of cores (NUMA-local memory for the ~GB/rank
-# op arrays; --bind-to none let ranks migrate across sockets).
-mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS python -m "$QAQMC_MPI_MOD" \
+# $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
+$MPIEXEC python -m "$QAQMC_MPI_MOD" \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" \
     --M  "$M" \
@@ -111,7 +102,7 @@ mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS py
     --n_equil "$N_EQUIL" \
     ${EQUIL_PRINT_EVERY:+--equil_progress_every "$EQUIL_PRINT_EVERY"} \
     --n_samples "$N_SAMPLES" \
-    --omp_threads "$SLURM_CPUS_PER_TASK" \
+    --omp_threads "$CPT" \
     --delta_groups 600 \
     --neighbor_cutoff -1 \
     --boundary "$BOUNDARY" \

@@ -28,20 +28,12 @@
 
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qaqmc
+# Shared env: conda, PMIx workarounds, OMP threads, NTASKS/CPT/JOB_TAG/MPIEXEC.
+# Works under sbatch AND as plain `bash <script>` on a server without SLURM.
+# Run from the repo root.
+source main_scripts/common/env.sh
 
 mkdir -p logs data
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-
-unset PMI_SIZE PMI_RANK PMI_FD PMI_PORT
-unset PMIX_RANK PMIX_SERVER_URI2 PMIX_SECURITY_MODE
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 LATTICE=${LATTICE:-kagome_bond_triangle}
@@ -104,11 +96,11 @@ PY
     echo "Auto-selected central size-${STRING_SIZE} string: sites ${STRING_SITES}"
 fi
 
-OUT_NAME=${OUT_NAME:-"strwork_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${SLURM_JOB_ID}.h5"}
+OUT_NAME=${OUT_NAME:-"strwork_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${JOB_TAG}.h5"}
 FILEPATH="data/${OUT_NAME}"
 
 echo "Off-diagonal string-work production run"
-echo "Node: $SLURM_NODELIST, ranks=$SLURM_NTASKS, omp_threads/rank=$OMP_NUM_THREADS"
+echo "Node: $NODE_DESC, ranks=$NTASKS, omp_threads/rank=$CPT"
 echo "Geometry: $LATTICE ${NX}x${NY}, a=$A_LAT; string sites: $STRING_SITES"
 echo "QAQMC: M=$M, delta=[$DELTA_MIN,$DELTA_MAX], Rb=$RB, groups=$DELTA_GROUPS"
 echo "Protocol: K=$K_VALUES ($SCHEDULE, $DIRECTION), n_traj=$N_TRAJ, "
@@ -116,7 +108,8 @@ echo "          thermalize=$N_THERMALIZE, decorr=$DECORR, ckpt every $CKPT_TRAJ 
 echo "Output: $FILEPATH"
 echo
 
-mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS \
+# $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
+$MPIEXEC \
     python -u -m src.mpi.qaqmc_string_work_mpi \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --a "$A_LAT" \

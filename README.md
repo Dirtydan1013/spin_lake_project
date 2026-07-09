@@ -1,223 +1,85 @@
-# Spin Lake Project: Quantum Annealing Monte Carlo (QAQMC)
+# Spin Lake Project — QAQMC
 
-這是一個以 Python 與 C++ 混合開發的量子退火蒙地卡羅 (Quantum Annealing Quantum Monte Carlo, QAQMC) 模擬框架。本專案透過 **C++ (搭配 OpenMP 平行運算) 處理核心的計算密集型任務**，並透過 **Python / Pybind11 提供高階 API 與資料分析**。
+部署與執行說明。環境完全由 conda-forge 在 user space 提供（含 MPI、OpenMP、編譯器），目標機器**只需要 miniconda，不需要 root、不需要系統 MPI**。
 
----
-
-## 📂 專案架構 (Project Structure)
-
-專案分為高階邏輯 (Python) 與底層引擎 (C++) 兩部分：
-
-```text
-spin_lake_project/
-├── csrc/                           # C++ 核心引擎 (底層計算)
-│   ├── qaqmc_core.hpp / .cpp       # QAQMC 的核心算法 (Alias Table, Diagonal/Cluster Update)
-│   └── bindings.cpp                # Pybind11 的 Python 綁定介面
-├── src/                            # Python 高階 API (主程式)
-│   ├── qaqmc.py                    # QAQMC_Rydberg 類別 (自動偵測並調用 C++ 引擎)
-│   ├── hamiltonian.py, lattices.py # 模型參數與晶格生成
-│   ├── sse.py, sse_updates.py      # 標準 SSE (Stochastic Series Expansion) 實現
-│   └── measurement.py, postprocess.py # 測量與後處理工具
-├── CMakeLists.txt                  # C++ / Pybind11 的 CMake 建置設定
-├── build.bat                       # Windows 一鍵編譯腳本
-├── test.py                         # 快速端到端 (End-to-End) 測試與驗證腳本
-└── test_cpp_vs_python.py           # 用於驗證 C++ 引擎與純 Python/Numba 引擎是否一致的腳本
-```
-
----
-
-## 🐳 安裝與執行 (Installation & Run — via Docker)
-
-本專案推薦使用 **Docker** 來建立環境與執行模擬。你只需要安裝好 Docker，無需準備 Python 虛擬環境、C++ 編譯器或任何系統依賴。
-
----
-
-### 1. 取得專案
+## 部署到新 server
 
 ```bash
-git clone https://github.com/你的帳號/spin_lake_project.git
-cd spin_lake_project
-```
+# 0. 若機器沒有 miniconda（裝在 $HOME，免 root）
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3
 
----
-
-### 2. 建立 Docker Image（只需做一次）
-
-```bash
-docker build -t qaqmc_app .
-```
-
-Docker 會自動完成以下所有步驟：
-- 下載 Python 3.12 基底環境
-- 安裝 `g++`、`cmake`、`ninja` 及 OpenMP 函式庫
-- 編譯 C++ 核心引擎（`qaqmc_cpp.so`）
-- 安裝所有 Python 套件（`numpy`, `scipy`, `h5py`, `numba` 等）
-
----
-
-### 3. 執行模擬
-
-#### 前景執行（適合快速測試）
-
-```bash
-mkdir -p data
-docker run -v $(pwd)/data:/app/data qaqmc_app python test.py
-```
-
-#### 背景執行（適合長時間運算，SSH 斷線後不中斷）
-
-```bash
-mkdir -p data
-docker run -d \
-    -v $(pwd)/data:/app/data \
-    --name qaqmc_run \
-    qaqmc_app python test.py
-```
-
-執行後，模擬結果（`.h5` 數據與圖片）會直接存入當前目錄的 `data/` 資料夾裡。
-
-```bash
-# 隨時查看計算進度
-docker logs -f qaqmc_run
-
-# 確認是否還在運行
-docker ps
-```
-
----
-
-### 4. 在自己的腳本中呼叫
-
-```python
-from src.qaqmc import QAQMC_Rydberg
-
-# omp_threads: 控制每個 Process 使用的 OpenMP 核心數（建議設為 1）
-# n_jobs: 在 run_and_save 裡控制平行的馬可夫鏈條數
-qmc = QAQMC_Rydberg(N=6, M=160, Omega=1.0, omp_threads=1)
-
-
-qmc.run_and_save("data/my_run.h5", n_equil=4000, n_samples=30000, n_jobs=4)
-```
-
----
-
-## 📦 在 HPC Cluster 上執行（Singularity）
-
-若 Cluster 使用 **Singularity**（大多數 HPC 環境皆支援），可將整個環境打包成 `.sif` 映像檔。
-
-### 1. 建置映像檔（需在有 root 或 `--fakeroot` 權限的機器上）
-
-```bash
-git clone https://github.com/你的帳號/spin_lake_project.git
+# 1. 取得專案
+git clone <repo-url> spin_lake_project
 cd spin_lake_project
 
-# 從 singularity.def 建置（推薦）
-singularity build spin_lake.sif singularity.def
-
-# 或者直接從現有的 Dockerfile 轉換
-singularity build spin_lake.sif docker-daemon://qaqmc_app:latest
-```
-
-> 若 Cluster 不允許 `--fakeroot`，請在本地 Linux 機器（有 root 權限）上 build 完，再把 `spin_lake.sif` 傳到 Cluster。
-
-### 2. 執行模擬
-
-```bash
-# 預設執行 test.py（資料輸出到 ./data/）
-singularity run --bind ./data:/app/data spin_lake.sif
-
-# 執行自訂腳本
-singularity exec --bind ./data:/app/data spin_lake.sif \
-    python /app/scripts/my_script.py
-
-# 進入互動式 shell（除錯用）
-singularity shell --bind ./data:/app/data spin_lake.sif
-```
-
-### 3. 搭配 SLURM 批次提交
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=qaqmc
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --time=24:00:00
-#SBATCH --output=qaqmc_%j.log
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-
-singularity exec --bind ./data:/app/data spin_lake.sif \
-    python /app/test.py
-```
-
-將上面內容存為 `submit.sh`，然後：
-
-```bash
-mkdir -p data
-sbatch submit.sh
-```
-
-### 4. 驗證環境是否正常
-
-```bash
-# 確認 C++ extension 可載入
-singularity exec spin_lake.sif \
-    python -c "import qaqmc_cpp; print('C++ extension OK')"
-
-# 確認 Python imports
-singularity exec spin_lake.sif \
-    python -c "from src.qaqmc import QAQMC_Rydberg; print('Python imports OK')"
-```
-
----
-
-## 🐍 替代方案：使用 Conda 安裝（無 Docker 環境適用）
-
-若伺服器沒有安裝 Docker，可改用 Conda 建立隔離的 Python 環境並手動編譯 C++ 核心。
-
-### 1. 建立 Conda 環境
-
-```bash
-conda create -n qaqmc python=3.12
+# 2. 建立環境（含 openmpi/mpiexec、mpi4py、g++/OpenMP、cmake/ninja/pybind11）
+conda env create -f environment.yml
 conda activate qaqmc
-```
 
-### 2. 安裝 Python 套件與建置工具
-
-```bash
-pip install -r requirements.txt
-
-# 確保 C++ 編譯相關的系統工具可用
-conda install -c conda-forge cmake ninja openmp
-```
-
-> 若伺服器已有系統級的 `g++` 與 `libomp`（例如 Ubuntu 上的 `build-essential` 和 `libomp-dev`），可跳過 conda 的編譯工具安裝，改用系統版本。
-
-### 3. 編譯 C++ 核心
-
-```bash
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DPYTHON_EXECUTABLE=$(which python)
-
+# 3. 編譯 C++ 核心（預設 -march=native，在哪台跑就在哪台 build）
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DPYTHON_EXECUTABLE=$(which python)
 cmake --build build -j
-
 cp build/qaqmc_cpp*.so .
+
+# 4. 驗證
+python -c "import qaqmc_cpp; print('C++ extension OK')"
 ```
 
-### 4. 執行模擬
+注意事項：
+
+- **一顆 binary 要在多台不同 CPU 的機器共用**時，改用
+  `-DQAQMC_ARCH=x86-64-v3`（AVX2 baseline，2015 後的 Intel/AMD 都能跑）。
+  預設的 `native` 只保證在 build 的那台機器上執行。
+- **絕對不要在任務執行中 `cp` 覆蓋活著的 `.so`** — 會讓執行中的行程
+  segfault。要部署新版請用 `mv`（atomic rename），或等任務結束。
+- 換 `-march` 會改變浮點捨入（FMA contraction），同 seed 的軌跡在不同
+  build 間不會 bit-identical（統計上等價）。
+
+## 提交 / 執行腳本
+
+production 腳本在 `main_scripts/slurm_scripts/`，同一份腳本在有無 SLURM 的
+機器上都能跑（`#SBATCH` 標頭在直接執行時只是註解）：
 
 ```bash
-# 前景執行（測試用）
-python test.py
+# 統一入口：有 sbatch 就提交 job，沒有就 nohup 背景執行（log 寫到 logs/）
+./main_scripts/submit.sh main_scripts/slurm_scripts/run_kagome_sse.sh
 
-# 背景執行（SSH 斷線後不中斷）
-nohup python test.py > output.log 2>&1 &
-echo "PID: $!"          # 記下 PID，之後可用 kill <PID> 停止
+# 額外參數會透傳給 sbatch（覆寫 #SBATCH 標頭）
+./main_scripts/submit.sh main_scripts/slurm_scripts/run_kagome_otf.sh --nodelist=cpunode02
 
-# 或使用 tmux（若伺服器有安裝）
-tmux new -s qaqmc
-python test.py
-# Ctrl+B → D 放到背景；之後 tmux attach -t qaqmc 回來查看
+# 也可以照舊直接用
+sbatch main_scripts/slurm_scripts/run_kagome_otf.sh       # SLURM cluster
+bash   main_scripts/slurm_scripts/run_kagome_otf.sh       # 一般 server（前景）
 ```
+
+所有腳本參數都用環境變數覆寫，例如：
+
+```bash
+NX=8 NY=8 M=200000 N_TRAJ=8000 \
+    ./main_scripts/submit.sh main_scripts/slurm_scripts/run_kagome_renyi_work.sh
+```
+
+資源與綁核（由 `main_scripts/common/env.sh` 統一處理）：
+
+- **SLURM job 內**：ranks / cores-per-rank 自動取自 `SLURM_NTASKS` /
+  `SLURM_CPUS_PER_TASK`。
+- **無 SLURM**：預設 ranks = 實體核心數（排除超執行緒）、每 rank 1 核；
+  用 `NTASKS=16 CPT=4` 這類環境變數覆寫。
+- launcher 兩種情況都是 `mpiexec`（conda 的 Open MPI 沒有 SLURM/PMIx 整合，
+  不要用 srun）。
+- **site 專屬設定**（綁核策略、conda 路徑等）：
+  `cp main_scripts/common/site.conf.example main_scripts/common/site.conf`
+  後編輯（此檔已 gitignore）。例如 AMD EPYC 建議
+  `BIND_FLAGS="--map-by numa:PE=$CPT --bind-to core"`；container 內
+  `BIND_FLAGS="--bind-to none"`。
+
+四個 production 腳本：
+
+| 腳本 | 內容 |
+| --- | --- |
+| `run_kagome_otf.sh` | 單 replica QAQMC diagonal-profile（`src.mpi.qaqmc_mpi --mode profile`） |
+| `run_kagome_sse.sh` | 有限溫度 SSE 熱平衡對照（`src.mpi.sse_mpi`） |
+| `run_kagome_renyi_work.sh` | Renyi-2 非平衡功引擎，KP 區域 ΔS₂ / γ（`src.mpi.qaqmc_renyi_work_mpi`） |
+| `run_kagome_string_work.sh` | off-diagonal string-work Jarzynski 估計（`src.mpi.qaqmc_string_work_mpi`） |

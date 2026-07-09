@@ -1,0 +1,34 @@
+# Full user-space environment spec — includes the system-level stack
+# (MPI runtime + mpiexec, C++ compiler with OpenMP, build tools) so the
+# target machine needs NOTHING beyond miniconda (no root, no system MPI).
+#
+#     conda env create -f environment.yml
+#     conda activate qaqmc
+#     cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#           -DPYTHON_EXECUTABLE=$(which python)      # -DQAQMC_ARCH=native is the default
+#     cmake --build build -j && cp build/qaqmc_cpp*.so .
+#
+# Notes:
+#   - conda-forge openmpi has no SLURM/PMIx integration: launch with mpiexec,
+#     not srun (main_scripts/common/env.sh handles this uniformly).
+#   - single-node runs only; multi-node over InfiniBand needs a system MPI.
+#   - requirements.txt lists just the Python-level subset (for Docker/pip).
+name: qaqmc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # ── system-level (previously undocumented, provided by conda-forge) ──
+  - openmpi              # libmpi + mpiexec + hwloc (core binding)
+  - mpi4py               # conda-installed so it matches the openmpi above
+  - cxx-compiler         # g++ incl. libgomp (OpenMP runtime)
+  - cmake
+  - ninja
+  - pybind11
+  # ── Python-level (mirrors requirements.txt) ──
+  - numpy>=1.26
+  - scipy>=1.11
+  - numba>=0.59
+  - h5py>=3.10
+  - tqdm>=4.66
+  - matplotlib>=3.8

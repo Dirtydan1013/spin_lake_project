@@ -24,9 +24,23 @@ pybind11_add_module(qaqmc_cpp
 target_include_directories(qaqmc_cpp PRIVATE csrc)
 
 # ── Optimization flags ───────────────────────────────────────────────────────
-# Production target: cpunode02 (Intel Xeon Gold 5218, Cascade Lake, AVX-512).
-# beehive (login) is also Cascade Lake so this binary runs on either; to add
-# cpunode01 (Coffee Lake, no AVX-512) drop -march to broadwell.
+# Target microarchitecture is a cache variable so the same tree deploys to any
+# CPU.  Build ON the machine you run on (default 'native'), or pick a portable
+# baseline when one binary must run on several hosts:
+#   -DQAQMC_ARCH=native        (default) full ISA of the build machine
+#   -DQAQMC_ARCH=x86-64-v3     AVX2+FMA baseline, runs on ~2015+ Intel/AMD
+#   -DQAQMC_ARCH=cascadelake   the original cpunode02/beehive production value
+# NOTE: changing -march changes FMA contraction/rounding, so same-seed
+# trajectories are NOT bit-identical across different QAQMC_ARCH builds
+# (statistically equivalent; ED comparisons must use tolerances, not bits).
+set(QAQMC_ARCH "native" CACHE STRING
+    "-march target: native | x86-64-v3 | cascadelake | broadwell | ...")
+# -mtune does not accept the x86-64-v* ABI levels; fall back to generic tuning.
+if(QAQMC_ARCH MATCHES "^x86-64")
+    set(QAQMC_MTUNE "generic")
+else()
+    set(QAQMC_MTUNE "${QAQMC_ARCH}")
+endif()
 #
 # Notes on what's NOT enabled:
 #   - -ffast-math: re-associates FP, can shift Metropolis accept boundaries
@@ -59,8 +73,8 @@ if(QAQMC_ASAN)
 else()
     target_compile_options(qaqmc_cpp PRIVATE
         -O3
-        -march=cascadelake
-        -mtune=cascadelake
+        -march=${QAQMC_ARCH}
+        -mtune=${QAQMC_MTUNE}
         -funroll-loops
         -fno-math-errno
         -fno-trapping-math

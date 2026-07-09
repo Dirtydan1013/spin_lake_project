@@ -66,3 +66,4 @@ specs/csrc
 build_asan/
 
 build_dbg/
+main_scripts/common/site.conf
