@@ -67,6 +67,11 @@ SEED=${SEED:-42}
 # reclaims that space without touching the data or needing an h5repack.
 CONFIG_IN=${CONFIG_IN:-""}
 CONFIG_OUT=${CONFIG_OUT:-""}
+# Per-rank random site-label permutation (PERMUTE_SITES=1 to enable): breaks
+# the shared update-scan-order that otherwise freezes every rank into the
+# SAME ordered-phase stripe pattern (see scripts/experiments/
+# scan_order_bias_probe.py).  Recommended for runs probing the ordered regime.
+PERMUTE_SITES=${PERMUTE_SITES:-""}
 
 echo "Starting QAQMC ${NX}x${NY} ${LATTICE} Profile Simulation"
 echo "Node(s): $NODE_DESC"
@@ -117,6 +122,7 @@ $MPIEXEC python -m "$QAQMC_MPI_MOD" \
     --occ_sf_nbatch 4 \
     ${CONFIG_IN:+--config_in "$CONFIG_IN"} \
     ${CONFIG_OUT:+--config_out "$CONFIG_OUT"} \
+    ${PERMUTE_SITES:+--permute_site_labels} \
     --filepath "data/${NX}x${NY}_${LATTICE}_M=${M}.h5"
     # NOTES:
     #   - triangle lattice ⇒ bulk = ALL atoms (complete blockade triangles
