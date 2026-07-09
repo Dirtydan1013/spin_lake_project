@@ -45,6 +45,8 @@ if _REPO_ROOT not in sys.path:
 from src.engines.qaqmc_string_work import QAQMCStringWorkRydberg, cosine_schedule
 from src.mpi.chunk_io import RankChunkWriter
 from src.mpi.equil_progress import run_equil_with_progress
+from src.mpi.site_permutation import (permute_rows, resolve_site_permutation,
+                                      to_engine)
 from src.rydberg.lattices import (
     generate_1d_chain,
     generate_kagome_bond_lattice,
@@ -95,6 +97,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         config_in: str | None = None,
                         config_out: str | None = None,
                         equil_progress_every: int = 500,
+                        permute_site_labels: bool = False,
                         verbose: bool = True) -> dict | None:
     """config_in: warm-start directory of rank{r}.h5 final configurations from
     a previous run with the same (N, M, Hamiltonian); when given, per-K
@@ -115,6 +118,27 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
               f"string_sites={list(string_sites)}, K_values={K_values}, "
               f"schedule={schedule}, direction={direction}", flush=True)
 
+    # Warm-start config (K-independent) and per-rank site-label permutation
+    # (scan-order decorrelation — see src/mpi/site_permutation.py).  The engine
+    # runs on relabelled sites; string_sites are mapped into the engine
+    # labelling and all outputs (log_J samples) are scalars.
+    cfg = None
+    if config_in:
+        from src.mpi.chunk_io import check_config_compat, load_warm_config
+        cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
+        if cfg is None:
+            raise FileNotFoundError(
+                f"[warm-start] no rank*.h5 files in {config_in}")
+        check_config_compat(
+            cfg, dict(N=int(N), M_total=int(2 * M),
+                      boundary=("periodic" if box_vectors is not None else "open")),
+            f"string-work rank {rank}")
+    site_perm, inv_perm = resolve_site_permutation(
+        N, _rank_seed(seed, rank), permute_site_labels, cfg=cfg,
+        label="MPI-STRWORK")
+    pos_engine = permute_rows(pos, site_perm)
+    string_sites_eng = [int(s) for s in to_engine(list(string_sites), inv_perm)]
+
     results: dict[int, dict] = {}
     for K in K_values:
         comm.Barrier()
@@ -124,25 +148,16 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             N=N, M=M, Omega=Omega, Rb=Rb,
             delta_min=delta_min, delta_max=delta_max,
             epsilon=epsilon, seed=_rank_seed(seed, rank),
-            pos=pos,
+            pos=pos_engine,
             neighbor_cutoff=(None if neighbor_cutoff < 0 else neighbor_cutoff),
             delta_groups=delta_groups, box_vectors=box_vectors,
         )
-        eng.set_string_sites(list(string_sites), m_star)
+        eng.set_string_sites(string_sites_eng, m_star)
         if schedule == "cosine":
             eng.set_lambda_schedule(cosine_schedule(int(K)))
         else:
             eng.set_lambda_schedule(np.linspace(0.0, 1.0, int(K) + 1))
-        if config_in:
-            from src.mpi.chunk_io import check_config_compat, load_warm_config
-            cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
-            if cfg is None:
-                raise FileNotFoundError(
-                    f"[warm-start] no rank*.h5 files in {config_in}")
-            check_config_compat(
-                cfg, dict(N=int(N), M_total=int(2 * M),
-                          boundary=("periodic" if box_vectors is not None else "open")),
-                f"string-work rank {rank}")
+        if cfg is not None:
             eng._eng.set_op_string(
                 np.ascontiguousarray(cfg["op_types"], dtype=np.int32),
                 np.ascontiguousarray(cfg["op_sites"], dtype=np.int32))
@@ -213,11 +228,14 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 base = str(filepath)
                 out_dir = (base[:-3] if base.endswith(".h5") else base) + "_configs"
             if out_dir:
+                cfg_datasets = dict(
+                    op_types=np.asarray(eng._eng.op_types, dtype=np.int32),
+                    op_sites=np.asarray(eng._eng.op_sites, dtype=np.int32))
+                if site_perm is not None:
+                    cfg_datasets["site_perm"] = np.asarray(site_perm, dtype=np.int32)
                 with RankChunkWriter(out_dir, rank) as w:
                     w.write_final_config(
-                        datasets=dict(
-                            op_types=np.asarray(eng._eng.op_types, dtype=np.int32),
-                            op_sites=np.asarray(eng._eng.op_sites, dtype=np.int32)),
+                        datasets=cfg_datasets,
                         attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed),
                                    boundary=("periodic" if box_vectors is not None
                                              else "open")))
@@ -350,6 +368,11 @@ def main():
     parser.add_argument("--config-out", type=str, default=None,
                         help="where to save final configurations "
                              "(default: <filepath minus .h5>_configs)")
+    parser.add_argument("--permute-site-labels", action="store_true",
+                        help="per-rank random site-label permutation (identical "
+                             "physics, different update scan order) — decorrelates "
+                             "the ordered-phase domain selection across ranks; see "
+                             "scripts/experiments/scan_order_bias_probe.py")
     args = parser.parse_args()
 
     if args.lattice == "1d_chain":
@@ -410,6 +433,7 @@ def main():
         config_in=args.config_in,
         config_out=args.config_out,
         equil_progress_every=args.equil_progress_every,
+        permute_site_labels=args.permute_site_labels,
     )
 
 

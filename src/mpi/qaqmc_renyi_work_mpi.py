@@ -39,6 +39,7 @@ if _REPO_ROOT not in sys.path:
 
 from src.engines.qaqmc_renyi_work import QAQMCRenyiWorkRydberg
 from src.mpi.equil_progress import run_equil_with_progress
+from src.mpi.site_permutation import permute_rows, resolve_site_permutation
 from src.rydberg.lattices import (
     generate_1d_chain,
     generate_kagome_bond_lattice,
@@ -97,6 +98,7 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                  config_in: str | None = None,
                  config_out: str | None = None,
                  equil_progress_every: int = 500,
+                 permute_site_labels: bool = False,
                  verbose: bool = True) -> dict:
     """When checkpoint_every_trajectories > 0 and checkpoint_dir is set, each
     rank additionally flushes its per-trajectory arrays every that many
@@ -128,6 +130,27 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         ed_ref = None
     ed_ref = comm.bcast(ed_ref, root=0)
 
+    # Warm-start config (loaded once; K-independent) and per-rank site-label
+    # permutation (scan-order decorrelation — see src/mpi/site_permutation.py).
+    # The engine runs on relabelled sites; masks are mapped into the engine
+    # labelling, and all outputs (work samples etc.) are scalars, so nothing
+    # needs mapping back.
+    cfg = None
+    if config_in:
+        from src.mpi.chunk_io import check_config_compat, load_warm_config
+        cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
+        if cfg is None:
+            raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
+        check_config_compat(
+            cfg, dict(N=int(N), M_total=int(2 * M),
+                      boundary=("periodic" if box_vectors is not None else "open")),
+            f"renyi-work rank {rank}")
+    site_perm, _inv_perm = resolve_site_permutation(
+        N, seed + 9973 * rank, permute_site_labels, cfg=cfg, label="MPI-WORK")
+    pos_engine = permute_rows(pos, site_perm)
+    A_start_eng = permute_rows(A_start_mask, site_perm)
+    A_end_eng = permute_rows(A_end_mask, site_perm)
+
     results = {}
     for K in K_values:
         comm.Barrier()
@@ -138,23 +161,15 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             delta_min=delta_min, delta_max=delta_max,
             epsilon=epsilon,
             seed=seed + 9973 * rank,
-            pos=pos, neighbor_cutoff=neighbor_cutoff,
+            pos=pos_engine, neighbor_cutoff=neighbor_cutoff,
             delta_groups=delta_groups, box_vectors=box_vectors,
         )
-        eng.set_region_pair(A_start_mask, A_end_mask)
+        eng.set_region_pair(A_start_eng, A_end_eng)
         eng.set_lambda_schedule(np.linspace(0.0, 1.0, K + 1))
-        if config_in:
+        if cfg is not None:
             # Warm start: install the saved A_start-sector configuration and
             # seed the checkpoint chain — no thermalization needed.  The
             # configuration is K-independent.
-            from src.mpi.chunk_io import check_config_compat, load_warm_config
-            cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
-            if cfg is None:
-                raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
-            check_config_compat(
-                cfg, dict(N=int(N), M_total=int(2 * M),
-                          boundary=("periodic" if box_vectors is not None else "open")),
-                f"renyi-work rank {rank}")
             eng._cpp_engine.import_start_config(
                 np.ascontiguousarray(cfg["op_types0"], dtype=np.int32),
                 np.ascontiguousarray(cfg["op_sites0"], dtype=np.int32),
@@ -230,10 +245,13 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             if out_dir:
                 from src.mpi.chunk_io import RankChunkWriter
                 t0c, s0c, t1c, s1c = eng._cpp_engine.export_start_config()
+                cfg_datasets = dict(op_types0=t0c, op_sites0=s0c,
+                                    op_types1=t1c, op_sites1=s1c)
+                if site_perm is not None:
+                    cfg_datasets["site_perm"] = np.asarray(site_perm, dtype=np.int32)
                 with RankChunkWriter(out_dir, rank) as w:
                     w.write_final_config(
-                        datasets=dict(op_types0=t0c, op_sites0=s0c,
-                                      op_types1=t1c, op_sites1=s1c),
+                        datasets=cfg_datasets,
                         attrs=dict(N=int(N), M_total=int(2 * M), seed=int(seed),
                                    boundary=("periodic" if box_vectors is not None
                                              else "open")))
@@ -361,7 +379,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
                        compute_ed=True, box_vectors=None, filepath=None, kp_meta=None,
                        checkpoint_every_trajectories=0, checkpoint_dir=None,
                        config_in=None, config_out=None,
-                       equil_progress_every=500,
+                       equil_progress_every=500, permute_site_labels=False,
                        verbose=True) -> dict | None:
     """Run the work engine for a list of (region_name, A_start_mask, A_end_mask).
 
@@ -407,6 +425,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
             config_out=(os.path.join(config_out, str(region_name))
                         if config_out else None),
             equil_progress_every=equil_progress_every,
+            permute_site_labels=permute_site_labels,
             verbose=verbose,
         )
         if rank == 0:
@@ -633,6 +652,11 @@ def main():
                              "(default: <filepath minus .h5>_configs)")
     parser.add_argument("--skip-ed", action="store_true",
                         help="skip ED reference computation (forced if N > 16)")
+    parser.add_argument("--permute-site-labels", action="store_true",
+                        help="per-rank random site-label permutation (identical "
+                             "physics, different update scan order) — decorrelates "
+                             "the ordered-phase domain selection across ranks; see "
+                             "scripts/experiments/scan_order_bias_probe.py")
     args = parser.parse_args()
 
     cfg_out_dir = args.config_out
@@ -735,6 +759,7 @@ def main():
             config_in=args.config_in,
             config_out=cfg_out_dir,
             equil_progress_every=args.equil_progress_every,
+            permute_site_labels=args.permute_site_labels,
             kp_meta=dict(
                 lattice=args.lattice, nx=args.nx, ny=args.ny, a=args.a,
                 m=args.kp_m, center_label=spec.center_label,
@@ -769,6 +794,7 @@ def main():
         config_in=args.config_in,
         config_out=cfg_out_dir,
         equil_progress_every=args.equil_progress_every,
+        permute_site_labels=args.permute_site_labels,
     )
 
 

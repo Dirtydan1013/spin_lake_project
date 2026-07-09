@@ -884,6 +884,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     lattice='kagome_bond', boundary='open', box_vectors=None,
                     config_in=None, config_out=None,
                     equil_progress_every=500,
+                    permute_site_labels=False,
                     verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
@@ -929,10 +930,61 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     if verbose and rank == 0:
         print(f"[MPI-PROF] spatial boundary: {boundary}")
 
+    # ── Per-rank site-label permutation (scan-order decorrelation) ──────────
+    # The updates visit sites in label order, and that shared fixed order was
+    # shown to deterministically select the ordered-phase domain pattern:
+    # independent-seed chains freeze into the SAME real-space stripe (see
+    # scripts/experiments/scan_order_bias_probe.py; permuting labels restores
+    # domain diversity and the C3 orientation balance).  With this option each
+    # rank runs the engine on randomly relabelled sites (identical physics,
+    # different scan geometry); every site-resolved input is mapped into the
+    # engine labelling and every site-resolved output is mapped back, so the
+    # stored files stay in canonical labels.  Warm-start configs record the
+    # permutation and continue under it.
+    cfg = None
+    if config_in:
+        from src.mpi.chunk_io import check_config_compat, load_warm_config
+        cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
+        if cfg is None:
+            raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
+
+    site_perm = None
+    if cfg is not None and "site_perm" in cfg:
+        # op strings in the saved config are engine-labelled — must keep its perm
+        site_perm = np.asarray(cfg["site_perm"], dtype=np.int64)
+    elif permute_site_labels:
+        if cfg is not None:
+            raise ValueError(
+                "[MPI-PROF] --permute_site_labels with a warm-start config that "
+                "has no site_perm: the saved op string uses canonical labels — "
+                "refusing to mix labellings")
+        site_perm = np.random.RandomState(104729 + rank_seed).permutation(N)
+
+    if site_perm is not None:
+        inv_perm = np.argsort(site_perm)          # canonical s ↔ engine inv_perm[s]
+        pos_engine = np.ascontiguousarray(np.asarray(pos)[site_perm])
+    else:
+        inv_perm = None
+        pos_engine = pos
+
+    def _to_engine(idx):
+        """Map canonical site indices to engine labels."""
+        arr = np.asarray(idx, dtype=np.int64)
+        return arr if inv_perm is None else inv_perm[arr]
+
+    def _unpermute_res(res):
+        """Map the site-resolved outputs of run_profile back to canonical labels."""
+        if inv_perm is None:
+            return res
+        for key in ('snapshots', 'occ_nprof'):
+            if key in res:
+                res[key] = np.ascontiguousarray(np.asarray(res[key])[..., inv_perm])
+        return res
+
     engine = QAQMC_Rydberg(
         N=N, M=M, Omega=Omega, Rb=Rb,
         delta_min=delta_min, delta_max=delta_max,
-        pos=pos, epsilon=epsilon, seed=rank_seed,
+        pos=pos_engine, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
         neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
         box_vectors=box_vectors,
@@ -944,11 +996,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     # ── Warm start: load a previously saved final configuration ─────────────
     # When config_in is given, each rank installs its saved operator string
     # (+ RNG state) and thermalization is skipped (n_equil forced to 0).
-    if config_in:
-        from src.mpi.chunk_io import check_config_compat, load_warm_config
-        cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
-        if cfg is None:
-            raise FileNotFoundError(f"[warm-start] no rank*.h5 files in {config_in}")
+    if cfg is not None:
         check_config_compat(cfg, dict(N=N, M_total=2 * M, lattice=str(lattice),
                                       boundary=str(boundary)),
                             f"profile rank {rank}")
@@ -983,6 +1031,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         config_datasets = dict(
             op_types=np.asarray(engine._cpp_engine.op_types, dtype=np.int32),
             op_sites=np.asarray(engine._cpp_engine.op_sites, dtype=np.int32))
+        if site_perm is not None:
+            config_datasets['site_perm'] = np.asarray(site_perm, dtype=np.int32)
         config_attrs = dict(N=int(N), M_total=int(2 * M), lattice=str(lattice),
                             boundary=str(boundary), seed=int(rank_seed),
                             rng_state=engine._cpp_engine.get_rng_state())
@@ -998,14 +1048,16 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
      vertex_sets, tri_ijk_map) = _lattice_observables(
         lattice, nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes,
         boundary=boundary)
-    engine._cpp_engine.set_bulk_sites(bulk)
+    engine._cpp_engine.set_bulk_sites([int(s) for s in _to_engine(bulk)])
 
     # A_v vertex operator: append to loop_sets, track offset
     n_vertex    = len(vertex_sets)
     vertex_offset = len(loop_sets)
     all_loop_sets = loop_sets + vertex_sets
 
-    engine._cpp_engine.set_observable_sites(all_loop_sets, string_sets)
+    engine._cpp_engine.set_observable_sites(
+        [[int(s) for s in _to_engine(st)] for st in all_loop_sets],
+        [[int(s) for s in _to_engine(st)] for st in string_sets])
 
     # VBS/SS order parameters (paper Eq. 5-6): measured at every profile point,
     # batched like Z_l.  Always on for kagome lattices large enough.
@@ -1016,7 +1068,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     do_vbs = vbs_tri is not None
     if do_vbs:
         corners, par, vsign, ssign, ref00, ref10 = vbs_tri
-        engine._cpp_engine.set_vbs_triangles(corners, par, vsign, ssign, ref00, ref10)
+        engine._cpp_engine.set_vbs_triangles(
+            np.asarray(_to_engine(corners), dtype=np.int32),
+            par, vsign, ssign, ref00, ref10)
 
     # Optional: dimer structure factor S_d(q).  Setting q-points enables the
     # SF accumulator inside measure_profile (same forward walk, no extra MC).
@@ -1062,7 +1116,13 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         occ_q_points, occ_q_frac = _build_occ_q_grid(int(occ_sf_grid_n), 1.0)
         occ_pt_indices = _snap_delta_points(prof_delta, occ_sf_delta_points,
                                             sweep=occ_sf_sweep)
-        engine._cpp_engine.set_occ_sf_site_map(occ_cell_R, occ_basis, occ_in_bulk, 6)
+        # engine site i == canonical site site_perm[i]: feed the engine the
+        # permuted views; meta.h5 keeps the canonical arrays.
+        occ_sel = site_perm if site_perm is not None else slice(None)
+        engine._cpp_engine.set_occ_sf_site_map(
+            np.ascontiguousarray(np.asarray(occ_cell_R)[occ_sel]),
+            np.ascontiguousarray(np.asarray(occ_basis)[occ_sel]),
+            np.ascontiguousarray(np.asarray(occ_in_bulk)[occ_sel]), 6)
         engine._cpp_engine.set_occ_sf_q_points(occ_q_points)
         engine._cpp_engine.set_occ_sf_point_indices(occ_pt_indices)
         # Second unit cell: up+down triangle pair (bulk tiling), same q-grid.
@@ -1071,7 +1131,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 nx, ny, 1.0, tri_ijk_map)
         else:
             occ2_cell_R, occ2_basis = _build_occ2_sf_geometry(nx, ny, 1.0)
-        engine._cpp_engine.set_occ2_sf_site_map(occ2_cell_R, occ2_basis, 6)
+        engine._cpp_engine.set_occ2_sf_site_map(
+            np.ascontiguousarray(np.asarray(occ2_cell_R)[occ_sel]),
+            np.ascontiguousarray(np.asarray(occ2_basis)[occ_sel]), 6)
     n_occ_pts = len(occ_pt_indices)
 
     if verbose and rank == 0:
@@ -1173,12 +1235,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                                             my_n_samples=int(my_n_samples))) as writer:
             while samples_done < my_n_samples:
                 n = min(bin_size, my_n_samples - samples_done)
-                res = engine._cpp_engine.run_profile(
+                res = _unpermute_res(engine._cpp_engine.run_profile(
                     0, n, me_density, me_zl, me_cml, profile_step,
                     n,                       # batch_size = bin size → one bin/chunk
                     None, 1,
                     n_snapshots if n_snap_pts > 0 else 0,
-                    occ_sf_nbatch if do_occ else 0)
+                    occ_sf_nbatch if do_occ else 0))
                 writer.write_chunk(
                     c, {k: _store_array(k, v) for k, v in res.items()},
                     attrs=dict(n_samples=n, samples_cumulative=samples_done + n))
@@ -1218,7 +1280,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                            delta_min=delta_min, delta_max=delta_max, epsilon=epsilon,
                            seed=seed, profile_step=profile_step,
                            samples_per_bin=int(bin_size),
-                           n_samples=n_samples, n_ranks=n_ranks))
+                           n_samples=n_samples, n_ranks=n_ranks,
+                           permute_site_labels=bool(site_perm is not None)))
             print(f"[MPI-PROF] checkpoint run dir: {run_dir}", flush=True)
 
         comm.Barrier()
@@ -1237,12 +1300,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     if verbose and rank == 0 and my_n_samples > 0:
         sa_cb, sa_bar = _make_tqdm_callback(my_n_samples, "[MPI-PROF] Sampling (rank0)")
 
-    result = engine._cpp_engine.run_profile(
+    result = _unpermute_res(engine._cpp_engine.run_profile(
         0, my_n_samples, me_density, me_zl, me_cml, profile_step,
         batch_size,
         sa_cb, 1000 if sa_cb is not None else 1,
         n_snapshots if n_snap_pts > 0 else 0,
-        occ_sf_nbatch if do_occ else 0)
+        occ_sf_nbatch if do_occ else 0))
     if sa_bar is not None:
         sa_bar.close()
 
@@ -1776,6 +1839,13 @@ def main():
                         choices=['forward', 'backward'],
                         help='(profile mode) which δ ramp --occ_sf_delta_points snap to '
                              '(default forward = up-ramp).')
+    parser.add_argument('--permute_site_labels', action='store_true',
+                        help='(profile mode) give each rank a random site-label '
+                             'permutation (identical physics, different update scan '
+                             'order). Decorrelates the ordered-phase domain pattern '
+                             'across ranks — without this, independent chains freeze '
+                             'into the SAME stripe pattern selected by the shared '
+                             'scan order. Outputs are stored in canonical labels.')
     parser.add_argument('--boundary', type=str, default='open',
                         choices=['open', 'periodic'],
                         help='Spatial lattice boundary: open (finite cropped patch) or '
@@ -1865,6 +1935,7 @@ def main():
             config_in=config.get('config_in'),
             config_out=config.get('config_out'),
             equil_progress_every=config.get('equil_progress_every', 500),
+            permute_site_labels=config.get('permute_site_labels', False),
         )
     elif mode == 'onthefly':
         run_mpi_onthefly(

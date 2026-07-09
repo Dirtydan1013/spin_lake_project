@@ -42,6 +42,8 @@ if _REPO_ROOT not in sys.path:
 from src.engines.sse import SSE_Rydberg
 from src.mpi.chunk_io import RankChunkWriter, check_config_compat, load_warm_config
 from src.mpi.equil_progress import run_equil_with_progress
+from src.mpi.site_permutation import (permute_rows, resolve_site_permutation,
+                                      to_engine, unpermute_last_axis)
 
 
 def _make_pos(lattice, N, nx, ny, a):
@@ -65,7 +67,7 @@ def _make_pos(lattice, N, nx, ny, a):
 
 
 def _setup_diag_observables(cpp, lattice, nx, ny, boundary, occ_sf_grid_n,
-                            verbose):
+                            verbose, site_perm=None, inv_perm=None):
     """Configure QAQMC-profile-parity diagonal observables on the SSE engine.
 
     Returns extra meta.h5 datasets (occ geometry) or None when skipped.
@@ -96,19 +98,25 @@ def _setup_diag_observables(cpp, lattice, nx, ny, boundary, occ_sf_grid_n,
     (bulk, loop_sets, string_sets, loop_meta, string_meta,
      vertex_sets, ijk_map) = _lattice_observables(lattice, nx, ny,
                                                   boundary=boundary)
-    cpp.set_bulk_sites([int(s) for s in bulk])
+    # geometry is built in canonical labels; map into the engine labelling
+    # when the rank runs with a site permutation (site_permutation.py)
+    cpp.set_bulk_sites([int(s) for s in to_engine(bulk, inv_perm)])
     # A_v vertex sets appended after the loops → trailing Z_l size group,
     # exactly like the QAQMC profile driver.
     cpp.set_observable_sites(
-        [[int(s) for s in st] for st in list(loop_sets) + list(vertex_sets)],
-        [[int(s) for s in st] for st in string_sets])
+        [[int(s) for s in to_engine(st, inv_perm)]
+         for st in list(loop_sets) + list(vertex_sets)],
+        [[int(s) for s in to_engine(st, inv_perm)] for st in string_sets])
 
     if lattice == "kagome_bond_triangle":
         vbs = _build_vbs_triangles_tri(nx, ny, ijk_map)
     else:
         vbs = _build_vbs_triangles(nx, ny)
     if vbs is not None:
-        cpp.set_vbs_triangles(*vbs)
+        corners, par, vsign, ssign, ref00, ref10 = vbs
+        cpp.set_vbs_triangles(np.asarray(to_engine(corners, inv_perm),
+                                         dtype=np.int32),
+                              par, vsign, ssign, ref00, ref10)
 
     meta_extra = {}
     if int(occ_sf_grid_n) > 0:
@@ -121,12 +129,14 @@ def _setup_diag_observables(cpp, lattice, nx, ny, boundary, occ_sf_grid_n,
                 nx, ny, 1.0, boundary=boundary)
             cell2_R, basis2 = _build_occ2_sf_geometry(nx, ny, 1.0)
         q_points, _ = _build_occ_q_grid(int(occ_sf_grid_n), 1.0)
-        cpp.set_occ_sf_site_map(np.asarray(cell_R, dtype=np.float64),
-                                np.asarray(basis, dtype=np.int32),
-                                np.asarray(in_bulk, dtype=np.int32), 6)
+        cpp.set_occ_sf_site_map(
+            permute_rows(np.asarray(cell_R, dtype=np.float64), site_perm),
+            permute_rows(np.asarray(basis, dtype=np.int32), site_perm),
+            permute_rows(np.asarray(in_bulk, dtype=np.int32), site_perm), 6)
         cpp.set_occ_sf_q_points(np.asarray(q_points, dtype=np.float64))
-        cpp.set_occ2_sf_site_map(np.asarray(cell2_R, dtype=np.float64),
-                                 np.asarray(basis2, dtype=np.int32), 6)
+        cpp.set_occ2_sf_site_map(
+            permute_rows(np.asarray(cell2_R, dtype=np.float64), site_perm),
+            permute_rows(np.asarray(basis2, dtype=np.int32), site_perm), 6)
         meta_extra = dict(
             occ_q_points=np.asarray(q_points, dtype=np.float64),
             occ_cell_R=np.asarray(cell_R, dtype=np.float64),
@@ -153,7 +163,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             epsilon=0.01, seed=42, n_equil=5000, n_samples=50000,
             checkpoint=250, run_dir="data/sse_mpi", neighbor_cutoff=None,
             boundary="open", config_in=None, equil_progress_every=500,
-            occ_sf_grid_n=0, n_snapshots=0,
+            occ_sf_grid_n=0, n_snapshots=0, permute_site_labels=False,
             verbose=True):
     """MPI-parallel SSE with per-rank chunked output and warm start.
 
@@ -188,16 +198,15 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
               f"({n_ranks * my_n_samples} total)", flush=True)
 
     rank_seed = seed + rank * 9973
-    engine = SSE_Rydberg(
-        N=N, Omega=Omega, delta=delta, Rb=Rb, beta=beta,
-        epsilon=epsilon, seed=rank_seed, pos=pos, use_cpp=True,
-        verbose=False, neighbor_cutoff=neighbor_cutoff, box_vectors=box_vectors,
-    )
-    cpp = engine._cpp_engine
-    if cpp is None:
-        raise RuntimeError("SSE MPI mode requires the C++ backend")
 
-    # ── Warm start: install a saved configuration, skip thermalization ──────
+    # Warm-start config + per-rank site-label permutation (scan-order
+    # decorrelation — see src/mpi/site_permutation.py).  The engine runs on
+    # relabelled sites; diagonal-observable geometry is mapped into the engine
+    # labelling and site-resolved outputs mapped back, so files stay canonical.
+    # NOTE: the index-staggered mz/mz_abs are computed in ENGINE labels and
+    # lose their meaning under permutation (they are 1d-chain legacy
+    # observables anyway).
+    cfg = None
     if config_in:
         cfg = load_warm_config(config_in, rank, verbose=(rank == 0 and verbose))
         if cfg is None:
@@ -205,6 +214,21 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
         check_config_compat(cfg, dict(N=int(N), lattice=str(lattice),
                                       boundary=str(boundary)),
                             f"sse rank {rank}")
+    site_perm, inv_perm = resolve_site_permutation(
+        N, rank_seed, permute_site_labels, cfg=cfg, label="MPI-SSE")
+
+    engine = SSE_Rydberg(
+        N=N, Omega=Omega, delta=delta, Rb=Rb, beta=beta,
+        epsilon=epsilon, seed=rank_seed, pos=permute_rows(pos, site_perm),
+        use_cpp=True,
+        verbose=False, neighbor_cutoff=neighbor_cutoff, box_vectors=box_vectors,
+    )
+    cpp = engine._cpp_engine
+    if cpp is None:
+        raise RuntimeError("SSE MPI mode requires the C++ backend")
+
+    # ── Warm start: install a saved configuration, skip thermalization ──────
+    if cfg is not None:
         cpp.set_config(
             np.ascontiguousarray(cfg["state"], dtype=np.int32),
             np.ascontiguousarray(cfg["op_types"], dtype=np.int32),
@@ -235,7 +259,8 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
     # ── Diagonal observables (QAQMC-profile parity; needs a new-enough .so) ──
     diag_meta = _setup_diag_observables(cpp, lattice, nx, ny, boundary,
                                         occ_sf_grid_n,
-                                        verbose=(verbose and rank == 0))
+                                        verbose=(verbose and rank == 0),
+                                        site_perm=site_perm, inv_perm=inv_perm)
     supports_new_run = hasattr(cpp, "set_observable_sites")
 
     # ── Sampling in bins → chunks ───────────────────────────────────────────
@@ -247,6 +272,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
         Omega=float(Omega), delta=float(delta),
         Rb=float(Rb), beta=float(beta), epsilon=float(epsilon), seed=int(seed),
         rank_seed=int(rank_seed), n_ranks=int(n_ranks), checkpoint=int(checkpoint),
+        permute_site_labels=bool(site_perm is not None),
         n_bins=int(n_bins), samples_per_bin=int(checkpoint),
         neighbor_cutoff=(-1 if neighbor_cutoff is None else int(neighbor_cutoff)),
         boundary=str(boundary),
@@ -286,9 +312,13 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
                     np.asarray(raw["density_bulk"], np.float64).mean())
             for key in _OCC_CHUNK_KEYS:
                 if key in raw:
-                    datasets[key] = np.asarray(raw[key], dtype=np.float32)
+                    arr = np.asarray(raw[key], dtype=np.float32)
+                    if key == "occ_nprof":                # site-resolved
+                        arr = unpermute_last_axis(arr, inv_perm)
+                    datasets[key] = arr
             if "snapshots" in raw:
-                datasets["snapshots"] = np.asarray(raw["snapshots"], dtype=np.int8)
+                datasets["snapshots"] = unpermute_last_axis(
+                    np.asarray(raw["snapshots"], dtype=np.int8), inv_perm)
             writer.write_chunk(c, datasets=datasets,
                                attrs=dict(n_samples=int(checkpoint), M=int(cpp.M)))
             if verbose and rank == 0:
@@ -299,12 +329,15 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
     # Warm-start config (spin state + operator string + RNG state) →
     # <run_dir>/configs/rank{r}.h5, separate from the observable chunk files so
     # it can be reclaimed independently (rm -rf <run_dir>/configs).
+    cfg_datasets = dict(
+        state=np.asarray(cpp.state, dtype=np.int32),
+        op_types=np.asarray(cpp.op_types, dtype=np.int32),
+        op_sites=np.asarray(cpp.op_sites, dtype=np.int32))
+    if site_perm is not None:
+        cfg_datasets["site_perm"] = np.asarray(site_perm, dtype=np.int32)
     with RankChunkWriter(os.path.join(run_dir, "configs"), rank) as cfg_writer:
         cfg_writer.write_final_config(
-            datasets=dict(
-                state=np.asarray(cpp.state, dtype=np.int32),
-                op_types=np.asarray(cpp.op_types, dtype=np.int32),
-                op_sites=np.asarray(cpp.op_sites, dtype=np.int32)),
+            datasets=cfg_datasets,
             attrs=dict(N=int(N), lattice=str(lattice), boundary=str(boundary),
                        beta=float(beta), seed=int(rank_seed),
                        rng_state=cpp.get_rng_state()))
@@ -388,6 +421,12 @@ def main():
                         help="full-state snapshots per rank per chunk (int8, "
                              "for real-space excitation-pattern plots). "
                              "0 = disabled.")
+    parser.add_argument("--permute-site-labels", action="store_true",
+                        help="per-rank random site-label permutation (identical "
+                             "physics, different update scan order) — decorrelates "
+                             "the domain selection across ranks. Files stay in "
+                             "canonical labels; the index-staggered mz/mz_abs "
+                             "lose meaning under permutation.")
     parser.add_argument("--run-dir", type=str, default="data/sse_mpi",
                         help="output directory; each rank writes rank{r}.h5 here")
     parser.add_argument("--config-in", type=str, default=None,
@@ -413,6 +452,7 @@ def main():
         equil_progress_every=config.get("equil_progress_every", 500),
         occ_sf_grid_n=config.get("occ_sf_grid_n", 0),
         n_snapshots=config.get("n_snapshots", 0),
+        permute_site_labels=config.get("permute_site_labels", False),
     )
 
 
