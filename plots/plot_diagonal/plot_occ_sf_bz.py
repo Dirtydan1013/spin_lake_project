@@ -7,6 +7,12 @@ triangle-pair 'tri' by default), columns = δ points.  Supports the connected
 (⟨s s*⟩ − ⟨s⟩⟨s⟩*, default) and unconnected (raw ⟨s s*⟩) definitions; both are
 normalised per cell.
 
+NOTE: with per-rank site permutation (default ON since 2026-07) the ensemble
+averages over degenerate domain patterns, so unconnected ≈ connected at the
+ordering vectors — the connected mode and per-bin domain analysis are the
+order diagnostics; a large unconnected−connected gap only appears for
+phase-locked (pre-permutation) ensembles.
+
 Usage::
 
     python plots/plot_diagonal/plot_occ_sf_bz.py [--run_dir data/M=...] \

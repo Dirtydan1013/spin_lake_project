@@ -5,6 +5,10 @@ Single (δ, β) point; one panel per unit-cell convention (hexagon 'full',
 plots/plot_diagonal/plot_occ_sf_bz.py: default max eigenvalue of the Hermitian
 6×6 matrix, connected (⟨s s*⟩ − ⟨s⟩⟨s⟩*) or unconnected, per-cell normalised.
 
+NOTE: an equilibrium (or site-permuted, default ON since 2026-07) ensemble
+averages over degenerate domains, so unconnected ≈ connected at the ordering
+vectors — use the connected mode and per-bin domain analysis for order.
+
 Usage::
 
     python plots/plot_sse/plot_occ_sf_bz.py --run_dir data/sse_6x6_... \
