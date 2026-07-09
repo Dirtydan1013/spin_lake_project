@@ -76,6 +76,8 @@ DELTA_GROUPS=${DELTA_GROUPS:-600}
 K_VALUES=${K_VALUES:-"200"}
 N_TRAJ=${N_TRAJ:-4000}
 N_THERMALIZE=${N_THERMALIZE:-5000}
+# Print rank-0 thermalization progress every this many steps (<= 0 disables).
+EQUIL_PRINT_EVERY=${EQUIL_PRINT_EVERY:-500}
 DECORR=${DECORR:-1000}
 SEED=${SEED:-7}
 # Incremental checkpointing: flush per-trajectory arrays every this many
@@ -164,6 +166,7 @@ mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS py
     --K-values "$K_VALUES" \
     --n-trajectories "$N_TRAJ" \
     --n-thermalize "$N_THERMALIZE" \
+    --equil-progress-every "$EQUIL_PRINT_EVERY" \
     --decorrelation-steps "$DECORR" \
     --seed "$SEED" \
     --skip-ed \

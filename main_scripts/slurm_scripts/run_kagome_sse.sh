@@ -55,6 +55,8 @@ BETA=${BETA:-16.0}
 EPSILON=${EPSILON:-0.01}
 NEIGHBOR_CUTOFF=${NEIGHBOR_CUTOFF:--1}
 N_EQUIL=${N_EQUIL:-20000}
+# Print rank-0 equilibration progress every this many steps (<= 0 disables).
+EQUIL_PRINT_EVERY=${EQUIL_PRINT_EVERY:-500}
 N_SAMPLES=${N_SAMPLES:-2000000}
 # checkpoint = samples per bin == chunk flush size (merged).  Pick so one
 # chunk ~= a few minutes of wall time.
@@ -85,6 +87,7 @@ mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS \
     --boundary "$BOUNDARY" \
     --seed "$SEED" \
     --n-equil "$N_EQUIL" \
+    --equil-progress-every "$EQUIL_PRINT_EVERY" \
     --n-samples "$N_SAMPLES" \
     --checkpoint "$CHECKPOINT" \
     --run-dir "$RUN_DIR" \

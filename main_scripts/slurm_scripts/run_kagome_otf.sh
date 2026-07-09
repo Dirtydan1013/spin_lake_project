@@ -58,6 +58,10 @@ RB=${RB:-2.4}
 DELTA_MIN=${DELTA_MIN:--2}
 DELTA_MAX=${DELTA_MAX:-6}
 N_EQUIL=${N_EQUIL:-4000}
+# Print rank-0 equilibration progress every this many steps (driver default
+# 500; <= 0 disables intermediate prints).  Passed conditionally so the script
+# stays compatible with the main branch's flat src.qaqmc_mpi module.
+EQUIL_PRINT_EVERY=${EQUIL_PRINT_EVERY:-""}
 N_SAMPLES=${N_SAMPLES:-72000}
 PROFILE_STEP=${PROFILE_STEP:-500000}
 # Merged bin==chunk: every CHECKPOINT raw samples per rank get averaged into
@@ -105,6 +109,7 @@ mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS py
     --delta_min "$DELTA_MIN" \
     --delta_max "$DELTA_MAX" \
     --n_equil "$N_EQUIL" \
+    ${EQUIL_PRINT_EVERY:+--equil_progress_every "$EQUIL_PRINT_EVERY"} \
     --n_samples "$N_SAMPLES" \
     --omp_threads "$SLURM_CPUS_PER_TASK" \
     --delta_groups 600 \

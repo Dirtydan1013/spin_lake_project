@@ -44,6 +44,7 @@ if _REPO_ROOT not in sys.path:
 
 from src.engines.qaqmc_string_work import QAQMCStringWorkRydberg, cosine_schedule
 from src.mpi.chunk_io import RankChunkWriter
+from src.mpi.equil_progress import run_equil_with_progress
 from src.rydberg.lattices import (
     generate_1d_chain,
     generate_kagome_bond_lattice,
@@ -93,6 +94,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         checkpoint_dir: str | None = None,
                         config_in: str | None = None,
                         config_out: str | None = None,
+                        equil_progress_every: int = 500,
                         verbose: bool = True) -> dict | None:
     """config_in: warm-start directory of rank{r}.h5 final configurations from
     a previous run with the same (N, M, Hamiltonian); when given, per-K
@@ -150,7 +152,13 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 print(f"[MPI-STRWORK] warm start from {config_in} — "
                       f"thermalization skipped", flush=True)
         else:
-            eng.thermalize(n_thermalize, direction=direction)
+            # Chunked thermalize is equivalent to one long call: each chunk
+            # just re-sets the same starting seam mask (idempotent) and keeps
+            # stepping the same chain.
+            run_equil_with_progress(
+                lambda n: eng.thermalize(n, direction=direction),
+                n_thermalize, label=f"MPI-STRWORK K={K}",
+                rank=rank, print_every=equil_progress_every, verbose=verbose)
 
         ckpt = int(checkpoint_every_trajectories) if checkpoint_dir else 0
         if ckpt > 0 and my_n > 0:
@@ -320,6 +328,9 @@ def main():
     parser.add_argument("--n-trajectories", type=int, default=4000,
                         help="total trajectories across ranks")
     parser.add_argument("--n-thermalize", type=int, default=2000)
+    parser.add_argument("--equil-progress-every", type=int, default=500,
+                        help="print rank-0 thermalization progress every N steps "
+                             "(<= 0 disables intermediate prints)")
     parser.add_argument("--decorrelation-steps", type=int, default=100)
     parser.add_argument("--n-topology-sweeps-per-lambda", type=int, default=1)
     parser.add_argument("--n-qaqmc-sweeps-per-lambda", type=int, default=1)
@@ -398,6 +409,7 @@ def main():
         checkpoint_dir=ckpt_dir,
         config_in=args.config_in,
         config_out=args.config_out,
+        equil_progress_every=args.equil_progress_every,
     )
 
 

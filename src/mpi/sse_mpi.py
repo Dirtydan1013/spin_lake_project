@@ -41,6 +41,7 @@ if _REPO_ROOT not in sys.path:
 
 from src.engines.sse import SSE_Rydberg
 from src.mpi.chunk_io import RankChunkWriter, check_config_compat, load_warm_config
+from src.mpi.equil_progress import run_equil_with_progress
 
 
 def _make_pos(lattice, N, nx, ny, a):
@@ -66,7 +67,8 @@ def _make_pos(lattice, N, nx, ny, a):
 def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             epsilon=0.01, seed=42, n_equil=5000, n_samples=50000,
             checkpoint=250, run_dir="data/sse_mpi", neighbor_cutoff=None,
-            boundary="open", config_in=None, verbose=True):
+            boundary="open", config_in=None, equil_progress_every=500,
+            verbose=True):
     """MPI-parallel SSE with per-rank chunked output and warm start.
 
     Each rank runs an independent chain (seed = seed + rank*9973), bins its
@@ -131,10 +133,15 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
 
     # ── Equilibration ───────────────────────────────────────────────────────
     comm.Barrier()
-    t0 = time.perf_counter()
-    for _ in range(n_equil):
-        cpp.mc_step()
-    t_equil = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
+
+    def _advance_equil(n):
+        for _ in range(n):
+            cpp.mc_step()
+
+    t_equil = run_equil_with_progress(
+        _advance_equil, n_equil, label="MPI-SSE", rank=rank,
+        print_every=equil_progress_every, verbose=verbose)
+    t_equil = comm.reduce(t_equil, op=MPI.MAX, root=0)
     if verbose and rank == 0:
         print(f"[MPI-SSE] Equilibration done in {t_equil:.1f}s (slowest rank)",
               flush=True)
@@ -243,6 +250,9 @@ def main():
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-equil", type=int, default=5000)
+    parser.add_argument("--equil-progress-every", type=int, default=500,
+                        help="print rank-0 equilibration progress every N steps "
+                             "(<= 0 disables intermediate prints)")
     parser.add_argument("--n-samples", type=int, default=50000,
                         help="total samples across ranks")
     parser.add_argument("--checkpoint", type=int, default=250,
@@ -274,6 +284,7 @@ def main():
         checkpoint=config["checkpoint"], run_dir=config["run_dir"],
         neighbor_cutoff=neighbor_cutoff, boundary=config.get("boundary", "open"),
         config_in=config.get("config_in"),
+        equil_progress_every=config.get("equil_progress_every", 500),
     )
 
 

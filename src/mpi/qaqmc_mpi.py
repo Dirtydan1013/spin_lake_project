@@ -29,6 +29,7 @@ except ImportError:
     HAS_TQDM = False
 
 from src.engines.qaqmc import QAQMC_Rydberg
+from src.mpi.equil_progress import run_equil_with_progress
 from src.rydberg.lattices import (kagome_loop_string_translations,
                           kagome_multi_size_translations, kagome_bulk_sites,
                           kagome_vertex_sites)
@@ -859,6 +860,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
                     lattice='kagome_bond', boundary='open', box_vectors=None,
                     config_in=None, config_out=None,
+                    equil_progress_every=500,
                     verbose=True):
     """
     MPI-parallel QAQMC asymmetric profile measurement.
@@ -1086,15 +1088,17 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
     # Equilibration
     comm.Barrier()
-    t0 = time.perf_counter()
-    if n_equil > 0:
+
+    def _advance_equil(n):
         try:
-            engine._cpp_engine.run(n_equil, 0)
+            engine._cpp_engine.run(n, 0)
         except TypeError:
-            for _ in range(n_equil):
+            for _ in range(n):
                 engine._cpp_engine.mc_step()
 
-    t_equil = time.perf_counter() - t0
+    t_equil = run_equil_with_progress(
+        _advance_equil, n_equil, label="MPI-PROF", rank=rank,
+        print_every=equil_progress_every, verbose=verbose)
     comm.Barrier()
     if verbose and rank == 0:
         max_eq = comm.reduce(t_equil, op=MPI.MAX, root=0)
@@ -1654,6 +1658,9 @@ def main():
     parser.add_argument('--epsilon', type=float, default=0.01)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--n_equil', type=int, default=5000)
+    parser.add_argument('--equil_progress_every', type=int, default=500,
+                        help='(profile mode) print rank-0 equilibration progress '
+                             'every N steps (<= 0 disables intermediate prints)')
     parser.add_argument('--n_samples', type=int, default=30000)
     parser.add_argument('--neighbor_cutoff', type=int, default=None)
     parser.add_argument('--delta_groups', type=int, default=600,
@@ -1822,6 +1829,7 @@ def main():
             boundary=boundary, box_vectors=box_vectors,
             config_in=config.get('config_in'),
             config_out=config.get('config_out'),
+            equil_progress_every=config.get('equil_progress_every', 500),
         )
     elif mode == 'onthefly':
         run_mpi_onthefly(

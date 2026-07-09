@@ -63,6 +63,8 @@ SCHEDULE=${SCHEDULE:-cosine}
 DIRECTION=${DIRECTION:-forward}
 N_TRAJ=${N_TRAJ:-4000}
 N_THERMALIZE=${N_THERMALIZE:-5000}
+# Print rank-0 thermalization progress every this many steps (<= 0 disables).
+EQUIL_PRINT_EVERY=${EQUIL_PRINT_EVERY:-500}
 DECORR=${DECORR:-100}
 SEED=${SEED:-7}
 CKPT_TRAJ=${CKPT_TRAJ:-250}
@@ -131,6 +133,7 @@ mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS \
     --direction "$DIRECTION" \
     --n-trajectories "$N_TRAJ" \
     --n-thermalize "$N_THERMALIZE" \
+    --equil-progress-every "$EQUIL_PRINT_EVERY" \
     --decorrelation-steps "$DECORR" \
     --seed "$SEED" \
     --checkpoint-every-trajectories "$CKPT_TRAJ" \

@@ -38,6 +38,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from src.engines.qaqmc_renyi_work import QAQMCRenyiWorkRydberg
+from src.mpi.equil_progress import run_equil_with_progress
 from src.rydberg.lattices import (
     generate_1d_chain,
     generate_kagome_bond_lattice,
@@ -95,6 +96,7 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                  checkpoint_dir: str | None = None,
                  config_in: str | None = None,
                  config_out: str | None = None,
+                 equil_progress_every: int = 500,
                  verbose: bool = True) -> dict:
     """When checkpoint_every_trajectories > 0 and checkpoint_dir is set, each
     rank additionally flushes its per-trajectory arrays every that many
@@ -162,7 +164,13 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 print(f"[MPI-WORK] warm start from {config_in} — "
                       f"thermalization skipped", flush=True)
         else:
-            eng.thermalize(n_thermalize)
+            # Chunked thermalize is equivalent to one long call: from the
+            # second chunk on, thermalize()'s reset_to_start_sector restores
+            # the checkpoint saved at the end of the previous chunk (the
+            # current config) and keeps stepping.
+            run_equil_with_progress(
+                eng.thermalize, n_thermalize, label=f"MPI-WORK K={K}",
+                rank=rank, print_every=equil_progress_every, verbose=verbose)
 
         ckpt = int(checkpoint_every_trajectories) if checkpoint_dir else 0
         if ckpt > 0 and my_n > 0:
@@ -353,6 +361,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
                        compute_ed=True, box_vectors=None, filepath=None, kp_meta=None,
                        checkpoint_every_trajectories=0, checkpoint_dir=None,
                        config_in=None, config_out=None,
+                       equil_progress_every=500,
                        verbose=True) -> dict | None:
     """Run the work engine for a list of (region_name, A_start_mask, A_end_mask).
 
@@ -397,6 +406,7 @@ def run_kp_regions_mpi(*, N, M, Omega, Rb, delta_min, delta_max, epsilon,
                        if config_in else None),
             config_out=(os.path.join(config_out, str(region_name))
                         if config_out else None),
+            equil_progress_every=equil_progress_every,
             verbose=verbose,
         )
         if rank == 0:
@@ -598,6 +608,9 @@ def main():
                         help="comma-separated K values to sweep (use one value for production)")
     parser.add_argument("--n-trajectories", type=int, default=4000)
     parser.add_argument("--n-thermalize", type=int, default=3000)
+    parser.add_argument("--equil-progress-every", type=int, default=500,
+                        help="print rank-0 thermalization progress every N steps "
+                             "(<= 0 disables intermediate prints)")
     parser.add_argument("--decorrelation-steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=7)
     # Output / misc
@@ -721,6 +734,7 @@ def main():
             checkpoint_dir=ckpt_dir,
             config_in=args.config_in,
             config_out=cfg_out_dir,
+            equil_progress_every=args.equil_progress_every,
             kp_meta=dict(
                 lattice=args.lattice, nx=args.nx, ny=args.ny, a=args.a,
                 m=args.kp_m, center_label=spec.center_label,
@@ -754,6 +768,7 @@ def main():
         checkpoint_dir=ckpt_dir,
         config_in=args.config_in,
         config_out=cfg_out_dir,
+        equil_progress_every=args.equil_progress_every,
     )
 
 
