@@ -41,7 +41,8 @@ old_code/
 
 logs/
 
-scripts/
+scripts/*
+!scripts/experiments/
 
 task/
 
