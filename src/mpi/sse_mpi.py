@@ -340,7 +340,7 @@ def combine_run(run_dir, burn_in_fraction=0.5):
     for _r, _c, g in iter_rank_chunks(run_dir, burn_in_fraction=burn_in_fraction):
         for k in keys:
             if k in g:
-                acc[k].append(float(g[k][()]))
+                acc[k].append(float(np.squeeze(g[k][()])))
     out = {}
     for k, vals in acc.items():
         if vals:
