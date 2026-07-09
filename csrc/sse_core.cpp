@@ -35,6 +35,8 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
       norm_N_(0.0), energy_shift_(0.0),
       rng_(seed)
 {
+    diag_obs.init(N);
+
     // ── Build V_ij (optional neighbor cutoff; optional periodic box) ───────────
     vij_ = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff, box, n_box);
     int n_bonds     = vij_.n_bonds;

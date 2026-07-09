@@ -1,5 +1,6 @@
 #pragma once
 #include "qaqmc_core.hpp"  // RydbergVij, build_rydberg_vij, AliasEntry, RNG helpers
+#include "diagonal_observables.hpp"
 #include <string>
 #include <cstdint>
 
@@ -52,6 +53,13 @@ public:
     double measure_energy()  const;   // -n_ops/beta + sum_b cij_b
     double measure_density() const;   // mean(state_)
     double measure_mz()      const;   // staggered mz = (1/N) sum_i (-1)^i (n_i - 0.5)
+
+    // ── Diagonal observables shared with the QAQMC profile engine ────────────
+    // Geometry (loop/string sets, A_v, VBS/SS triangles, occ-SF maps) is set
+    // through this member; per-sample measurement on state_ happens in the
+    // bindings' run() loop.  Same estimator as measure_density: state_ is the
+    // τ=0 basis state of the SSE configuration.
+    DiagonalObservables diag_obs;
 
     // ── Array accessors ──────────────────────────────────────────────────────
     const std::vector<int32_t>& get_state()           const { return state_; }

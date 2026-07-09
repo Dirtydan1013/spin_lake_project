@@ -52,6 +52,11 @@ N_SAMPLES=${N_SAMPLES:-2000000}
 # checkpoint = samples per bin == chunk flush size (merged).  Pick so one
 # chunk ~= a few minutes of wall time.
 CHECKPOINT=${CHECKPOINT:-250}
+# Diagonal observables (QAQMC-profile parity: Z_l/C_m/A_v/VBS/SS are ON
+# automatically on kagome lattices when the deployed qaqmc_cpp supports them).
+# occ-SF matrix q-grid side (0 = off) and full-state snapshots per rank/chunk.
+OCC_SF_GRID_N=${OCC_SF_GRID_N:-12}
+N_SNAPSHOTS=${N_SNAPSHOTS:-1}
 SEED=${SEED:-42}
 RUN_DIR=${RUN_DIR:-"data/sse_${NX}x${NY}_${LATTICE}_beta${BETA}_delta${DELTA}"}
 # Warm start: point CONFIG_IN at a previous run's RUN_DIR (rank{r}.h5 with a
@@ -81,6 +86,8 @@ $MPIEXEC \
     --equil-progress-every "$EQUIL_PRINT_EVERY" \
     --n-samples "$N_SAMPLES" \
     --checkpoint "$CHECKPOINT" \
+    --occ-sf-grid-n "$OCC_SF_GRID_N" \
+    --n-snapshots "$N_SNAPSHOTS" \
     --run-dir "$RUN_DIR" \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"}
     # NOTES:

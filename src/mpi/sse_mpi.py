@@ -64,10 +64,96 @@ def _make_pos(lattice, N, nx, ny, a):
     raise ValueError(f"unsupported lattice {lattice!r}")
 
 
+def _setup_diag_observables(cpp, lattice, nx, ny, boundary, occ_sf_grid_n,
+                            verbose):
+    """Configure QAQMC-profile-parity diagonal observables on the SSE engine.
+
+    Returns extra meta.h5 datasets (occ geometry) or None when skipped.
+    Skips silently when the lattice has no kagome observable geometry, and
+    with a note when the loaded qaqmc_cpp predates the SSE observable API —
+    so a driver newer than the deployed .so degrades to the legacy behaviour
+    instead of crashing a production run.
+    """
+    if lattice not in ("kagome_bond", "kagome_bond_triangle"):
+        return None
+    if not hasattr(cpp, "set_observable_sites"):
+        if verbose:
+            print("[MPI-SSE] loaded qaqmc_cpp lacks the SSE diagonal-observable "
+                  "API — measuring legacy scalars only", flush=True)
+        return None
+
+    from src.mpi.qaqmc_mpi import (
+        _build_occ2_sf_geometry,
+        _build_occ2_sf_geometry_tri,
+        _build_occ_q_grid,
+        _build_occ_sf_geometry,
+        _build_occ_sf_geometry_tri,
+        _build_vbs_triangles,
+        _build_vbs_triangles_tri,
+        _lattice_observables,
+    )
+
+    (bulk, loop_sets, string_sets, loop_meta, string_meta,
+     vertex_sets, ijk_map) = _lattice_observables(lattice, nx, ny,
+                                                  boundary=boundary)
+    cpp.set_bulk_sites([int(s) for s in bulk])
+    # A_v vertex sets appended after the loops → trailing Z_l size group,
+    # exactly like the QAQMC profile driver.
+    cpp.set_observable_sites(
+        [[int(s) for s in st] for st in list(loop_sets) + list(vertex_sets)],
+        [[int(s) for s in st] for st in string_sets])
+
+    if lattice == "kagome_bond_triangle":
+        vbs = _build_vbs_triangles_tri(nx, ny, ijk_map)
+    else:
+        vbs = _build_vbs_triangles(nx, ny)
+    if vbs is not None:
+        cpp.set_vbs_triangles(*vbs)
+
+    meta_extra = {}
+    if int(occ_sf_grid_n) > 0:
+        if lattice == "kagome_bond_triangle":
+            cell_R, basis, in_bulk = _build_occ_sf_geometry_tri(
+                nx, ny, 1.0, ijk_map, bulk)
+            cell2_R, basis2 = _build_occ2_sf_geometry_tri(nx, ny, 1.0, ijk_map)
+        else:
+            cell_R, basis, in_bulk = _build_occ_sf_geometry(
+                nx, ny, 1.0, boundary=boundary)
+            cell2_R, basis2 = _build_occ2_sf_geometry(nx, ny, 1.0)
+        q_points, _ = _build_occ_q_grid(int(occ_sf_grid_n), 1.0)
+        cpp.set_occ_sf_site_map(np.asarray(cell_R, dtype=np.float64),
+                                np.asarray(basis, dtype=np.int32),
+                                np.asarray(in_bulk, dtype=np.int32), 6)
+        cpp.set_occ_sf_q_points(np.asarray(q_points, dtype=np.float64))
+        cpp.set_occ2_sf_site_map(np.asarray(cell2_R, dtype=np.float64),
+                                 np.asarray(basis2, dtype=np.int32), 6)
+        meta_extra = dict(
+            occ_q_points=np.asarray(q_points, dtype=np.float64),
+            occ_cell_R=np.asarray(cell_R, dtype=np.float64),
+            occ_basis=np.asarray(basis, dtype=np.int32))
+
+    if verbose:
+        loops = [m["size"] for m in loop_meta if m["n_copies"] > 0]
+        strings = [m["size"] for m in string_meta if m["n_copies"] > 0]
+        occ_note = (f", occ-SF {occ_sf_grid_n}×{occ_sf_grid_n} q-grid"
+                    if int(occ_sf_grid_n) > 0 else "")
+        print(f"[MPI-SSE] diagonal observables on: bulk={len(bulk)}/{cpp.N}, "
+              f"loops s={loops} + A_v({len(vertex_sets)}), strings s={strings}, "
+              f"VBS/SS={'on' if vbs is not None else 'off'}{occ_note}",
+              flush=True)
+    return meta_extra
+
+
+# Per-chunk occ-SF datasets forwarded from the C++ run() (one super-bin/chunk).
+_OCC_CHUNK_KEYS = ("occ_S_full_re", "occ_S_full_im", "occ_S_bulk_re",
+                   "occ_S_bulk_im", "occ2_S_re", "occ2_S_im", "occ_nprof")
+
+
 def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             epsilon=0.01, seed=42, n_equil=5000, n_samples=50000,
             checkpoint=250, run_dir="data/sse_mpi", neighbor_cutoff=None,
             boundary="open", config_in=None, equil_progress_every=500,
+            occ_sf_grid_n=0, n_snapshots=0,
             verbose=True):
     """MPI-parallel SSE with per-rank chunked output and warm start.
 
@@ -146,12 +232,19 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
         print(f"[MPI-SSE] Equilibration done in {t_equil:.1f}s (slowest rank)",
               flush=True)
 
+    # ── Diagonal observables (QAQMC-profile parity; needs a new-enough .so) ──
+    diag_meta = _setup_diag_observables(cpp, lattice, nx, ny, boundary,
+                                        occ_sf_grid_n,
+                                        verbose=(verbose and rank == 0))
+    supports_new_run = hasattr(cpp, "set_observable_sites")
+
     # ── Sampling in bins → chunks ───────────────────────────────────────────
     comm.Barrier()
     t0 = time.perf_counter()
 
     run_attrs = dict(
-        lattice=str(lattice), N=int(N), Omega=float(Omega), delta=float(delta),
+        lattice=str(lattice), N=int(N), nx=int(nx), ny=int(ny), a=float(a),
+        Omega=float(Omega), delta=float(delta),
         Rb=float(Rb), beta=float(beta), epsilon=float(epsilon), seed=int(seed),
         rank_seed=int(rank_seed), n_ranks=int(n_ranks), checkpoint=int(checkpoint),
         n_bins=int(n_bins), samples_per_bin=int(checkpoint),
@@ -160,20 +253,44 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
         timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
     )
 
+    run_kwargs = dict(n_snapshots=int(n_snapshots)) if supports_new_run else {}
+
     with RankChunkWriter(run_dir, rank, run_attrs=run_attrs) as writer:
         for c in range(n_bins):
             raw = cpp.run(n_equil=0, n_samples=int(checkpoint),
-                          progress_callback=None, progress_every=1)
+                          progress_callback=None, progress_every=1,
+                          **run_kwargs)
             e = np.asarray(raw["energies"], dtype=np.float64)
             d = np.asarray(raw["densities"], dtype=np.float64)
             m = np.asarray(raw["mz"], dtype=np.float64)
             no = np.asarray(raw["n_ops"], dtype=np.float64)
-            writer.write_chunk(c, datasets=dict(
+            datasets = dict(
                 energy=float(e.mean()), energy_sq=float((e**2).mean()),
                 density=float(d.mean()), density_sq=float((d**2).mean()),
                 mz=float(m.mean()), mz_abs=float(np.abs(m).mean()),
                 n_ops=float(no.mean()),
-            ), attrs=dict(n_samples=int(checkpoint), M=int(cpp.M)))
+            )
+            # Bin means of the diagonal observables (chunk == one bin, same
+            # convention as the QAQMC profile chunks).
+            if "Z_l" in raw:
+                datasets["Z_l"] = np.asarray(raw["Z_l"], np.float64).mean(axis=0)
+            if "C_m_l" in raw:
+                datasets["C_m_l"] = np.asarray(raw["C_m_l"], np.float64).mean(axis=0)
+            if "M_vbs" in raw:
+                mv = np.asarray(raw["M_vbs"], np.float64)
+                ms = np.asarray(raw["M_ss"], np.float64)
+                datasets.update(M_vbs=float(mv.mean()), M_vbs2=float((mv**2).mean()),
+                                M_ss=float(ms.mean()), M_ss2=float((ms**2).mean()))
+            if "density_bulk" in raw:
+                datasets["density_bulk"] = float(
+                    np.asarray(raw["density_bulk"], np.float64).mean())
+            for key in _OCC_CHUNK_KEYS:
+                if key in raw:
+                    datasets[key] = np.asarray(raw[key], dtype=np.float32)
+            if "snapshots" in raw:
+                datasets["snapshots"] = np.asarray(raw["snapshots"], dtype=np.int8)
+            writer.write_chunk(c, datasets=datasets,
+                               attrs=dict(n_samples=int(checkpoint), M=int(cpp.M)))
             if verbose and rank == 0:
                 el = time.perf_counter() - t0
                 print(f"[MPI-SSE] rank0 chunk {c + 1}/{n_bins} "
@@ -203,6 +320,8 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
                 f.attrs[k] = v
             f.attrs["n_samples_total"] = int(n_ranks * my_n_samples)
             f.create_dataset("pos", data=np.asarray(pos, dtype=np.float64))
+            for k, v in (diag_meta or {}).items():
+                f.create_dataset(k, data=v)
         if verbose:
             print(f"[MPI-SSE] Sampling done in {t_sample:.1f}s; "
                   f"{n_bins} chunk(s)/rank → {run_dir}", flush=True)
@@ -262,6 +381,13 @@ def main():
                         choices=["open", "periodic"],
                         help="spatial lattice boundary: open (finite patch) or "
                              "periodic (torus; not valid for kagome_bond_triangle)")
+    parser.add_argument("--occ-sf-grid-n", type=int, default=0,
+                        help="side length of the 2D BZ q-grid for the occupation "
+                             "SF matrix (one super-bin per chunk). 0 = disabled.")
+    parser.add_argument("--n-snapshots", type=int, default=0,
+                        help="full-state snapshots per rank per chunk (int8, "
+                             "for real-space excitation-pattern plots). "
+                             "0 = disabled.")
     parser.add_argument("--run-dir", type=str, default="data/sse_mpi",
                         help="output directory; each rank writes rank{r}.h5 here")
     parser.add_argument("--config-in", type=str, default=None,
@@ -285,6 +411,8 @@ def main():
         neighbor_cutoff=neighbor_cutoff, boundary=config.get("boundary", "open"),
         config_in=config.get("config_in"),
         equil_progress_every=config.get("equil_progress_every", 500),
+        occ_sf_grid_n=config.get("occ_sf_grid_n", 0),
+        n_snapshots=config.get("n_snapshots", 0),
     )
 
 
