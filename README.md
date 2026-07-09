@@ -75,11 +75,42 @@ NX=8 NY=8 M=200000 N_TRAJ=8000 \
   `BIND_FLAGS="--map-by numa:PE=$CPT --bind-to core"`；container 內
   `BIND_FLAGS="--bind-to none"`。
 
-四個 production 腳本：
+四個 production 腳本（輸出資料夾/檔名都帶引擎標籤）：
 
-| 腳本 | 內容 |
-| --- | --- |
-| `run_kagome_otf.sh` | 單 replica QAQMC diagonal-profile（`src.mpi.qaqmc_mpi --mode profile`） |
-| `run_kagome_sse.sh` | 有限溫度 SSE 熱平衡對照（`src.mpi.sse_mpi`） |
-| `run_kagome_renyi_work.sh` | Renyi-2 非平衡功引擎，KP 區域 ΔS₂ / γ（`src.mpi.qaqmc_renyi_work_mpi`） |
-| `run_kagome_string_work.sh` | off-diagonal string-work Jarzynski 估計（`src.mpi.qaqmc_string_work_mpi`） |
+| 腳本 | 內容 | 輸出 |
+| --- | --- | --- |
+| `run_kagome_otf.sh` | 單 replica QAQMC diagonal-profile（`src.mpi.qaqmc_mpi --mode profile`） | `data/qaqmc_profile_M=..._<stamp>/` |
+| `run_kagome_sse.sh` | 有限溫度 SSE 熱平衡對照（`src.mpi.sse_mpi`） | `data/sse_.../` |
+| `run_kagome_renyi_work.sh` | Renyi-2 非平衡功引擎，KP 區域 ΔS₂ / γ（`src.mpi.qaqmc_renyi_work_mpi`） | `data/renyi_work_....h5` (+`_chunks/`) |
+| `run_kagome_string_work.sh` | off-diagonal string-work Jarzynski 估計（`src.mpi.qaqmc_string_work_mpi`） | `data/string_work_....h5` (+`_chunks/`) |
+
+## 畫圖
+
+所有繪圖腳本從 repo 根目錄執行，圖預設存到 **`figures/<資料目錄同名>/<圖名>.png`**
+（可用 `--out` 覆寫）。各腳本都有 `--help` 列出完整參數。
+
+**Diagonal profile**（吃 `data/qaqmc_profile_M=*` chunked run dir；不給 `--run_dir` 自動用最新的）：
+
+```bash
+python plots/plot_diagonal/plot_profile_panels.py --run_dir data/qaqmc_profile_M=...   # density/A_v/Z_l/C_m 四合一
+python plots/plot_diagonal/plot_vbs_ss.py         --run_dir ...                        # Ψ_VBS / Ψ_SS vs δ（上下坡）
+python plots/plot_diagonal/plot_bffm.py           --run_dir ...                        # BFFM: C_m(l−1)/√|Z(l)|
+python plots/plot_diagonal/plot_occ_sf_bz.py      --run_dir ...  # S_αβ(q) BZ heatmap；--mode connected|unconnected --stat max_eig|trace
+python plots/plot_diagonal/plot_snapshots.py      --run_dir ...  # 實空間激發圖案（各 δ 點）
+```
+
+**SSE**（吃 `data/sse_*` run dir；單參數點）：
+
+```bash
+python plots/plot_sse/plot_observables.py --run_dir data/sse_...   # Z_l/A_v、C_m、序參量總覽（標題=E）
+python plots/plot_sse/plot_occ_sf_bz.py   --run_dir ...            # S_αβ(q) BZ heatmap
+python plots/plot_sse/plot_snapshots.py   --run_dir ...            # 激發圖案網格
+```
+
+**Work engines 誤差診斷**（blocking analysis：橫軸 bin size、縱軸 error、標題=估計值；
+`--data` 給 chunk 目錄（`*_chunks/`，per-rank 時序完整，優先）或 aggregate `.h5`）：
+
+```bash
+python plots/plot_renyi_work/plot_error_vs_binsize.py   --data data/renyi_work_..._chunks    # ΔS₂（jackknife）
+python plots/plot_off_diagonal/plot_error_vs_binsize.py --data data/string_work_..._chunks   # O_C（SEM+jackknife 對照）
+```

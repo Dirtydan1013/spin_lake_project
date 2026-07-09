@@ -111,7 +111,7 @@ fi
 A_END=${A_END:-""}
 A_START=${A_START:-""}
 
-OUT_NAME=${OUT_NAME:-"work_kpkag_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${JOB_TAG}.h5"}
+OUT_NAME=${OUT_NAME:-"renyi_work_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${JOB_TAG}.h5"}
 FILEPATH="data/${OUT_NAME}"
 
 echo "Geometry: $LATTICE nx=$NX, ny=$NY, a=$A_LAT"

@@ -96,7 +96,7 @@ PY
     echo "Auto-selected central size-${STRING_SIZE} string: sites ${STRING_SITES}"
 fi
 
-OUT_NAME=${OUT_NAME:-"strwork_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${JOB_TAG}.h5"}
+OUT_NAME=${OUT_NAME:-"string_work_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${JOB_TAG}.h5"}
 FILEPATH="data/${OUT_NAME}"
 
 echo "Off-diagonal string-work production run"
