@@ -3,8 +3,8 @@
 #SBATCH --partition=cpu
 #SBATCH --nodelist=cpunode02
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=32
-#SBATCH --cpus-per-task=4
+#SBATCH --ntasks-per-node=64
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=240gb
 #SBATCH --output=logs/sse_6x6_%j.out
 #SBATCH --error=logs/sse_6x6_%j.err
@@ -32,23 +32,23 @@ source main_scripts/common/env.sh
 mkdir -p logs data
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
-LATTICE=${LATTICE:-kagome_bond_triangle}
+LATTICE=${LATTICE:-kagome_bond}
 # Spatial lattice boundary: open (finite patch) or periodic (torus).  periodic
 # is only valid for kagome_bond (the driver errors on the cropped triangle).
-BOUNDARY=${BOUNDARY:-open}
-NX=${NX:-6}
-NY=${NY:-6}
+BOUNDARY=${BOUNDARY:-periodic}
+NX=${NX:-8}
+NY=${NY:-8}
 A_LAT=${A_LAT:-4.0}
 OMEGA=${OMEGA:-1.0}
-DELTA=${DELTA:-3.0}
+DELTA=${DELTA:-5.5}
 RB=${RB:-2.4}
-BETA=${BETA:-16.0}
+BETA=${BETA:-40}
 EPSILON=${EPSILON:-0.01}
 NEIGHBOR_CUTOFF=${NEIGHBOR_CUTOFF:--1}
-N_EQUIL=${N_EQUIL:-20000}
+N_EQUIL=${N_EQUIL:-4000}
 # Print rank-0 equilibration progress every this many steps (<= 0 disables).
 EQUIL_PRINT_EVERY=${EQUIL_PRINT_EVERY:-500}
-N_SAMPLES=${N_SAMPLES:-2000000}
+N_SAMPLES=${N_SAMPLES:-100000}
 # checkpoint = samples per bin == chunk flush size (merged).  Pick so one
 # chunk ~= a few minutes of wall time.
 CHECKPOINT=${CHECKPOINT:-250}
@@ -56,7 +56,10 @@ CHECKPOINT=${CHECKPOINT:-250}
 # automatically on kagome lattices when the deployed qaqmc_cpp supports them).
 # occ-SF matrix q-grid side (0 = off) and full-state snapshots per rank/chunk.
 OCC_SF_GRID_N=${OCC_SF_GRID_N:-12}
-N_SNAPSHOTS=${N_SNAPSHOTS:-1}
+N_SNAPSHOTS=${N_SNAPSHOTS:-4}
+# PERMUTE_SITES=1: per-rank random site-label permutation (breaks the shared
+# update-scan-order domain selection; see scripts/experiments/).
+PERMUTE_SITES=${PERMUTE_SITES:-""}
 SEED=${SEED:-42}
 RUN_DIR=${RUN_DIR:-"data/sse_${NX}x${NY}_${LATTICE}_beta${BETA}_delta${DELTA}"}
 # Warm start: point CONFIG_IN at a previous run's RUN_DIR (rank{r}.h5 with a
@@ -88,6 +91,7 @@ $MPIEXEC \
     --checkpoint "$CHECKPOINT" \
     --occ-sf-grid-n "$OCC_SF_GRID_N" \
     --n-snapshots "$N_SNAPSHOTS" \
+    ${PERMUTE_SITES:+--permute-site-labels} \
     --run-dir "$RUN_DIR" \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"}
     # NOTES:

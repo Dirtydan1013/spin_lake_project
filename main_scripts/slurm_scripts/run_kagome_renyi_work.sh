@@ -79,6 +79,9 @@ CKPT_TRAJ=${CKPT_TRAJ:-250}
 # ([region/]rank{r}.h5 in KP-regions mode) — thermalization is skipped.
 CONFIG_IN=${CONFIG_IN:-""}
 CONFIG_OUT=${CONFIG_OUT:-""}
+# PERMUTE_SITES=1: per-rank random site-label permutation (breaks the shared
+# update-scan-order domain selection; see scripts/experiments/).
+PERMUTE_SITES=${PERMUTE_SITES:-""}
 
 # KP region selection.  Three modes (in priority order):
 #
@@ -164,6 +167,7 @@ $MPIEXEC python -u -m src.mpi.qaqmc_renyi_work_mpi \
     --checkpoint-every-trajectories "$CKPT_TRAJ" \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"} \
     ${CONFIG_OUT:+--config-out "$CONFIG_OUT"} \
+    ${PERMUTE_SITES:+--permute-site-labels} \
     --filepath "$FILEPATH"
 
 echo
