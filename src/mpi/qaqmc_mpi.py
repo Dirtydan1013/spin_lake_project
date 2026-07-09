@@ -263,6 +263,28 @@ def _build_occ_q_grid(grid_n, a):
     return np.array(qs, dtype=np.float64), np.array(frac, dtype=np.float64)
 
 
+def _snap_delta_points(prof_delta, requested, sweep='forward'):
+    """Profile-point indices nearest each requested δ, restricted to one ramp.
+
+    The δ profile goes up then down, so a requested value exists on BOTH
+    ramps; an unrestricted argmin can land on either branch depending on
+    sub-grid float offsets (a ~1e-6 coin flip).  Restricting the search to the
+    chosen ramp ('forward' = δ-increasing, default) makes the selection
+    deterministic; pass sweep='backward' to deliberately sample the down-ramp
+    (e.g. for hysteresis comparisons).
+    """
+    prof_delta = np.asarray(prof_delta, dtype=np.float64)
+    turn = np.where(np.diff(prof_delta) < 0)[0]
+    n_fwd = int(turn[0]) + 1 if len(turn) else len(prof_delta)
+    if sweep == 'backward' and n_fwd < len(prof_delta):
+        offset, seg = n_fwd, prof_delta[n_fwd:]
+    else:
+        offset, seg = 0, prof_delta[:n_fwd]
+    req = np.asarray(requested, dtype=np.float64)
+    return np.unique(np.array(
+        [offset + int(np.argmin(np.abs(seg - d))) for d in req], dtype=np.int32))
+
+
 def _build_sf_q_points(sf_q_points_file=None, sf_q_path=None, sf_q_n=20, a=1.0):
     """Return q-points array of shape (n_q, 2), or None if SF not requested.
 
@@ -856,8 +878,9 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     loop_sizes=None, string_sizes=None,
                     delta_groups=600, omp_threads=0, nx=6, ny=6,
                     sf_q_points=None, sf_delta_points=None,
-                    snapshot_deltas=None, n_snapshots=0,
+                    snapshot_deltas=None, n_snapshots=0, snapshot_sweep='forward',
                     occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
+                    occ_sf_sweep='forward',
                     lattice='kagome_bond', boundary='open', box_vectors=None,
                     config_in=None, config_out=None,
                     equil_progress_every=500,
@@ -1011,12 +1034,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                             dtype=np.int64)
     prof_delta   = delta_sched_full[prof_p_idx]   # δ at each profile point
 
-    # Optional: full-state snapshots at chosen δ values (snapped to profile grid).
+    # Optional: full-state snapshots at chosen δ values (snapped to the chosen
+    # ramp of the profile grid; forward by default).
     snap_pt_indices = np.array([], dtype=np.int32)
     if snapshot_deltas is not None and len(snapshot_deltas) > 0 and n_snapshots > 0:
-        req = np.asarray(snapshot_deltas, dtype=np.float64)
-        snap_pt_indices = np.unique(np.array(
-            [int(np.argmin(np.abs(prof_delta - d))) for d in req], dtype=np.int32))
+        snap_pt_indices = _snap_delta_points(prof_delta, snapshot_deltas,
+                                             sweep=snapshot_sweep)
         engine._cpp_engine.set_snapshot_point_indices(snap_pt_indices)
     n_snap_pts = len(snap_pt_indices)
 
@@ -1037,9 +1060,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             occ_cell_R, occ_basis, occ_in_bulk = _build_occ_sf_geometry(
                 nx, ny, 1.0, boundary=boundary)
         occ_q_points, occ_q_frac = _build_occ_q_grid(int(occ_sf_grid_n), 1.0)
-        req = np.asarray(occ_sf_delta_points, dtype=np.float64)
-        occ_pt_indices = np.unique(np.array(
-            [int(np.argmin(np.abs(prof_delta - d))) for d in req], dtype=np.int32))
+        occ_pt_indices = _snap_delta_points(prof_delta, occ_sf_delta_points,
+                                            sweep=occ_sf_sweep)
         engine._cpp_engine.set_occ_sf_site_map(occ_cell_R, occ_basis, occ_in_bulk, 6)
         engine._cpp_engine.set_occ_sf_q_points(occ_q_points)
         engine._cpp_engine.set_occ_sf_point_indices(occ_pt_indices)
@@ -1131,7 +1153,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         if rank == 0:
             base_dir = os.path.dirname(filepath) or '.'
             stamp = time.strftime('%Y%m%d_%H%M%S')
-            run_dir = os.path.join(base_dir, f'M={M}_{nx}x{ny}_{stamp}')
+            run_dir = os.path.join(base_dir, f'qaqmc_profile_M={M}_{nx}x{ny}_{stamp}')
             os.makedirs(run_dir, exist_ok=True)
         else:
             run_dir = None
@@ -1182,7 +1204,10 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             }
             if pos is not None:
                 meta['pos'] = np.asarray(pos, dtype=np.float64)
+            if n_snap_pts > 0:
+                meta['snap_pt_indices'] = np.asarray(snap_pt_indices, dtype=np.int32)
             if do_occ:
+                meta['occ_pt_indices'] = np.asarray(occ_pt_indices, dtype=np.int32)
                 meta['occ_basis'] = np.asarray(occ_basis, dtype=np.int32)
                 meta['occ_cell_R'] = np.asarray(occ_cell_R, dtype=np.float64)
                 if occ_q_points is not None:
@@ -1734,6 +1759,10 @@ def main():
                         help='(profile mode) Number of full-state configs to save PER RANK at '
                              'each --snapshot_deltas point. Total = n_snapshots × n_ranks. '
                              'Default 0 (disabled).')
+    parser.add_argument('--snapshot_sweep', type=str, default='forward',
+                        choices=['forward', 'backward'],
+                        help='(profile mode) which δ ramp --snapshot_deltas snap to '
+                             '(default forward = up-ramp).')
     parser.add_argument('--occ_sf_delta_points', type=float, nargs='+', default=None,
                         help='(profile mode) δ values at which to measure the sublattice-resolved '
                              'occupation structure-factor matrix S_αβ(q). Snapped to profile grid.')
@@ -1743,6 +1772,10 @@ def main():
     parser.add_argument('--occ_sf_nbatch', type=int, default=4,
                         help='(profile mode) Coarse super-bins PER RANK for the occ-SF matrix '
                              '(controls storage; total = nbatch × n_ranks). Default 4.')
+    parser.add_argument('--occ_sf_sweep', type=str, default='forward',
+                        choices=['forward', 'backward'],
+                        help='(profile mode) which δ ramp --occ_sf_delta_points snap to '
+                             '(default forward = up-ramp).')
     parser.add_argument('--boundary', type=str, default='open',
                         choices=['open', 'periodic'],
                         help='Spatial lattice boundary: open (finite cropped patch) or '
@@ -1822,8 +1855,10 @@ def main():
             sf_delta_points=config.get('sf_delta_points'),
             snapshot_deltas=config.get('snapshot_deltas'),
             n_snapshots=config.get('n_snapshots', 0),
+            snapshot_sweep=config.get('snapshot_sweep', 'forward'),
             occ_sf_delta_points=config.get('occ_sf_delta_points'),
             occ_sf_grid_n=config.get('occ_sf_grid_n', 0),
+            occ_sf_sweep=config.get('occ_sf_sweep', 'forward'),
             occ_sf_nbatch=config.get('occ_sf_nbatch', 4),
             lattice=config.get('lattice', 'kagome_bond'),
             boundary=boundary, box_vectors=box_vectors,
