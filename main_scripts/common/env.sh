@@ -35,8 +35,13 @@ fi
 CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3}
 CONDA_ENV=${CONDA_ENV:-qaqmc}
 if [ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
+    # conda-forge activate.d scripts (binutils/gcc from cxx-compiler) read
+    # possibly-unset vars ($ADDR2LINE, ...) and die under `set -u`
+    case $- in *u*) _QAQMC_HAD_U=1;; *) _QAQMC_HAD_U=0;; esac
+    set +u
     source "$CONDA_ROOT/etc/profile.d/conda.sh"
     conda activate "$CONDA_ENV"
+    [ "$_QAQMC_HAD_U" = 1 ] && set -u
     export PATH="$CONDA_PREFIX/bin:$PATH"
 elif [ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]; then
     echo "[env.sh] WARNING: $CONDA_ROOT not found and conda env '$CONDA_ENV' not" \
