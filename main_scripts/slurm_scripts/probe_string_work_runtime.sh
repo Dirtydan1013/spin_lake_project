@@ -17,20 +17,12 @@
 
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qaqmc
+# Shared env: conda, PMIx workarounds, OMP threads, NTASKS/CPT/JOB_TAG/MPIEXEC.
+# Works under sbatch AND as plain `bash <script>` on a server without SLURM.
+# Run from the repo root.
+source main_scripts/common/env.sh
 
 mkdir -p logs
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-
-unset PMI_SIZE PMI_RANK PMI_FD PMI_PORT
-unset PMIX_RANK PMIX_SERVER_URI2 PMIX_SECURITY_MODE
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
 
 # ─── Production target being estimated (mirror run_kagome_string_work.sh) ───
 LATTICE=${LATTICE:-kagome_bond_triangle}
@@ -55,7 +47,7 @@ DECORR=${DECORR:-100}
 PROBE_TRAJ_PER_RANK=${PROBE_TRAJ_PER_RANK:-2}
 PROBE_THERMALIZE=${PROBE_THERMALIZE:-50}
 
-PROBE_TRAJ=$(( PROBE_TRAJ_PER_RANK * SLURM_NTASKS ))
+PROBE_TRAJ=$(( PROBE_TRAJ_PER_RANK * NTASKS ))
 
 STRING_SITES=$(python - <<PY
 import numpy as np
@@ -79,15 +71,15 @@ PY
 )
 
 echo "=== Probing string-work runtime ==="
-echo "Node: $SLURM_NODELIST, ranks=$SLURM_NTASKS"
+echo "Node: $NODE_DESC, ranks=$NTASKS"
 echo "Geometry: $LATTICE ${NX}x${NY}, M=$M, K=$K ($SCHEDULE), string sites: $STRING_SITES"
 echo "Probe: $PROBE_TRAJ trajectories total ($PROBE_TRAJ_PER_RANK/rank), thermalize=$PROBE_THERMALIZE"
 echo "Estimating production: n_traj=$TARGET_N_TRAJ, thermalize=$TARGET_THERMALIZE"
 echo
 
 T0=$(date +%s.%N)
-mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS \
-    python -u -m src.mpi.qaqmc_string_work_mpi \
+# $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
+$MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --a "$A_LAT" \
     --M "$M" \
@@ -108,7 +100,7 @@ T1=$(date +%s.%N)
 python - <<PY
 probe_elapsed = $T1 - $T0
 probe_traj_per_rank = $PROBE_TRAJ_PER_RANK
-target_per_rank = ($TARGET_N_TRAJ + $SLURM_NTASKS - 1) // $SLURM_NTASKS
+target_per_rank = ($TARGET_N_TRAJ + $NTASKS - 1) // $NTASKS
 # Rough split: engine init + thermalize is a fixed overhead; per-trajectory
 # cost scales linearly.  The K-line "elapsed=" in the log gives the pure
 # sampling time; here we scale the whole probe conservatively.

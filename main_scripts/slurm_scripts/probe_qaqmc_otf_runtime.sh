@@ -16,20 +16,12 @@
 
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qaqmc
+# Shared env: conda, PMIx workarounds, OMP threads, NTASKS/CPT/JOB_TAG/MPIEXEC.
+# Works under sbatch AND as plain `bash <script>` on a server without SLURM.
+# Run from the repo root.
+source main_scripts/common/env.sh
 
 mkdir -p logs
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-
-unset PMI_SIZE PMI_RANK PMI_FD PMI_PORT
-unset PMIX_RANK PMIX_SERVER_URI2 PMIX_SECURITY_MODE
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
 
 LATTICE=${LATTICE:-kagome_bond_triangle}
 BOUNDARY=${BOUNDARY:-periodic}
@@ -40,12 +32,12 @@ TARGET_SAMPLES=${TARGET_SAMPLES:-100000}
 
 echo "Probing QAQMC ${NX}x${NY} ${LATTICE} profile runtime (M=${M})"
 
-mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS \
-    python -u "scripts/python script/probe_runtime_qaqmc_otf.py" \
+# $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
+$MPIEXEC python -u main_scripts/python_scripts/probe_runtime_qaqmc_otf.py \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --M "$M" --delta-groups 600 \
     --delta-min -2.0 --delta-max 6.0 \
     --Rb 2.4 --neighbor-cutoff -1 \
     --probe-equil 24 --probe-samples 24 \
     --target-equil 4000 --target-samples "$TARGET_SAMPLES" \
-    --omp-threads "$SLURM_CPUS_PER_TASK"
+    --omp-threads "$CPT"

@@ -19,20 +19,12 @@
 
 set -euo pipefail
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qaqmc
+# Shared env: conda, PMIx workarounds, OMP threads, NTASKS/CPT/JOB_TAG/MPIEXEC.
+# Works under sbatch AND as plain `bash <script>` on a server without SLURM.
+# Run from the repo root.
+source main_scripts/common/env.sh
 
 mkdir -p logs
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-
-unset PMI_SIZE PMI_RANK PMI_FD PMI_PORT
-unset PMIX_RANK PMIX_SERVER_URI2 PMIX_SECURITY_MODE
-
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
 
 # ── Probe target: which production run are we estimating ─────────────────────
 LATTICE=${LATTICE:-kagome_bond_triangle}
@@ -43,7 +35,7 @@ M=${M:-2257000}
 OMEGA=${OMEGA:-1.0}
 RB=${RB:-2.4}
 DELTA_MIN=${DELTA_MIN:--2.0}
-DELTA_MAX=${DELTA_MAX:-6.0}
+DELTA_MAX=${DELTA_MAX:-4.5}
 EPSILON=${EPSILON:-0.01}
 NEIGHBOR_CUTOFF=${NEIGHBOR_CUTOFF:--1}
 DELTA_GROUPS=${DELTA_GROUPS:-600}
@@ -59,9 +51,9 @@ fi
 
 # Production parameters being estimated
 TARGET_K=${TARGET_K:-200}
-TARGET_N_TRAJ=${TARGET_N_TRAJ:-4000}
-TARGET_N_THERMALIZE=${TARGET_N_THERMALIZE:-5000}
-TARGET_DECORR=${TARGET_DECORR:-1000}
+TARGET_N_TRAJ=${TARGET_N_TRAJ:-4800}
+TARGET_N_THERMALIZE=${TARGET_N_THERMALIZE:-4000}
+TARGET_DECORR=${TARGET_DECORR:-200}
 TARGET_N_REGIONS=${TARGET_N_REGIONS:-1}     # 7 for KP-all, 1 for single region/pair
 
 # Probe scale (small; just enough to time primitives)
@@ -73,14 +65,14 @@ PROBE_K=${PROBE_K:-20}
 PROBE_DECORR=${PROBE_DECORR:-20}
 
 echo "=== Probing QAQMC Renyi work-engine runtime ==="
-echo "Node: $SLURM_NODELIST, ranks=$SLURM_NTASKS, omp_threads/rank=$OMP_NUM_THREADS"
+echo "Node: $NODE_DESC, ranks=$NTASKS, omp_threads/rank=$CPT"
 echo "Geometry: $LATTICE ${NX}x${NY} (m=${KP_M}), probe pair: ${PROBE_KP_START} → ${PROBE_KP_END}"
 echo "Estimating: K=${TARGET_K}, n_traj=${TARGET_N_TRAJ}, thermalize=${TARGET_N_THERMALIZE},"
 echo "            decorr=${TARGET_DECORR}, n_regions=${TARGET_N_REGIONS}"
 echo
 
-mpiexec --map-by slot:PE=$SLURM_CPUS_PER_TASK --bind-to core -n $SLURM_NTASKS \
-    python -u "scripts/python script/probe_runtime_renyi_work.py" \
+# $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
+$MPIEXEC python -u main_scripts/python_scripts/probe_runtime_renyi_work.py \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --a "$A_LAT" \
     --M "$M" \
