@@ -582,7 +582,8 @@ def main():
     parser = argparse.ArgumentParser(description="MPI driver for QAQMC Renyi work engine")
     # Lattice / Hamiltonian
     parser.add_argument("--lattice", type=str, default="1d_chain",
-                        choices=["1d_chain", "kagome_bond", "kagome_bond_triangle"])
+                        choices=["1d_chain", "kagome_bond", "kagome_bond_triangle",
+                                 "kagome"])
     parser.add_argument("--N", type=int, default=0,
                         help="(1d_chain) site count. Ignored for kagome_bond (computed from nx,ny).")
     parser.add_argument("--nx", type=int, default=6, help="(kagome_bond) cells in x")
@@ -681,6 +682,13 @@ def main():
     elif args.lattice == "kagome_bond_triangle":
         pos = generate_kagome_bond_triangle_lattice(args.nx, args.ny, args.a)
         N = len(pos)
+    elif args.lattice == "kagome":
+        # Vertex kagome (U(1) QDM, paper/u1); nn distance = a/2 → use --a 2.0
+        # for nn-distance units (paper's Rb/a_nn = 1.32 → --Rb 1.32).
+        from src.rydberg.lattices import generate_kagome_lattice
+        pos = generate_kagome_lattice(args.nx, args.ny, args.a,
+                                      boundary=args.boundary)
+        N = len(pos)
     else:
         raise ValueError(f"unsupported lattice {args.lattice}")
 
@@ -703,8 +711,11 @@ def main():
 
     if kp_set_mode or kp_pair_mode:
         # ── KP mode: use src.kp.kp_geometry to build masks ───────────────────
-        if args.lattice == "1d_chain":
-            raise ValueError("--kp-regions / --kp-start/end require a kagome lattice")
+        if args.lattice not in ("kagome_bond", "kagome_bond_triangle"):
+            raise ValueError(
+                "--kp-regions / --kp-start/end require a kagome BOND lattice "
+                "(kp_geometry masks are not defined for the vertex 'kagome' "
+                "lattice yet)")
         from src.kp.kp_geometry import (
             KP_REGION_NAMES,
             build_kp_region_masks_for_lattice,

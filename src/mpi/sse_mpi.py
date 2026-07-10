@@ -46,8 +46,13 @@ from src.mpi.site_permutation import (permute_rows, resolve_site_permutation,
                                       to_engine, unpermute_last_axis)
 
 
-def _make_pos(lattice, N, nx, ny, a):
-    """Build atom positions for the requested lattice; returns (pos, N)."""
+def _make_pos(lattice, N, nx, ny, a, boundary="open"):
+    """Build atom positions for the requested lattice; returns (pos, N).
+
+    ``boundary`` only matters for the vertex ``kagome`` lattice, whose open
+    patch keeps extra boundary vertices (N > 3*nx*ny) while the periodic
+    generator returns exactly the 3-site basis (N == 3*nx*ny).
+    """
     if lattice == "1d_chain":
         from src.rydberg.lattices import generate_1d_chain
         if N <= 0:
@@ -62,6 +67,14 @@ def _make_pos(lattice, N, nx, ny, a):
         from src.rydberg.lattices import generate_kagome_bond_triangle_lattice
         pos = np.ascontiguousarray(
             generate_kagome_bond_triangle_lattice(nx, ny, a), dtype=np.float64)
+        return pos, len(pos)
+    if lattice == "kagome":
+        # Atoms on kagome VERTICES (U(1) QDM, paper/u1).  nn distance = a/2:
+        # pass a=2.0 to work in nn-distance units (paper's Rb/a_nn=1.32 → Rb=1.32).
+        from src.rydberg.lattices import generate_kagome_lattice
+        pos = np.ascontiguousarray(
+            generate_kagome_lattice(nx, ny, a, boundary=boundary),
+            dtype=np.float64)
         return pos, len(pos)
     raise ValueError(f"unsupported lattice {lattice!r}")
 
@@ -178,7 +191,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
 
-    pos, N = _make_pos(lattice, N, nx, ny, a)
+    pos, N = _make_pos(lattice, N, nx, ny, a, boundary=boundary)
 
     box_vectors = None
     if boundary == "periodic":
@@ -390,7 +403,8 @@ def main():
     parser = argparse.ArgumentParser(description="MPI-parallel SSE simulation")
     parser.add_argument("--config", type=str, help="JSON config file")
     parser.add_argument("--lattice", type=str, default="kagome_bond_triangle",
-                        choices=["1d_chain", "kagome_bond", "kagome_bond_triangle"])
+                        choices=["1d_chain", "kagome_bond", "kagome_bond_triangle",
+                                 "kagome"])
     parser.add_argument("--N", type=int, default=0, help="(1d_chain) site count")
     parser.add_argument("--nx", type=int, default=6)
     parser.add_argument("--ny", type=int, default=6)

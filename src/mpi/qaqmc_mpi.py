@@ -198,7 +198,7 @@ def _build_occ2_sf_geometry_tri(nx, ny, a, ijk_map):
 
 
 def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None,
-                         boundary='open'):
+                         boundary='open', N=None):
     """bulk sites, loop/string translation sets (+meta), and A_v vertex sets
     for either kagome bond lattice.  Returns (bulk, loop_sets, string_sets,
     loop_meta, string_meta, vertex_sets, ijk_map) — ijk_map is None for
@@ -206,7 +206,18 @@ def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None,
 
     With boundary='periodic' (kagome_bond only) there is no edge, so the bulk
     restriction is dropped and density/SF use ALL sites — same as the triangle
-    lattice's every-atom convention."""
+    lattice's every-atom convention.
+
+    The vertex 'kagome' lattice (U(1) QDM, paper/u1) has no bond-lattice
+    observable geometry: it returns empty loop/string/vertex sets and
+    bulk = ALL sites (pass N; regenerated from nx/ny/boundary when omitted).
+    Its dimer observables (medial-honeycomb loops/strings) come from the
+    dedicated U(1) geometry module, not from these kagome_bond builders."""
+    if lattice == 'kagome':
+        if N is None:
+            from src.rydberg.lattices import generate_kagome_lattice
+            N = len(generate_kagome_lattice(nx, ny, 1.0, boundary=boundary))
+        return list(range(int(N))), [], [], [], [], [], None
     if lattice == 'kagome_bond_triangle':
         from src.rydberg.lattices import (
             kagome_triangle_bulk_sites,
@@ -1034,7 +1045,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     (bulk, loop_sets, string_sets, loop_meta, string_meta,
      vertex_sets, tri_ijk_map) = _lattice_observables(
         lattice, nx, ny, loop_sizes=loop_sizes, string_sizes=string_sizes,
-        boundary=boundary)
+        boundary=boundary, N=N)
     engine._cpp_engine.set_bulk_sites([int(s) for s in _to_engine(bulk)])
 
     # A_v vertex operator: append to loop_sets, track offset
@@ -1047,8 +1058,11 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         [[int(s) for s in _to_engine(st)] for st in string_sets])
 
     # VBS/SS order parameters (paper Eq. 5-6): measured at every profile point,
-    # batched like Z_l.  Always on for kagome lattices large enough.
-    if lattice == 'kagome_bond_triangle':
+    # batched like Z_l.  Always on for kagome BOND lattices large enough; the
+    # vertex 'kagome' lattice has no bond-lattice VBS geometry.
+    if lattice == 'kagome':
+        vbs_tri = None
+    elif lattice == 'kagome_bond_triangle':
         vbs_tri = _build_vbs_triangles_tri(nx, ny, tri_ijk_map)
     else:
         vbs_tri = _build_vbs_triangles(nx, ny)
@@ -1091,6 +1105,12 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
     occ2_cell_R = occ2_basis = None
     do_occ = (occ_sf_delta_points is not None and len(occ_sf_delta_points) > 0
               and occ_sf_grid_n > 0 and occ_sf_nbatch > 0)
+    if do_occ and lattice == 'kagome':
+        # The occ-SF cell decomposition is written in kagome_bond 6-atom void
+        # coordinates; the vertex lattice needs its own 3-site-basis geometry
+        # (U(1) module, not yet wired).  Fail loudly rather than mis-index.
+        raise ValueError("--occ-sf-delta-points is not supported yet for "
+                         "lattice='kagome' (vertex lattice)")
     if do_occ:
         # q·R phases are dimensionless (the lattice constant cancels between the
         # reciprocal vectors and the cell positions), so use a=1.0 internally.
@@ -1743,7 +1763,9 @@ def main():
     parser.add_argument('--omp_threads', type=int, default=1)
     parser.add_argument('--filepath', type=str, default='data/qaqmc_mpi.h5')
     parser.add_argument('--lattice', type=str, default='kagome_bond',
-                        help='Lattice type: kagome_bond | kagome_bond_triangle')
+                        help='Lattice type: kagome_bond | kagome_bond_triangle | '
+                             'kagome (vertex lattice, U(1) QDM; nn distance = a/2 '
+                             'so use --a 2.0 for nn units)')
     parser.add_argument('--config_in', type=str, default=None,
                         help='(profile mode) warm-start directory of rank{r}.h5 final '
                              'configurations from a previous run; when given, '
@@ -1871,6 +1893,17 @@ def main():
             nx=config.get('nx', 1),
             ny=config.get('ny', 1),
             a=config.get('a', 4.0)
+        )
+        config['N'] = len(pos)
+    elif config.get('lattice') == 'kagome':
+        # Vertex kagome (U(1) QDM, paper/u1).  nn distance = a/2: pass a=2.0
+        # to work in nn-distance units (paper's Rb/a_nn = 1.32 → Rb = 1.32).
+        from src.rydberg.lattices import generate_kagome_lattice
+        pos = generate_kagome_lattice(
+            nx=config.get('nx', 1),
+            ny=config.get('ny', 1),
+            a=config.get('a', 2.0),
+            boundary=config.get('boundary', 'open')
         )
         config['N'] = len(pos)
 

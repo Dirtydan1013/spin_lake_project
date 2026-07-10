@@ -76,6 +76,9 @@ def lattice_box_vectors(lattice: str, nx: int, ny: int, a: float = 1.0,
     - ``1d_chain``:      one vector ``[N*a]`` (a ring of circumference N*a).
     - ``kagome_bond``:   ``(nx*v1, ny*v2)`` on the triangular Bravais lattice
       (v1=(a,0), v2=(a/2, a√3/2)) — a proper torus of the nx×ny void tiling.
+    - ``kagome``:        same ``(nx*v1, ny*v2)`` torus (the vertex lattice
+      shares the Bravais tiling); pair with
+      ``generate_kagome_lattice(..., boundary='periodic')`` so N == 3*nx*ny.
     - ``kagome_bond_triangle``:  raises — the cropped protruding-boundary patch
       is inherently open (no commensurate torus), so periodic BC is undefined.
     """
@@ -83,7 +86,7 @@ def lattice_box_vectors(lattice: str, nx: int, ny: int, a: float = 1.0,
         if N is None or N <= 0:
             raise ValueError("periodic 1d_chain needs N > 0")
         return np.ascontiguousarray([[N * a]], dtype=np.float64)
-    if lattice == "kagome_bond":
+    if lattice in ("kagome_bond", "kagome"):
         v1 = np.array([a, 0.0])
         v2 = np.array([a / 2.0, a * np.sqrt(3) / 2.0])
         return np.ascontiguousarray([nx * v1, ny * v2], dtype=np.float64)
@@ -269,13 +272,17 @@ def generate_kagome_bond_triangle_lattice(
     return 0.5 * (vertices[edges[:, 0]] + vertices[edges[:, 1]])
 
 
-def generate_kagome_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
+def generate_kagome_lattice(nx: int, ny: int, a: float = 1.0,
+                            boundary: str = 'open') -> np.ndarray:
     """Generate the original kagome-lattice vertices for the same void tiling.
 
     The existing ``generate_kagome_bond_lattice`` places atoms at the midpoints
     of the edges of the hexagonal voids.  This helper instead returns the
     unique *vertices* of those hexagonal void outlines, i.e. the intersection
-    points of the grey kagome network in the user's sketches.
+    points of the grey kagome network in the user's sketches.  This is the
+    atoms-on-kagome-VERTICES geometry of the U(1) QDM experiments (Geim et
+    al., paper/u1): each vertex atom encodes a dimer on the medial honeycomb
+    lattice.
 
     Geometry:
         - Void centres are tiled on the same triangular Bravais lattice as in
@@ -284,16 +291,40 @@ def generate_kagome_lattice(nx: int, ny: int, a: float = 1.0) -> np.ndarray:
           and angles 0° + 60° * k.
         - With this convention, the bond-lattice sites are the midpoints of
           nearest-neighbour kagome edges on the void perimeter.
-        - Shared vertices between neighbouring voids are deduplicated.
+        - NOTE the units: nearest-neighbour distance is a/2 (NOT a).  To work
+          in nn-distance units (e.g. the paper's Rb/a_nn = 1.32) pass a=2.0.
+
+    Boundary:
+        - 'open': finite patch, shared vertices between neighbouring voids
+          deduplicated; keeps the extra boundary vertices, N > 3*nx*ny.
+        - 'periodic': exactly the 3-site kagome basis per Bravais cell
+          (offsets v1/2, v2/2, (v1+v2)/2), N == 3*nx*ny, commensurate with
+          the (nx*v1, ny*v2) torus of ``lattice_box_vectors``.  Site index
+          convention mirrors kagome_bond: site = (j*nx + i)*3 + k.
 
     Args:
         nx: Number of hexagonal voids along v1.
         ny: Number of hexagonal voids along v2.
         a:  Triangular Bravais lattice constant.
+        boundary: 'open' (default) or 'periodic'.
 
     Returns:
         (N, 2) Cartesian coordinate array of unique kagome vertices.
     """
+    if boundary == 'periodic':
+        v1 = np.array([a, 0.0])
+        v2 = np.array([a / 2.0, a * np.sqrt(3) / 2.0])
+        basis = [v1 / 2.0, v2 / 2.0, (v1 + v2) / 2.0]
+        sites = []
+        for j in range(ny):
+            for i in range(nx):
+                c = i * v1 + j * v2
+                for off in basis:
+                    sites.append(c + off)
+        return np.array(sites, dtype=np.float64)
+    if boundary != 'open':
+        raise ValueError(f"unknown boundary {boundary!r} (use 'open' or 'periodic')")
+
     centers = kagome_hex_centers(nx, ny, a)
     angles = np.radians(np.arange(6) * 60.0)
     offsets = np.column_stack([

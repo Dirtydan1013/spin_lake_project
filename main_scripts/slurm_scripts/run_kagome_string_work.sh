@@ -84,6 +84,10 @@ if [ -z "$STRING_SITES" ]; then
 import numpy as np
 nx, ny, s = $NX, $NY, $STRING_SIZE
 lattice = "$LATTICE"
+if lattice == "kagome":
+    raise SystemExit(
+        "auto string selection is only defined for the kagome BOND lattices; "
+        "for lattice=kagome (vertex, U(1)) pass explicit STRING_SITES")
 if lattice == "kagome_bond_triangle":
     from src.rydberg.lattices import (generate_kagome_bond_triangle_lattice,
                                       kagome_triangle_multi_size_translations)
