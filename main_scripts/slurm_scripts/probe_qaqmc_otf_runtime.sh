@@ -27,7 +27,7 @@ LATTICE=${LATTICE:-kagome_bond_triangle}
 BOUNDARY=${BOUNDARY:-periodic}
 NX=${NX:-6}
 NY=${NY:-6}
-M=${M:-100000000}
+M=${M:-27600000}
 TARGET_SAMPLES=${TARGET_SAMPLES:-100000}
 
 echo "Probing QAQMC ${NX}x${NY} ${LATTICE} profile runtime (M=${M})"

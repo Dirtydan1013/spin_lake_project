@@ -8,6 +8,11 @@
 # Extra args go to sbatch (override the #SBATCH headers).  Without SLURM the
 # script runs via nohup with output in logs/<script>_<stamp>.log; tune
 # resources with NTASKS/CPT env vars (see main_scripts/common/env.sh).
+#
+# EXCLUSIVE=1 requests the whole node (sbatch --exclusive): each rank gets a
+# full physical core.  Default allows co-scheduling — cpunode02 advertises
+# 128 logical CPUs (64 cores × 2 hyperthreads), so two 64-task jobs stack on
+# hyperthread pairs (each ~60-70% speed, but higher combined throughput).
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -19,7 +24,11 @@ shift
 [ -f "$script" ] || { echo "ERROR: no such script: $script" >&2; exit 1; }
 
 if command -v sbatch >/dev/null 2>&1; then
-    sbatch "$@" "$script"
+    if [ "${EXCLUSIVE:-0}" = "1" ]; then
+        sbatch --exclusive "$@" "$script"
+    else
+        sbatch "$@" "$script"
+    fi
 else
     if [ $# -gt 0 ]; then
         echo "ERROR: extra args are sbatch-only, but sbatch is not available: $*" >&2

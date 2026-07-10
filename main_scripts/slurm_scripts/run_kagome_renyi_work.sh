@@ -48,6 +48,9 @@ echo "Started: $(date --iso-8601=seconds)"
 echo
 
 # ─── Defaults — override by editing or copy & change ─────────────────────────
+# EXCLUSIVE=1 (via submit.sh) → sbatch --exclusive: whole node, one full
+# physical core per rank.  Default allows co-scheduling: two 64-task jobs
+# share the node's hyperthreads (~60-70% speed each, higher total throughput).
 LATTICE=${LATTICE:-kagome_bond_triangle}    # cropped (matches KP geometry)
 # Spatial lattice boundary: open (finite patch) or periodic (torus, kagome_bond
 # only).  KP region geometry requires an OPEN cropped patch, so leave this

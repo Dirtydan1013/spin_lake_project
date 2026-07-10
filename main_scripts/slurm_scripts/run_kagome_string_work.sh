@@ -36,6 +36,9 @@ source main_scripts/common/env.sh
 mkdir -p logs data
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
+# EXCLUSIVE=1 (via submit.sh) → sbatch --exclusive: whole node, one full
+# physical core per rank.  Default allows co-scheduling: two 64-task jobs
+# share the node's hyperthreads (~60-70% speed each, higher total throughput).
 LATTICE=${LATTICE:-kagome_bond_triangle}
 # Spatial lattice boundary: open (finite patch) or periodic (torus, kagome_bond
 # only).  The driver errors on the cropped triangle + periodic.
