@@ -89,7 +89,7 @@ def _setup_diag_observables(cpp, lattice, nx, ny, boundary, occ_sf_grid_n,
     so a driver newer than the deployed .so degrades to the legacy behaviour
     instead of crashing a production run.
     """
-    if lattice not in ("kagome_bond", "kagome_bond_triangle"):
+    if lattice not in ("kagome_bond", "kagome_bond_triangle", "kagome"):
         return None
     if not hasattr(cpp, "set_observable_sites"):
         if verbose:
@@ -121,7 +121,9 @@ def _setup_diag_observables(cpp, lattice, nx, ny, boundary, occ_sf_grid_n,
          for st in list(loop_sets) + list(vertex_sets)],
         [[int(s) for s in to_engine(st, inv_perm)] for st in string_sets])
 
-    if lattice == "kagome_bond_triangle":
+    if lattice == "kagome":
+        vbs = None                     # VBS/SS geometry is kagome_bond-only
+    elif lattice == "kagome_bond_triangle":
         vbs = _build_vbs_triangles_tri(nx, ny, ijk_map)
     else:
         vbs = _build_vbs_triangles(nx, ny)
@@ -132,6 +134,9 @@ def _setup_diag_observables(cpp, lattice, nx, ny, boundary, occ_sf_grid_n,
                               par, vsign, ssign, ref00, ref10)
 
     meta_extra = {}
+    if int(occ_sf_grid_n) > 0 and lattice == "kagome":
+        raise ValueError("--occ-sf-grid-n is not supported yet for "
+                         "lattice='kagome' (vertex lattice)")
     if int(occ_sf_grid_n) > 0:
         if lattice == "kagome_bond_triangle":
             cell_R, basis, in_bulk = _build_occ_sf_geometry_tri(

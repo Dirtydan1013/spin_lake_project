@@ -208,16 +208,22 @@ def _lattice_observables(lattice, nx, ny, loop_sizes=None, string_sizes=None,
     restriction is dropped and density/SF use ALL sites — same as the triangle
     lattice's every-atom convention.
 
-    The vertex 'kagome' lattice (U(1) QDM, paper/u1) has no bond-lattice
-    observable geometry: it returns empty loop/string/vertex sets and
-    bulk = ALL sites (pass N; regenerated from nx/ny/boundary when omitted).
-    Its dimer observables (medial-honeycomb loops/strings) come from the
-    dedicated U(1) geometry module, not from these kagome_bond builders."""
+    The vertex 'kagome' lattice (U(1) QDM, paper/u1) uses the medial-honeycomb
+    dimer geometry from src.u1.honeycomb_dimer instead of the bond-lattice
+    builders: loops = the hexagon Z loops (size 6, closed dimer parity / FM
+    denominators), strings = straight dimer-parity strings between plaquette
+    centres grouped by length (C_s numerators; all translations and the three
+    directions share a group).  bulk = ALL sites, no A_v vertex sets (Z2-only).
+    NOTE the engine measures ∏(1-2n) = (-1)^len · ∏σᶻ_paper."""
     if lattice == 'kagome':
-        if N is None:
-            from src.rydberg.lattices import generate_kagome_lattice
-            N = len(generate_kagome_lattice(nx, ny, 1.0, boundary=boundary))
-        return list(range(int(N))), [], [], [], [], [], None
+        from src.u1.honeycomb_dimer import KagomeU1Geometry
+        geo = KagomeU1Geometry(nx, ny, a=1.0, boundary=boundary)
+        loop_sets = geo.hexagon_loop_sets()
+        loop_meta = [dict(size=6, n_copies=len(loop_sets), offset=0)]
+        max_len = max(string_sizes) if string_sizes else None
+        string_sets, string_meta = geo.straight_string_sets(max_len)
+        return (list(range(geo.N)), loop_sets, string_sets,
+                loop_meta, string_meta, [], None)
     if lattice == 'kagome_bond_triangle':
         from src.rydberg.lattices import (
             kagome_triangle_bulk_sites,
