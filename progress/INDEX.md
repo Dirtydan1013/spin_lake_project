@@ -13,4 +13,6 @@
 | [E06](E06_2026-07-10_sse-delta-scan.md) | 07-10 | SSE δ-scan β=20（3.5–5.5）＋8×8 β=40 | 全窗口無序；SL候選窗δ≈4.0–4.5；排他性=shuffle-null | 完成 |
 | [E07](E07_2026-07-10_sse-beta-scan.md) | 07-10 | β-scan（20/40/80 @5.5；20/40 @4.25） | 全平：β≤80下溫度不是限制 | 完成 |
 | [E08](E08_2026-07-10_qaqmc-rerun-permuted.md) | 07-10 | QAQMC sweep重跑（permutation ON） | M3回歸24:15:16、phase-lock消失（std 0.047=平衡值） | 完成 |
-| [E09](E09_2026-07-10_sse-deep-beta.md) | 07-10 | 深βSSE（160/320 @4.25、160 @5.5） | 預測：仍無VBS（W–P尺度Ω⁶/δ⁵→β_c~10⁴） | **進行中** |
+| [E09](E09_2026-07-10_sse-deep-beta.md) | 07-10 | 深βSSE（160/320 @4.25、160 @5.5） | 預測命中：β×16全平無VBS/SS；4.25液體指標反增強→KP TEE可上 | 完成 |
+| [E10](E10_2026-07-11_u1-kagome-first-probe.md) | 07-11 | U(1) kagome 首次探測：SSE δ+β-scan＋QAQMC M-scan | **β_eff≈2–3 飽和不隨β**：基態波函數性質，平衡即近-RK；古典RCSL加權被推翻 | 完成 |
+| [E11](E11_2026-07-11_u1-sse-rcsl-pilot.md) | 07-11 | U(1) SSE RCSL pilot（另一session；12×6 β-scan @δ=3.5） | 與E10a合流待整理 | 暫停 |
