@@ -45,6 +45,7 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
     // ── Compute bond weights ──────────────────────────────────────────────────
     bond_W_.assign(n_bonds_pad * 4, 0.0);
     bond_W_rmax_.assign(n_bonds_pad, 0.0);
+    bond_dlnW_.assign(n_bonds_pad * 4, 0.0);
     energy_shift_ = 0.0;
 
     std::vector<double> weights;
@@ -102,6 +103,32 @@ SSEEngine::SSEEngine(int N, double Omega, double delta, double Rb,
         bond_W_[b * 4 + 2] = W[2];
         bond_W_[b * 4 + 3] = W[3];
         bond_W_rmax_[b] = (bmax > 0.0) ? 1.0 / bmax : 0.0;
+
+        // d(ln W[s])/d(delta) for the chi_F estimator.  raw1/raw2/raw3 are
+        // linear in delta (d(di)/d(delta) = 1/coord_i etc.); cij follows its
+        // active min/argmin branches (kinks are measure-zero in delta).
+        {
+            double ci = (vij_.coord_number[si] > 0)
+                            ? 1.0 / vij_.coord_number[si] : 0.0;
+            double cjv = (vij_.coord_number[sj] > 0)
+                            ? 1.0 / vij_.coord_number[sj] : 0.0;
+            double d1 = cjv, d2 = ci, d3 = ci + cjv;   // d(raw_s)/d(delta)
+            double dmin = 0.0;                          // d(m_min)/d(delta)
+            if (m_min < 0.0) {
+                if      (m_min == raw3) dmin = d3;
+                else if (m_min == raw1) dmin = d1;
+                else if (m_min == raw2) dmin = d2;
+            }
+            auto sgn = [](double x) { return (x > 0.0) - (x < 0.0); };
+            double dnz;                                 // d(m_nz)/d(delta)
+            if      (m_nz == std::abs(raw1)) dnz = sgn(raw1) * d1;
+            else if (m_nz == std::abs(raw2)) dnz = sgn(raw2) * d2;
+            else                             dnz = sgn(raw3) * d3;
+            double dc = (m_min < 0.0 ? -dmin : 0.0) + epsilon * dnz;
+            double dW[4] = {dc, d1 + dc, d2 + dc, d3 + dc};
+            for (int s = 0; s < 4; ++s)
+                bond_dlnW_[b * 4 + s] = (W[s] > 0.0) ? dW[s] / W[s] : 0.0;
+        }
 
         energy_shift_ += W[0];  // W[0] == cij (bond offset constant)
         norm_N_        += bmax;
@@ -240,6 +267,45 @@ double SSEEngine::measure_mz() const {
         mz += phase * (state_[i] - 0.5);
     }
     return mz / N_;
+}
+
+void SSEEngine::measure_chi_f_terms(double& g_left, double& g_right) {
+    // Propagate the tau=0 state through the string; each diagonal bond op
+    // contributes d(ln W[b, spin-state])/d(delta).
+    //
+    // The beta/2 cut must be drawn in IMAGINARY TIME, not at slot M_/2:
+    // adjust_M keeps M_ ~ 1.33 n_ops, so the <=1-op-per-slot exclusion makes
+    // slot positions anti-bunched and the slot cut biased.  Exact mapping:
+    // conditional on the sequence, the n_ops times are sorted iid U[0, beta),
+    // so the count in [0, beta/2) is Binomial(n_ops, 1/2) and it is exactly
+    // the FIRST j operators of the sequence (order statistics).  All
+    // non-identity ops count toward n_ops (Omega ops carry g = 0 but occupy
+    // time slots).
+    if ((int)spin_now_.size() < N_) spin_now_.resize(N_);
+    std::memcpy(spin_now_.data(), state_.data(), N_ * sizeof(int32_t));
+    chi_g_seq_.clear();
+    for (int p = 0; p < M_; ++p) {
+        const int t = op_types_[p];
+        if (t == 0) continue;
+        if (t == -1) {
+            spin_now_[op_sites_[p]] ^= 1;
+            chi_g_seq_.push_back(0.0);
+            continue;
+        }
+        if (t == 1) { chi_g_seq_.push_back(0.0); continue; }
+        const int b  = op_sites_[p];
+        const int si = vij_.bonds_i[b];
+        const int sj = vij_.bonds_j[b];
+        chi_g_seq_.push_back(
+            bond_dlnW_[b * 4 + (spin_now_[si] * 2 + spin_now_[sj])]);
+    }
+    const int n = (int)chi_g_seq_.size();
+    std::binomial_distribution<int> bin(n, 0.5);
+    const int j = (n > 0) ? bin(rng_) : 0;
+    g_left = 0.0;
+    g_right = 0.0;
+    for (int k = 0; k < j; ++k) g_left  += chi_g_seq_[k];
+    for (int k = j; k < n; ++k) g_right += chi_g_seq_[k];
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

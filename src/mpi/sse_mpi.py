@@ -164,7 +164,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             checkpoint=250, run_dir="data/sse_mpi", neighbor_cutoff=None,
             boundary="open", config_in=None, equil_progress_every=500,
             occ_sf_grid_n=0, n_snapshots=0, permute_site_labels=True,
-            verbose=True):
+            chi_f=False, verbose=True):
     """MPI-parallel SSE with per-rank chunked output and warm start.
 
     Each rank runs an independent chain (seed = seed + rank*9973), bins its
@@ -280,6 +280,12 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
     )
 
     run_kwargs = dict(n_snapshots=int(n_snapshots)) if supports_new_run else {}
+    if chi_f:
+        if not hasattr(cpp, "measure_chi_f_terms"):
+            raise RuntimeError("[MPI-SSE] --chi-f needs a .so with the "
+                               "measure_chi_f run() support (rebuild csrc)")
+        run_kwargs["measure_chi_f"] = True
+        run_attrs["chi_f"] = True
 
     with RankChunkWriter(run_dir, rank, run_attrs=run_attrs) as writer:
         for c in range(n_bins):
@@ -310,6 +316,13 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             if "density_bulk" in raw:
                 datasets["density_bulk"] = float(
                     np.asarray(raw["density_bulk"], np.float64).mean())
+            if "chi_gl" in raw:
+                gl = np.asarray(raw["chi_gl"], np.float64)
+                gr = np.asarray(raw["chi_gr"], np.float64)
+                # chi_F = (<gl*gr> - <gl><gr>)/2 with GLOBAL means — keep the
+                # three bin means so the covariance is assembled at analysis.
+                datasets.update(chi_gl=float(gl.mean()), chi_gr=float(gr.mean()),
+                                chi_glgr=float((gl * gr).mean()))
             for key in _OCC_CHUNK_KEYS:
                 if key in raw:
                     arr = np.asarray(raw[key], dtype=np.float32)
@@ -421,6 +434,11 @@ def main():
                         help="full-state snapshots per rank per chunk (int8, "
                              "for real-space excitation-pattern plots). "
                              "0 = disabled.")
+    parser.add_argument("--chi-f", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="fidelity-susceptibility estimator (Wang-Liu-"
+                             "Troyer): per-chunk bin means chi_gl/chi_gr/"
+                             "chi_glgr; chi_F = (<glgr> - <gl><gr>)/2")
     parser.add_argument("--permute-site-labels",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="per-rank random site-label permutation (identical "
@@ -454,6 +472,7 @@ def main():
         occ_sf_grid_n=config.get("occ_sf_grid_n", 0),
         n_snapshots=config.get("n_snapshots", 0),
         permute_site_labels=config.get("permute_site_labels", True),
+        chi_f=config.get("chi_f", False),
     )
 
 

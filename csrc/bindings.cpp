@@ -1256,7 +1256,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
         .def("run", [](SSEEngine& self, int n_equil, int n_samples,
                        py::object progress_callback, int progress_every,
-                       int n_snapshots) {
+                       int n_snapshots, bool measure_chi_f) {
             if (progress_every <= 0) progress_every = 1;
             const bool has_cb = !progress_callback.is_none();
 
@@ -1319,12 +1319,23 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             auto snap_buf = snap_out.mutable_unchecked<2>();
             int snap_count = 0;
 
+            // chi_F (WLT) half-string sums, per sample
+            py::array_t<double> chi_gl_out(std::max(measure_chi_f ? n_samples : 1, 1));
+            py::array_t<double> chi_gr_out(std::max(measure_chi_f ? n_samples : 1, 1));
+            auto gl_buf = chi_gl_out.mutable_unchecked<1>();
+            auto gr_buf = chi_gr_out.mutable_unchecked<1>();
+
             for (int i = 0; i < n_samples; ++i) {
                 self.mc_step();
                 e_buf(i) = self.measure_energy();
                 d_buf(i) = self.measure_density();
                 m_buf(i) = self.measure_mz();
                 n_buf(i) = self.get_n_ops();
+                if (measure_chi_f) {
+                    double gl, gr;
+                    self.measure_chi_f_terms(gl, gr);
+                    gl_buf(i) = gl; gr_buf(i) = gr;
+                }
 
                 const int32_t* st = self.get_state().data();
                 if (n_zg > 0) {
@@ -1390,6 +1401,10 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             if (do_vbs) { result["M_vbs"] = mvbs_out; result["M_ss"] = mss_out; }
             if (do_bulk)   result["density_bulk"] = dbulk_out;
             if (n_snap > 0) result["snapshots"] = snap_out;
+            if (measure_chi_f) {
+                result["chi_gl"] = chi_gl_out;
+                result["chi_gr"] = chi_gr_out;
+            }
             if (do_occ && n_samples > 0) {
                 const double inv = 1.0 / (double)n_samples;
                 auto pack = [&](std::vector<double>& acc) {
@@ -1420,6 +1435,7 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         py::arg("progress_callback") = py::none(),
         py::arg("progress_every") = 1000,
         py::arg("n_snapshots") = 0,
+        py::arg("measure_chi_f") = false,
         "Run equilibration + sampling.\n\n"
         "Returns\n-------\n"
         "dict with keys 'energies', 'densities', 'mz', 'n_ops' (1D per-sample\n"
@@ -1427,7 +1443,9 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         "'Z_l'/'C_m_l' (n_samples, n_size_groups), 'M_vbs'/'M_ss',\n"
         "'density_bulk', 'snapshots' (n_snapshots, N) int8, and one occ-SF\n"
         "super-bin per call: 'occ_S_{full,bulk}_{re,im}'/'occ2_S_{re,im}'\n"
-        "(n_q, 6, 6) + 'occ_nprof' (N,).")
+        "(n_q, 6, 6) + 'occ_nprof' (N,).  With measure_chi_f=True also\n"
+        "'chi_gl'/'chi_gr' (per-sample half-string sums of d ln W/d delta;\n"
+        "chi_F = (<gl*gr> - <gl><gr>)/2, Wang-Liu-Troyer PRX 5, 031007).")
 
         // ── Diagonal observables (QAQMC-profile parity) ─────────────────────
         .def("set_bulk_sites", [](SSEEngine& self, const std::vector<int>& sites) {
@@ -1535,6 +1553,11 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
              "Current energy estimate: -n_ops/beta + sum_b C_b")
         .def("measure_density", &SSEEngine::measure_density,
              "Current Rydberg density: mean(state)")
+        .def("measure_chi_f_terms", [](SSEEngine& self) {
+            double gl, gr;
+            self.measure_chi_f_terms(gl, gr);
+            return py::make_tuple(gl, gr);
+        }, "(g_left, g_right): half-string sums of d ln W/d delta (chi_F terms)")
         .def("measure_mz",      &SSEEngine::measure_mz,
              "Current staggered magnetization: (1/N) sum_i (-1)^i (n_i - 0.5)")
 

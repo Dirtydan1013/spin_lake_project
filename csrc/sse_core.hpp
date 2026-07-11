@@ -54,6 +54,16 @@ public:
     double measure_density() const;   // mean(state_)
     double measure_mz()      const;   // staggered mz = (1/N) sum_i (-1)^i (n_i - 0.5)
 
+    // ── Fidelity susceptibility terms (Wang–Liu–Troyer, PRX 5, 031007) ──────
+    // Sums of d(ln W_p)/d(delta) over the bond ops with imaginary time
+    // < / >= beta/2.  The cut is sampled exactly: the first j sequence ops are
+    // the left half with j ~ Binomial(n_ops, 1/2) (order statistics of iid
+    // uniform times; a slot cut at M_/2 would be biased since adjust_M keeps
+    // M_ ~ 1.33 n_ops).  chi_F is assembled in the analysis layer as
+    // (<gl*gr> - <gl><gr>) / 2.  Uses spin_now_/chi_g_seq_ scratch and rng_
+    // (hence non-const, and enabling it changes the RNG stream); O(M).
+    void measure_chi_f_terms(double& g_left, double& g_right);
+
     // ── Diagonal observables shared with the QAQMC profile engine ────────────
     // Geometry (loop/string sets, A_v, VBS/SS triangles, occ-SF maps) is set
     // through this member; per-sample measurement on state_ happens in the
@@ -101,6 +111,9 @@ private:
     // Bond weights: flat (n_bonds_pad * 4), index = b*4 + (ni*2+nj)
     std::vector<double>  bond_W_;
     std::vector<double>  bond_W_rmax_;  // 1/max_s W[b,s] (0 if max <= 0)
+    // d(ln W[b,s])/d(delta), same layout (0 where W == 0) — chi_F estimator
+    std::vector<double>  bond_dlnW_;
+    std::vector<double>  chi_g_seq_;    // scratch: per-op g in sequence order
 
     // Single alias table (one per beta/delta, not per time-slice), stored as
     // 16-byte AoS entries so each proposal touches 1-2 cache lines.
