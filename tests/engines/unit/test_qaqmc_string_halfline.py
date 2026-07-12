@@ -151,6 +151,74 @@ def _test_incremental_ratio_matches_full_recompute():
     assert n_checked >= 3, "expected at least a few valid half-line proposals to be checked"
 
 
+# ── Seam-cache consistency: cached snapshots == definitional recompute ──────
+
+def _test_seam_cache_stays_consistent():
+    # Two historical bugs lived here (fixed 2026-07-12): commit always flipped
+    # state_at_seam_plus_ (a left-walk terminal changes n^-, not n^+), and
+    # topology_sweep consumed snapshots staled by the preceding
+    # cluster_update. Invariants: (a) after any commit, cached snapshots must
+    # equal a fresh recompute; (b) after topology_sweep (entered right after
+    # mc_step, i.e. with a stale cache), same.
+    eng, _ = _make_engine(N=6, M=16, seed=7)
+    eng.set_string_sites([1, 3], eng.M)
+    for _ in range(100):
+        eng.mc_step()
+
+    def cache_matches_recompute():
+        cm = np.array(eng.state_at_seam_minus).copy()
+        cp = np.array(eng.state_at_seam_plus).copy()
+        eng.recompute_seam_snapshots()
+        return (np.array_equal(cm, np.array(eng.state_at_seam_minus))
+                and np.array_equal(cp, np.array(eng.state_at_seam_plus)))
+
+    n_commits = 0
+    for it in range(600):
+        eng.mc_step()
+        eng.recompute_seam_snapshots()
+        prop = eng.build_half_line_proposal(it % 2, bool(it % 4 < 2))
+        if prop.valid:
+            eng.commit_half_line_proposal(it % 2, prop)
+            n_commits += 1
+            assert cache_matches_recompute(), f"commit corrupted seam cache (iter {it})"
+        eng.topology_sweep(0.5)
+        assert cache_matches_recompute(), f"topology_sweep left stale seam cache (iter {it})"
+    assert n_commits >= 100, "expected plenty of committed toggles to exercise both walk directions"
+
+
+# ── Worldline closure: parity(sigma^x ops) == seam bit through mask resets ──
+
+def _test_mask_reset_preserves_worldline_closure():
+    # Fixed |0...0> boundaries at both tau ends impose, per string site,
+    # parity(# type -1 ops on site) == seam bit. Every kernel preserves it,
+    # so a raw mask write that changes a bit strands the engine in an
+    # unphysical sector forever (the third 2026-07-12 bug: trajectory resets
+    # used the raw setter, poisoning alternating trajectories).
+    # set_seam_mask_consistent must repair it.
+    eng, _ = _make_engine(N=6, M=16, seed=11)
+    sites = [1, 3]
+    eng.set_string_sites(sites, eng.M)
+    eng.set_seam_mask_consistent(0)
+
+    def closure_ok():
+        ot = np.array(eng.op_types)
+        os_ = np.array(eng.op_sites)
+        for k, s in enumerate(sites):
+            n_flip = int(np.sum((ot == -1) & (os_ == s)))
+            if (n_flip + ((eng.seam_mask >> k) & 1)) % 2 != 0:
+                return False
+        return True
+
+    for masks in ((0b11, 0b00), (0b01, 0b10), (0b11, 0b01), (0b00, 0b11)):
+        for mask in masks:
+            eng.set_seam_mask_consistent(mask)
+            assert closure_ok(), f"closure broken right after reset to {mask:#04b}"
+            for _ in range(20):
+                eng.mc_step()
+                eng.topology_sweep(0.5)
+            assert closure_ok(), f"closure broken after evolution at reset {mask:#04b}"
+
+
 # ── Phase B capstone: fixed lambda=1/2 sector residence probability vs ED ───
 
 def _test_sector_residence_probability_matches_ed():
@@ -198,6 +266,10 @@ def main():
     print("Test 2 (half-line involution) passed")
     _test_incremental_ratio_matches_full_recompute()
     print("Test 4 (incremental vs from-scratch weight ratio) passed")
+    _test_seam_cache_stays_consistent()
+    print("Test 5 (seam cache == recompute through commits/sweeps) passed")
+    _test_mask_reset_preserves_worldline_closure()
+    print("Test 6 (worldline closure through consistent mask resets) passed")
     empirical_ratio, expected_ratio, rel_err = _test_sector_residence_probability_matches_ed()
     print(f"Phase B capstone (sector residence vs ED) passed: "
           f"empirical={empirical_ratio:.4f} ED={expected_ratio:.4f} rel_err={rel_err:.3f}")

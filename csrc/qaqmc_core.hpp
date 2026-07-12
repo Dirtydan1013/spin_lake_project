@@ -319,6 +319,7 @@ public:
         off_diag_.set_string_sites(*this, sites, m_star);
     }
     void set_seam_mask(uint64_t mask) { off_diag_.set_seam_mask(mask); }
+    void set_seam_mask_consistent(uint64_t mask) { off_diag_.set_seam_mask_consistent(*this, mask); }
     uint64_t get_seam_mask() const { return off_diag_.get_seam_mask(); }
     const std::vector<int>& get_string_sites() const { return off_diag_.get_string_sites(); }
     int get_m_star() const { return off_diag_.get_m_star(); }

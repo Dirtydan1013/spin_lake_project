@@ -81,9 +81,22 @@ public:
     void on_diagonal_slice(int p, std::vector<int32_t>& state);
     void on_cluster_slice(int p, std::vector<int32_t>& spin_now) const;
 
+    // Set the seam mask AND repair per-site worldline closure. The fixed
+    // |0...0> boundary at BOTH tau ends imposes, per string site,
+    // parity(sigma^x ops) == seam bit; every update (diagonal, cluster,
+    // half-line toggle) preserves it, but writing the mask directly breaks
+    // it whenever a bit changes -- the raw setter below leaves the engine
+    // sampling an unphysical sector that no amount of decorrelation can
+    // leave. Use this for any sector reset (trajectory restarts,
+    // thermalize); repairs by toggling the site's first single-site op
+    // (repurposing a diagonal slot if it has none), then refreshes the
+    // seam snapshots.
+    void set_seam_mask_consistent(QAQMCEngine& eng, uint64_t mask);
+
     // ── Accessors ────────────────────────────────────────────────────────
-    // Set which sites in string_sites_ currently have an active seam bit.
-    // Bit k of mask <-> string_sites_[k].
+    // Raw mask write, no closure repair: bit k of mask <-> string_sites_[k].
+    // Only valid when the caller separately guarantees closure (e.g. paired
+    // with set_op_string of a config recorded at this mask).
     void set_seam_mask(uint64_t mask) { seam_mask_ = mask; }
     uint64_t get_seam_mask() const { return seam_mask_; }
     const std::vector<int>& get_string_sites() const { return string_sites_; }

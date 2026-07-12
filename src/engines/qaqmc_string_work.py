@@ -131,9 +131,9 @@ class QAQMCStringWorkRydberg:
         forward (lambda: 0->1) run, B=C (all bits active) for a reverse
         (lambda: 1->0) run -- document section 29/33."""
         if direction == "forward":
-            self._eng.set_seam_mask(0)
+            self._eng.set_seam_mask_consistent(0)
         elif direction == "reverse":
-            self._eng.set_seam_mask(self._full_mask())
+            self._eng.set_seam_mask_consistent(self._full_mask())
         else:
             raise ValueError(f"direction must be 'forward' or 'reverse', got {direction!r}")
         for _ in range(n_steps):
@@ -198,12 +198,15 @@ class QAQMCStringWorkRydberg:
         zero_count = 0
         for r in range(n_trajectories):
             # Trajectories always start at the sector matching lambda=0 (B=
-            # empty, forward) or lambda=1 (B=C, reverse); resetting the mask
-            # directly is safe here since site-operator weight (Omega/2)
-            # doesn't depend on type 1 vs -1, so any leftover terminal-op
-            # type from a previous trajectory is still a valid (positive-
-            # weight) configuration.
-            self._eng.set_seam_mask(reset_mask)
+            # empty, forward) or lambda=1 (B=C, reverse). The reset must go
+            # through the closure-repairing setter: the fixed |0...0>
+            # boundaries at both tau ends impose parity(sigma^x ops) == seam
+            # bit per string site, and a raw mask write breaks it whenever a
+            # bit changes -- every kernel preserves parity, so the following
+            # decorrelation steps can never leave the unphysical sector and
+            # the trajectory's J sample is garbage (alternating trajectories,
+            # since each reset re-flips the parity).
+            self._eng.set_seam_mask_consistent(reset_mask)
             for _ in range(decorrelation_steps):
                 self._eng.mc_step()
             result = self.run_trajectory(n_topology_sweeps_per_lambda, n_qaqmc_sweeps_per_lambda,

@@ -161,7 +161,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         py::arg("sites"), py::arg("m_star"),
         "Configure the string site list C and cut position m_star; resets seam_mask to empty")
         .def("set_seam_mask", &QAQMCEngine::set_seam_mask, py::arg("mask"),
-        "Set which string_sites are seam-active (bit k <-> string_sites[k]); Phase A: fixed by caller")
+        "RAW seam-mask write (bit k <-> string_sites[k]); breaks per-site worldline "
+        "closure when a bit changes -- only for callers restoring a recorded "
+        "(op string, mask) pair. For sector resets use set_seam_mask_consistent.")
+        .def("set_seam_mask_consistent", &QAQMCEngine::set_seam_mask_consistent, py::arg("mask"),
+        "Set the seam mask AND repair per-site worldline closure (parity(sigma^x ops) "
+        "== seam bit, from the fixed |0...0> tau boundaries) by toggling one single-site "
+        "op per changed bit; decorrelate before measuring. Use for trajectory resets.")
         .def_property_readonly("seam_mask", &QAQMCEngine::get_seam_mask)
         .def_property_readonly("m_star", &QAQMCEngine::get_m_star)
         .def_property_readonly("string_sites", &QAQMCEngine::get_string_sites)
@@ -1569,7 +1575,13 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         "Configure the string site list C and seam slot m_star (default 0 = "
         "tau=0 seam); resets seam_mask to empty")
         .def("set_seam_mask", &SSEEngine::set_seam_mask, py::arg("mask"),
-        "Set which string_sites are seam-active (bit k <-> string_sites[k])")
+        "Set which string_sites are seam-active (bit k <-> string_sites[k]); "
+        "repairs worldline parity as needed")
+        // Alias matching the QAQMCEngine name, so engine-agnostic drivers
+        // (QAQMCStringWorkRydberg and its SSE subclass) can call one method
+        // for a closure-safe sector reset on either engine.
+        .def("set_seam_mask_consistent", &SSEEngine::set_seam_mask, py::arg("mask"),
+        "Alias of set_seam_mask (which already repairs worldline parity)")
         .def_property_readonly("seam_mask", &SSEEngine::get_seam_mask)
         .def_property_readonly("m_star", &SSEEngine::get_m_star)
         .def_property_readonly("string_sites", &SSEEngine::get_string_sites)

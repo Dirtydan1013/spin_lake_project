@@ -34,6 +34,41 @@ void QAQMCOffDiagonalCore::set_string_sites(const QAQMCEngine& eng,
     recompute_seam_snapshots(eng);
 }
 
+void QAQMCOffDiagonalCore::set_seam_mask_consistent(QAQMCEngine& eng, uint64_t mask) {
+    seam_mask_ = mask;
+    if (m_star_ < 0) return;
+    for (size_t k = 0; k < string_sites_.size(); ++k) {
+        const int site = string_sites_[k];
+        int parity = 0;
+        int first_pm = -1, first_steal = -1;
+        for (int p = 0; p < eng.M_total_; ++p) {
+            const int ot = eng.op_types_[p];
+            if (ot == -1 && eng.op_sites_[p] == site) parity ^= 1;
+            if (first_pm < 0 && (ot == 1 || ot == -1) && eng.op_sites_[p] == site)
+                first_pm = p;
+            if (first_steal < 0 && (ot == 2 || (ot == 1 && eng.op_sites_[p] != site)))
+                first_steal = p;
+        }
+        const int want = (int)((mask >> k) & 1ULL);
+        if (parity == want) continue;
+        if (first_pm >= 0) {
+            eng.op_types_[first_pm] = (eng.op_types_[first_pm] == 1) ? -1 : 1;
+        } else if (first_steal >= 0) {
+            // No single-site op on this site (e.g. a fresh engine): repurpose
+            // a diagonal slot as the parity-fixing sigma^x. The resulting
+            // configuration is valid but atypical -- caller must decorrelate
+            // before measuring, same contract as the SSE core.
+            eng.op_types_[first_steal] = -1;
+            eng.op_sites_[first_steal] = site;
+            eng.vertex_counts_valid_ = false;
+        } else {
+            throw std::runtime_error("set_seam_mask_consistent: cannot repair "
+                                     "worldline closure (no repurposable operator)");
+        }
+    }
+    recompute_seam_snapshots(eng);
+}
+
 void QAQMCOffDiagonalCore::recompute_seam_snapshots(const QAQMCEngine& eng) {
     if (m_star_ < 0) return;
     std::vector<int32_t> state(eng.N_, 0);
@@ -152,12 +187,17 @@ void QAQMCOffDiagonalCore::commit_half_line_proposal(QAQMCEngine& eng, int local
     if (!prop.valid) return;
     eng.op_types_[prop.terminal_p] = (eng.op_types_[prop.terminal_p] == 1) ? -1 : 1;
     seam_mask_ ^= (1ULL << local_index);
-    // n_i^+ = n_i^- xor b_i by definition, regardless of which direction this
-    // toggle walked: keep the cached seam snapshot in sync so a subsequent
-    // build_half_line_proposal() in the same topology_sweep() (i.e. before
-    // the next diagonal_update() refreshes it from scratch) sees the right
-    // occupation. n^- is untouched: b_i never affects the "-" side.
-    state_at_seam_plus_[string_sites_[local_index]] ^= 1;
+    // Keep the cached seam snapshots in sync for any later
+    // build_half_line_proposal() in the same topology_sweep() (the next
+    // diagonal_update() refreshes them from scratch). Which snapshot changes
+    // depends on which side of the seam the terminal sits: a right-walk
+    // terminal (p >= m_star_) alters the worldline only after the seam, so
+    // n^+ flips and n^- is untouched; a left-walk terminal (p < m_star_)
+    // flips the propagated n^-, and since the seam bit b flips too,
+    // n^+ = n^- xor b is unchanged.
+    const int site = string_sites_[local_index];
+    if (prop.terminal_p >= m_star_) state_at_seam_plus_[site]  ^= 1;
+    else                            state_at_seam_minus_[site] ^= 1;
 }
 
 bool QAQMCOffDiagonalCore::attempt_string_toggle(QAQMCEngine& eng, int local_index, double lambda) {
@@ -182,6 +222,11 @@ bool QAQMCOffDiagonalCore::attempt_string_toggle(QAQMCEngine& eng, int local_ind
 void QAQMCOffDiagonalCore::topology_sweep(QAQMCEngine& eng, double lambda) {
     int L = (int)string_sites_.size();
     if (L == 0) return;
+    // cluster_update() can flip segments spanning m_star_ (changing the seam
+    // occupation) and only diagonal_update() refreshes the snapshots; since
+    // mc_step() runs diagonal -> cluster, the cache is usually stale on
+    // entry here. Rebuild it (O(M), no RNG). Same guard as the SSE core.
+    recompute_seam_snapshots(eng);
     std::vector<int> order(L);
     std::iota(order.begin(), order.end(), 0);
     for (int i = L - 1; i > 0; --i) {
