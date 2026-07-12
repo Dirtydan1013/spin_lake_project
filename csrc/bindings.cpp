@@ -1558,6 +1558,38 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             self.measure_chi_f_terms(gl, gr);
             return py::make_tuple(gl, gr);
         }, "(g_left, g_right): half-string sums of d ln W/d delta (chi_F terms)")
+
+        // ── Off-diagonal string X_C (thermal string-work; QAQMC-parity API) ──
+        .def("set_string_sites", [](SSEEngine& self, py::list sites_py, int m_star) {
+            std::vector<int> sites;
+            for (auto& x : sites_py) sites.push_back(x.cast<int>());
+            self.set_string_sites(sites, m_star);
+        },
+        py::arg("sites"), py::arg("m_star") = 0,
+        "Configure the string site list C and seam slot m_star (default 0 = "
+        "tau=0 seam); resets seam_mask to empty")
+        .def("set_seam_mask", &SSEEngine::set_seam_mask, py::arg("mask"),
+        "Set which string_sites are seam-active (bit k <-> string_sites[k])")
+        .def_property_readonly("seam_mask", &SSEEngine::get_seam_mask)
+        .def_property_readonly("m_star", &SSEEngine::get_m_star)
+        .def_property_readonly("string_sites", &SSEEngine::get_string_sites)
+        .def_property_readonly("state_at_seam_minus", [](const SSEEngine& self) {
+            return py::array_t<int32_t>(self.get_state_at_seam_minus().size(),
+                                        self.get_state_at_seam_minus().data());
+        })
+        .def_property_readonly("state_at_seam_plus", [](const SSEEngine& self) {
+            return py::array_t<int32_t>(self.get_state_at_seam_plus().size(),
+                                        self.get_state_at_seam_plus().data());
+        })
+        .def("recompute_seam_snapshots", &SSEEngine::recompute_seam_snapshots,
+             "Refresh state_at_seam_minus/plus from current state_/op string")
+        .def("attempt_string_toggle", &SSEEngine::attempt_string_toggle,
+             py::arg("local_index"), py::arg("lambda_"),
+             "One Metropolis attempt (random direction, periodic walk) for "
+             "string_sites[local_index] at fixed lambda")
+        .def("topology_sweep", &SSEEngine::topology_sweep, py::arg("lambda_"),
+             "Refresh seam snapshots, then one attempt_string_toggle per "
+             "string site in random order")
         .def("measure_mz",      &SSEEngine::measure_mz,
              "Current staggered magnetization: (1/N) sum_i (-1)^i (n_i - 0.5)")
 

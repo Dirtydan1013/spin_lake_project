@@ -241,6 +241,11 @@ void SSEEngine::set_config(const int32_t* state, int n_state,
     n_ops_ = n_ops;
     bond_spin_.assign(M_, 0);
     vertex_counts_valid_ = false;
+    if (off_diag_.get_m_star() >= 0) {
+        if (off_diag_.get_m_star() >= M_)
+            throw std::runtime_error("set_config: string length < configured m_star");
+        off_diag_.recompute_seam_snapshots(*this);
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -285,6 +290,7 @@ void SSEEngine::measure_chi_f_terms(double& g_left, double& g_right) {
     std::memcpy(spin_now_.data(), state_.data(), N_ * sizeof(int32_t));
     chi_g_seq_.clear();
     for (int p = 0; p < M_; ++p) {
+        off_diag_.on_fill_slice(p, spin_now_);  // seam XOR (twisted sector)
         const int t = op_types_[p];
         if (t == 0) continue;
         if (t == -1) {
@@ -347,6 +353,7 @@ void SSEEngine::diagonal_update() {
     std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
 
     for (int p = 0; p < M_; ++p) {
+        off_diag_.on_diagonal_slice(p, state_);  // seam XOR at p == m_star
         int ot = op_types_[p];
 
         if (ot == -1) {
@@ -467,6 +474,7 @@ void SSEEngine::build_vertex_lists() {
     std::copy(state_.begin(), state_.end(), spin_now_.begin());
 
     for (int p = 0; p < M; ++p) {
+        off_diag_.on_fill_slice(p, spin_now_);  // seam XOR at p == m_star
         int ot = op_types_[p];
         if (ot == 1 || ot == -1) {
             int s = op_sites_[p];

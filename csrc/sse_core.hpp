@@ -1,6 +1,7 @@
 #pragma once
 #include "qaqmc_core.hpp"  // RydbergVij, build_rydberg_vij, AliasEntry, RNG helpers
 #include "diagonal_observables.hpp"
+#include "sse_off_diagonal_core.hpp"
 #include <string>
 #include <cstdint>
 
@@ -94,6 +95,24 @@ public:
     void set_config(const int32_t* state, int n_state,
                     const int32_t* types, const int32_t* sites, int len);
 
+    // ── Off-diagonal string X_C (thermal string-work) — see
+    //    sse_off_diagonal_core.hpp.  One-line pass-throughs, QAQMC-parity API.
+    void set_string_sites(const std::vector<int>& sites, int m_star) {
+        off_diag_.set_string_sites(*this, sites, m_star);
+    }
+    // Repairs worldline parity as needed — see set_seam_mask_consistent.
+    void set_seam_mask(uint64_t mask) { off_diag_.set_seam_mask_consistent(*this, mask); }
+    uint64_t get_seam_mask() const { return off_diag_.get_seam_mask(); }
+    const std::vector<int>& get_string_sites() const { return off_diag_.get_string_sites(); }
+    int get_m_star() const { return off_diag_.get_m_star(); }
+    const std::vector<int32_t>& get_state_at_seam_minus() const { return off_diag_.get_state_at_seam_minus(); }
+    const std::vector<int32_t>& get_state_at_seam_plus()  const { return off_diag_.get_state_at_seam_plus(); }
+    void recompute_seam_snapshots() { off_diag_.recompute_seam_snapshots(*this); }
+    bool attempt_string_toggle(int local_index, double lambda) {
+        return off_diag_.attempt_string_toggle(*this, local_index, lambda);
+    }
+    void topology_sweep(double lambda) { off_diag_.topology_sweep(*this, lambda); }
+
 private:
     int    N_, M_, n_ops_;
     double Omega_, delta_, Rb_, beta_, epsilon_;
@@ -153,4 +172,8 @@ private:
     void cluster_update();
     void build_vertex_lists();
     void adjust_M_if_needed();
+
+    // Off-diagonal string seam (X_C); all state lives in the core object.
+    friend class SSEOffDiagonalCore;
+    SSEOffDiagonalCore off_diag_;
 };
