@@ -15,3 +15,5 @@
 | [E08](E08_2026-07-10_qaqmc-rerun-permuted.md) | 07-10 | QAQMC sweep重跑（permutation ON） | M3回歸24:15:16、phase-lock消失（std 0.047=平衡值） | 完成 |
 | [E09](E09_2026-07-10_sse-deep-beta.md) | 07-10 | 深βSSE（160/320 @4.25、160 @5.5） | 預測命中：β×16全平無VBS/SS；4.25液體指標反增強→KP TEE可上 | 完成 |
 | [E12](E12_2026-07-11_chi-f-estimator.md) | 07-11 | χ_F估計子：SSE WLT＋QAQMC速度校準（ED雙釘死） | 兩管線±1σ；slot-cut偏差→Binomial時間切割；非對稱點O(v²)無線性項 | 完成 |
+| [E13](E13_2026-07-12_thermal-entropy-ladder.md) | 07-12 | 熱熵β-ladder（W–P Eq.7、全vdW不截斷） | 三層熵階梯（ln2→ln4/3→ln2/6）；S/N(β=6,δ=4.5,8×8)=0.140(11)命中W–P | 完成（生產待排） |
+| [E14](E14_2026-07-12_sse-offdiagonal-string.md) | 07-12 | SSE非對角弦引擎（熱態⟨X_C⟩，Jarzynski） | ED 4/4＋driver端對端；週期邊界宇稱修復bug；QAQMC左走cache疑點待查 | 完成 |
