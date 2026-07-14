@@ -14,3 +14,9 @@ if str(_REPO_ROOT) not in sys.path:
 _BUILD_DIR = _REPO_ROOT / "build"
 if _BUILD_DIR.exists() and str(_BUILD_DIR) not in sys.path:
     sys.path.insert(0, str(_BUILD_DIR))
+
+# Optional CUDA build is kept separate so CPU-only configure/build remains
+# untouched.  GPU tests import from here when the module has been built.
+_CUDA_BUILD_DIR = _REPO_ROOT / "build_cuda"
+if _CUDA_BUILD_DIR.exists() and str(_CUDA_BUILD_DIR) not in sys.path:
+    sys.path.insert(0, str(_CUDA_BUILD_DIR))
