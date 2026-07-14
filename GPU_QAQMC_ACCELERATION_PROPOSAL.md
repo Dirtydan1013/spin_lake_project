@@ -1,8 +1,45 @@
 # QAQMC GPU 加速提案：從 prefix-XOR diagonal update 到 device-resident cluster update
 
-狀態：討論稿（`gpu_version` branch）  
+狀態：M0–M5 已實作，M6 production hardening 進行中（`gpu_version` branch）
 範圍：`QAQMCEngine` single-replica diagonal/profile engine，先不涵蓋 Renyi、work protocol 與 off-diagonal string seam  
 基準版本：`z2_spin_lake` commit `31d6c5c`
+
+## 0. 2026-07-14 實作結果
+
+目前 branch 已不只是可行性提案。以下路徑已完成並在 gpunode02 V100
+通過 exact/invariant tests：
+
+- packed `uint64` tiled prefix-XOR scan（支援 `N <= 384`）；
+- grouped-alias diagonal resampling，Philox 以 `(seed, slice, sweep)` 可重播；
+- site/bond event stream 建構與 CUB radix sort；
+- 保留 CPU site 順序的 cluster update；每個 segment 使用一個 CUDA block
+  平行歸約 log weight ratio；
+- operator string、event buffers 與 `bond_spin` 跨 sweep 常駐 GPU；
+- sparse profile-state snapshot、midpoint/profile density、`Z_l`、`C_m_l`、
+  `A_v`（以 loop group 表示）、VBS/SS；
+- atomic operator/Philox checkpoint 與 rank-local HDF5 production runner。
+
+V100 32 GB、`N=216`、full 23,220 bonds、`G=600`、`M=2,760,000`
+的單鏈實測如下。CPU reference 與 GPU 都在同一個 Slurm allocation、單一
+CPU core/GPU 上測量：
+
+| phase | CPU | V100 CUDA |
+| --- | ---: | ---: |
+| diagonal | 640.96 ms | 1.71 ms |
+| event build/sort |（包含於 CPU cluster）| 7.73 ms |
+| cluster segment sweep | 389.95 ms | 12.52 ms |
+| full MC wall time | 1,030.95 ms | 22.05 ms |
+| full-step speedup | — | **46.8×** |
+
+這裡的 46.8× 才是 end-to-end transition speedup；約 377× 的 diagonal
+數字只代表單一 phase。event buffers 配置後顯存約 1.0 GiB。observable
+與 checkpoint 不在每個 transition step 的 22.05 ms 內，production
+throughput仍取決於 measurement cadence 與 filesystem。
+
+目前刻意未宣稱完成的範圍是 off-diagonal seam/string、Rényi replica/work
+engine，以及 occupation-SF matrix 的 device-side accumulation；它們不應在
+沒有各自 detailed-balance/reference tests 的情況下假裝共用 standard
+single-replica kernel。
 
 ## 1. 結論先行
 

@@ -124,10 +124,29 @@ public:
     int get_N() const { return N_; }
     int get_M() const { return M_; }
     int get_M_total() const { return M_total_; }
+    double get_delta_min() const { return delta_min_; }
+    double get_delta_max() const { return delta_max_; }
+    double get_epsilon() const { return epsilon_; }
     const std::vector<int32_t>& get_op_types() const { return op_types_; }
     const std::vector<int32_t>& get_op_sites() const { return op_sites_; }
     const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
     const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
+
+    // Read-only export used to validate/seed the optional CUDA backend.  These
+    // arrays are Hamiltonian/schedule data, shared by every independent chain.
+    // Keeping the accessors here avoids duplicating the delicate grouped-alias
+    // envelope construction while the GPU transition kernel is brought up.
+    int get_n_bonds() const { return vij_.n_bonds; }
+    int get_group_count() const { return grp_alias_.n_groups; }
+    int get_group_max_alias() const { return grp_alias_.max_alias; }
+    const std::vector<double>& get_bond_vij() const { return vij_.vij_list; }
+    const std::vector<double>& get_inv_coord() const { return vij_.inv_coord; }
+    const std::vector<double>& get_group_bond_rmax() const {
+        return grp_alias_.bond_W_rmax_all;
+    }
+    const std::vector<AliasEntry>& get_group_alias_entries() const {
+        return grp_alias_.entries;
+    }
 
     // delta at slice p, computed arithmetically with the EXACT expression used
     // to build delta_sched_ (bit-identical), so hot loops avoid streaming /

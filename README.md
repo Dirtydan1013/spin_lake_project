@@ -37,6 +37,55 @@ python -c "import qaqmc_cpp; print('C++ extension OK')"
 - 換 `-march` 會改變浮點捨入（FMA contraction），同 seed 的軌跡在不同
   build 間不會 bit-identical（統計上等價）。
 
+## CUDA QAQMC backend（gpu_version）
+
+CUDA 是 optional build；CPU-only build 不需要 CUDA toolkit。gpunode02 的
+A100 (`sm_80`) 與兩張 V100 (`sm_70`) 共用同一顆 extension：
+
+```bash
+conda activate qaqmc
+cmake -S . -B build_cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DQAQMC_ENABLE_CUDA=ON \
+      -DQAQMC_CUDA_ARCHITECTURES='70;80' \
+      -DQAQMC_ARCH=x86-64 \
+      -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+      -DPYTHON_EXECUTABLE=$(which python)
+cmake --build build_cuda -j
+```
+
+`QAQMC_ARCH=x86-64` 讓同一顆 CPU reference module 可在 login/GPU node
+之間載入；production CPU benchmark 若在目標 node 原地 build，仍可用
+`native`。請不要把 login node 的 native `qaqmc_cpp*.so` 放在目前工作目錄
+再到舊 CPU node 執行，因為 Python 的空 import path 會優先於
+`PYTHONPATH`，可能直接 `Illegal instruction`。
+
+GPU 測試必須在 compute allocation 中執行：
+
+```bash
+srun --partition=gpu --nodelist=gpunode02 --gres=gpu:1 --cpus-per-task=2 \
+  bash -lc 'cd /tmp && \
+  PYTHONPATH=/path/to/spin_lake_project/build_cuda:/path/to/spin_lake_project \
+  python -m pytest -q /path/to/spin_lake_project/tests/gpu'
+```
+
+單 GPU production job：
+
+```bash
+sbatch main_scripts/slurm_scripts/run_kagome_qaqmc_cuda.sh
+
+# 多條獨立 chain 可用 job array；給所有 task 同一個絕對 RUN_DIR，
+# SLURM_ARRAY_TASK_ID 會成為 rank/seed offset。
+RUN_DIR=$PWD/data/qaqmc_cuda_ensemble \
+  sbatch --array=0-2 main_scripts/slurm_scripts/run_kagome_qaqmc_cuda.sh
+```
+
+CUDA runner 目前輸出 rank-local batched profile：density、`Z_l`、`C_m_l`、
+`A_v`、VBS/SS、指定 δ 點的 occupation-SF matrices，以及可精確 replay 的
+operator/Philox checkpoint。SF 的 O(2M) worldline propagation 在 GPU；只把
+選定的 `n_delta × N` packed states 傳回 host 做小矩陣歸約。standard
+single-replica QAQMC 已 GPU 化；Rényi/work 與 off-diagonal seam/string 仍是
+獨立後續 backend，不能用這個 runner 代替。
+
 ## 提交 / 執行腳本
 
 production 腳本在 `main_scripts/slurm_scripts/`，同一份腳本在有無 SLURM 的

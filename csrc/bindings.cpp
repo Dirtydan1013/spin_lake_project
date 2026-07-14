@@ -116,6 +116,9 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def_property_readonly("N", &QAQMCEngine::get_N)
         .def_property_readonly("M", &QAQMCEngine::get_M)
         .def_property_readonly("M_total", &QAQMCEngine::get_M_total)
+        .def_property_readonly("delta_min", &QAQMCEngine::get_delta_min)
+        .def_property_readonly("delta_max", &QAQMCEngine::get_delta_max)
+        .def_property_readonly("epsilon", &QAQMCEngine::get_epsilon)
         .def_property_readonly("n_loops",   &QAQMCEngine::get_n_loops)
         .def_property_readonly("n_strings", &QAQMCEngine::get_n_strings)
         .def_property_readonly("n_loop_size_groups",   &QAQMCEngine::get_n_loop_size_groups)
@@ -138,6 +141,58 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             const auto& v = self.get_delta_schedule();
             return py::array_t<double>(v.size(), v.data());
         })
+
+        .def("export_cuda_diagonal_data", [](const QAQMCEngine& self) {
+            const int n_groups = self.get_group_count();
+            const int max_alias = self.get_group_max_alias();
+            const int n_bonds = self.get_n_bonds();
+            const auto& entries = self.get_group_alias_entries();
+            const auto& rmax = self.get_group_bond_rmax();
+            const auto& bond_sites = self.get_bond_sites_flat();
+            const auto& bond_vij = self.get_bond_vij();
+            const auto& inv_coord = self.get_inv_coord();
+
+            py::array_t<double> alias_prob({n_groups, max_alias});
+            py::array_t<int32_t> alias_index({n_groups, max_alias});
+            py::array_t<int32_t> alias_loc_kind({n_groups, max_alias});
+            py::array_t<double> bond_rmax({n_groups, n_bonds});
+            py::array_t<int32_t> bond_sites_out({n_bonds, 2});
+            py::array_t<double> bond_vij_out(n_bonds);
+            py::array_t<double> inv_coord_out(self.get_N());
+
+            {
+                py::gil_scoped_release release;
+                double* prob_ptr = alias_prob.mutable_data();
+                int32_t* index_ptr = alias_index.mutable_data();
+                int32_t* loc_ptr = alias_loc_kind.mutable_data();
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    prob_ptr[i] = entries[i].prob;
+                    index_ptr[i] = entries[i].alias;
+                    loc_ptr[i] = entries[i].loc_kind;
+                }
+                std::memcpy(bond_rmax.mutable_data(), rmax.data(),
+                            rmax.size() * sizeof(double));
+                for (size_t i = 0; i < bond_sites.size(); ++i)
+                    bond_sites_out.mutable_data()[i] = static_cast<int32_t>(bond_sites[i]);
+                std::memcpy(bond_vij_out.mutable_data(), bond_vij.data(),
+                            bond_vij.size() * sizeof(double));
+                std::memcpy(inv_coord_out.mutable_data(), inv_coord.data(),
+                            inv_coord.size() * sizeof(double));
+            }
+
+            py::dict out;
+            out["alias_prob"] = std::move(alias_prob);
+            out["alias_index"] = std::move(alias_index);
+            out["alias_loc_kind"] = std::move(alias_loc_kind);
+            out["bond_rmax"] = std::move(bond_rmax);
+            out["bond_sites"] = std::move(bond_sites_out);
+            out["bond_vij"] = std::move(bond_vij_out);
+            out["inv_coord"] = std::move(inv_coord_out);
+            return out;
+        },
+        "Copy grouped alias and Rydberg bond data into NumPy arrays for the "
+        "optional CUDA backend.  Intended for backend construction/testing, "
+        "not per-sweep use.")
 
         // Checkpoint support
         .def("get_rng_state", &QAQMCEngine::get_rng_state)
