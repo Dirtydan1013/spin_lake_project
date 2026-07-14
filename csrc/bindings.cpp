@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <cstring>
 #include "qaqmc_core.hpp"
 #include "qaqmc_renyi_core.hpp"
 #include "qaqmc_renyi_work_core.hpp"
@@ -94,10 +95,9 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                 self.mc_step();
                 if ((i + 1) % measure_every == 0) {
                     const auto& ot = self.get_op_types();
-                    const auto& os = self.get_op_sites();
                     for (int p = 0; p < M2; ++p) {
                         t_buf(sample_idx, p) = static_cast<int8_t>(ot[p]);
-                        s_buf(sample_idx, p) = static_cast<int32_t>(os[p]);
+                        s_buf(sample_idx, p) = static_cast<int32_t>(self.get_op_site(p));
                     }
                     ++sample_idx;
                     if (has_cb && ((sample_idx % progress_every) == 0 || sample_idx == n_samples))
@@ -123,11 +123,14 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
         .def_property_readonly("op_types", [](const QAQMCEngine& self) {
             const auto& v = self.get_op_types();
-            return py::array_t<int32_t>(v.size(), v.data());
+            py::array_t<int32_t> out(v.size());
+            self.export_op_types(out.mutable_data(), static_cast<int>(v.size()));
+            return out;
         })
         .def_property_readonly("op_sites", [](const QAQMCEngine& self) {
-            const auto& v = self.get_op_sites();
-            return py::array_t<int32_t>(v.size(), v.data());
+            py::array_t<int32_t> out(self.get_M_total());
+            self.export_op_sites(out.mutable_data(), self.get_M_total());
+            return out;
         })
         .def_property_readonly("bond_sites", [](const QAQMCEngine& self) {
             const auto& v = self.get_bond_sites_flat();
@@ -135,18 +138,28 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
             return py::array_t<int32_t>({n, 2}, v.data());
         })
         .def_property_readonly("delta_schedule", [](const QAQMCEngine& self) {
-            const auto& v = self.get_delta_schedule();
-            return py::array_t<double>(v.size(), v.data());
+            const auto v = self.get_delta_schedule();
+            py::array_t<double> out(v.size());
+            std::memcpy(out.mutable_data(), v.data(), v.size() * sizeof(double));
+            return out;
         })
+        .def_property_readonly("memory_breakdown", &QAQMCEngine::get_memory_breakdown)
+        .def_property_readonly("compact_op_sites", &QAQMCEngine::uses_compact_op_sites)
+        .def_property_readonly("compact_alias_indices", &QAQMCEngine::uses_compact_alias_indices)
 
         // Checkpoint support
         .def("get_rng_state", &QAQMCEngine::get_rng_state)
         .def("set_rng_state", &QAQMCEngine::set_rng_state)
         .def("set_op_string", [](QAQMCEngine& self,
-                                 py::array_t<int32_t> types_arr,
-                                 py::array_t<int32_t> sites_arr) {
+                                 py::array_t<int32_t, py::array::c_style |
+                                                           py::array::forcecast> types_arr,
+                                 py::array_t<int32_t, py::array::c_style |
+                                                           py::array::forcecast> sites_arr) {
             auto t = types_arr.request();
             auto s = sites_arr.request();
+            if (t.ndim != 1 || s.ndim != 1 || t.shape[0] != s.shape[0])
+                throw std::invalid_argument(
+                    "set_op_string: types/sites must be equal-length 1D arrays");
             self.set_op_string(static_cast<const int32_t*>(t.ptr),
                                static_cast<const int32_t*>(s.ptr),
                                (int)t.shape[0]);

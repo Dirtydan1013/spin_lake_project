@@ -28,7 +28,11 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-from src.engines.qaqmc import QAQMC_Rydberg
+from src.engines.qaqmc import (
+    QAQMC_Rydberg,
+    _qaqmc_delta_values,
+    _write_qaqmc_delta_schedule,
+)
 from src.mpi.equil_progress import run_equil_with_progress
 from src.rydberg.lattices import (kagome_loop_string_translations,
                           kagome_multi_size_translations, kagome_bulk_sites,
@@ -261,6 +265,13 @@ def _build_occ_q_grid(grid_n, a):
             qs.append(fm*b1 + fn*b2)
             frac.append((fm, fn))
     return np.array(qs, dtype=np.float64), np.array(frac, dtype=np.float64)
+
+
+def _qaqmc_profile_grid(M, profile_step, delta_min, delta_max):
+    """Return only measured ``(p, delta(p))`` points, never the full 2M ramp."""
+    n_points = (2 * int(M)) // int(profile_step)
+    p_idx = np.arange(1, n_points + 1, dtype=np.int64) * int(profile_step) - 1
+    return p_idx, _qaqmc_delta_values(p_idx, M, delta_min, delta_max)
 
 
 def _snap_delta_points(prof_delta, requested, sweep='forward'):
@@ -544,10 +555,8 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
 
             # schedule
             sg = f.create_group('schedule')
-            delta_sched = np.array(engine._cpp_engine.delta_schedule
-                                   if engine._cpp_engine else
-                                   np.zeros(M2), dtype=np.float64)
-            sg.create_dataset('delta_schedule', data=delta_sched)
+            _write_qaqmc_delta_schedule(
+                sg, M, delta_min, delta_max)
 
             # sample datasets
             smg = f.create_group('samples')
@@ -791,8 +800,8 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             gg.create_dataset('pos', data=pos_stored.astype(np.float64))
 
             sg = f.create_group('schedule')
-            delta_sched = np.array(engine._cpp_engine.delta_schedule, dtype=np.float64)
-            sg.create_dataset('delta_schedule', data=delta_sched)
+            _write_qaqmc_delta_schedule(
+                sg, M, delta_min, delta_max)
 
             og = f.create_group('observables')
             og.create_dataset('density', data=all_density)
@@ -847,13 +856,15 @@ def _store_array(key, value):
     return arr
 
 
-def _write_result_h5(path, arrays, attrs=None):
+def _write_result_h5(path, arrays, attrs=None, qaqmc_schedule=None):
     """Atomically write a dict of arrays to a self-contained HDF5 file.
 
     Writes to ``path + '.tmp'`` first, then ``os.replace()`` into place, so a
     crash mid-write can never corrupt a previously-completed checkpoint file.
     Arrays larger than 1 MiB are gzip-compressed (op-type-like data shrinks a
     lot; batch means less so, but the cost is negligible at this cadence).
+    ``qaqmc_schedule=(M, delta_min, delta_max)`` preserves the historical
+    root-level ``delta_schedule`` dataset while streaming it in bounded chunks.
     """
     tmp = path + '.tmp'
     with h5py.File(tmp, 'w') as f:
@@ -866,6 +877,8 @@ def _write_result_h5(path, arrays, attrs=None):
                 f.create_dataset(k, data=arr, compression='gzip', compression_opts=4)
             else:
                 f.create_dataset(k, data=arr)
+        if qaqmc_schedule is not None:
+            _write_qaqmc_delta_schedule(f, *qaqmc_schedule)
     os.replace(tmp, path)
 
 
@@ -1067,13 +1080,14 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         n_q = sf_q_points.shape[0]
         engine._cpp_engine.set_dimer_sf_q_points(sf_q_points)
 
-    # Profile grid (point k → slice p_indices[k], δ = delta_sched[p_indices[k]])
+    # Profile grid (point k -> slice p_indices[k], delta = delta_at(p)).
+    # Do not export/materialize the complete 2M schedule here: for M=100M that
+    # would recreate a 1.6 GB per-rank array that the compact C++ engine
+    # intentionally removed.  Only the measured profile points are needed.
     M_total_  = engine._cpp_engine.M_total
     n_points_ = M_total_ // profile_step
-    delta_sched_full = np.array(engine._cpp_engine.delta_schedule, dtype=np.float64)
-    prof_p_idx   = np.array([(k + 1) * profile_step - 1 for k in range(n_points_)],
-                            dtype=np.int64)
-    prof_delta   = delta_sched_full[prof_p_idx]   # δ at each profile point
+    prof_p_idx, prof_delta = _qaqmc_profile_grid(
+        M, profile_step, delta_min, delta_max)
 
     # Optional: full-state snapshots at chosen δ values (snapped to the chosen
     # ramp of the profile grid; forward by default).
@@ -1245,11 +1259,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         # One-time run metadata (geometry + params) from rank 0.
         if rank == 0:
             meta = {
-                'delta_schedule': np.array(engine._cpp_engine.delta_schedule,
-                                           dtype=np.float64),
-                'p_indices': np.array([(k + 1) * profile_step - 1
-                                       for k in range(M_total_ // profile_step)],
-                                      dtype=np.int64),
+                'p_indices': np.asarray(prof_p_idx, dtype=np.int64),
             }
             if pos is not None:
                 meta['pos'] = np.asarray(pos, dtype=np.float64)
@@ -1268,7 +1278,8 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                            seed=seed, profile_step=profile_step,
                            samples_per_bin=int(bin_size),
                            n_samples=n_samples, n_ranks=n_ranks,
-                           permute_site_labels=bool(site_perm is not None)))
+                           permute_site_labels=bool(site_perm is not None)),
+                qaqmc_schedule=(M, delta_min, delta_max))
             print(f"[MPI-PROF] checkpoint run dir: {run_dir}", flush=True)
 
         comm.Barrier()
@@ -1497,8 +1508,6 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 all_sf_a3[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_a3
                 all_sf_a4[off_bz[src]:off_bz[src]+batches_z[src]] = buf_sf_a4
 
-        delta_sched = np.array(engine._cpp_engine.delta_schedule, dtype=np.float64)
-
         with h5py.File(filepath, 'w') as f:
             pg = f.create_group('params')
             pg.attrs['N']            = N
@@ -1530,9 +1539,10 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             gg.create_dataset('pos', data=pos_stored.astype(np.float64))
 
             sg = f.create_group('schedule')
-            sg.create_dataset('delta_schedule', data=delta_sched)
+            _write_qaqmc_delta_schedule(
+                sg, M, delta_min, delta_max)
             sg.create_dataset('p_indices',      data=p_indices)
-            sg.create_dataset('delta_sampled',  data=delta_sched[p_indices])
+            sg.create_dataset('delta_sampled',  data=prof_delta)
 
             # ── Provenance: which rank + which within-rank step each row came from ──
             # Rows of every gathered array are concatenated in rank order, and are

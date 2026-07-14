@@ -4,7 +4,10 @@
 #include <random>
 #include <cmath>
 #include <algorithm>
+#include <map>
+#include <limits>
 #include <numeric>
+#include <string>
 
 #ifdef QAQMC_USE_OPENMP
 #include <omp.h>
@@ -103,6 +106,8 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
 
 class QAQMCEngine {
 public:
+    using OpType = int8_t;
+
     QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
                 double Rb, int M, double epsilon, uint64_t seed,
                 const double* pos, int pos_dim,
@@ -124,14 +129,21 @@ public:
     int get_N() const { return N_; }
     int get_M() const { return M_; }
     int get_M_total() const { return M_total_; }
-    const std::vector<int32_t>& get_op_types() const { return op_types_; }
-    const std::vector<int32_t>& get_op_sites() const { return op_sites_; }
+    const std::vector<OpType>& get_op_types() const { return op_types_; }
+    int get_op_site(int p) const { return op_site_at(p); }
+    void export_op_types(int32_t* out, int len) const;
+    void export_op_sites(int32_t* out, int len) const;
     const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
-    const std::vector<double>& get_delta_schedule() const { return delta_sched_; }
+    std::vector<double> get_delta_schedule() const;
+    bool uses_compact_op_sites() const { return op_sites_u16_; }
+    bool uses_compact_alias_indices() const { return grp_alias_.alias_u16; }
 
-    // delta at slice p, computed arithmetically with the EXACT expression used
-    // to build delta_sched_ (bit-identical), so hot loops avoid streaming /
-    // randomly hitting the 8-byte-per-slice schedule array.
+    // Logical/capacity bytes for the dominant standard-engine allocations.
+    // Exposed for reproducible RSS accounting; values exclude Python/MPI/HDF5.
+    std::map<std::string, uint64_t> get_memory_breakdown() const;
+
+    // delta at slice p. The materialized O(M) schedule was removed; callers
+    // that need the complete public schedule receive an on-demand export.
     inline double delta_at(int p) const {
         return (p < M_)
             ? delta_min_ + (delta_max_ - delta_min_) * ((double)p / M_)
@@ -378,7 +390,6 @@ private:
     std::mt19937_64 rng_;
 
     RydbergVij vij_;
-    std::vector<double> delta_sched_;
     // Site coordinates stored row-major (N × pos_dim) for downstream use
     // (e.g. dimer structure factor q·r_i phases).
     std::vector<double> pos_flat_;
@@ -391,15 +402,35 @@ private:
         int n_groups;
         int max_alias;
         int n_bonds_pad;
-        std::vector<double>  bond_W_max_all;  // [n_groups * n_bonds_pad]
         std::vector<double>  bond_W_rmax_all; // [n_groups * n_bonds_pad] 1/W_max (0 if W_max <= 0)
         std::vector<int>     n_alias_all;     // [n_groups]
-        std::vector<AliasEntry> entries;      // [n_groups * max_alias]
+        std::vector<double>  alias_prob;       // [n_groups * max_alias]
+        std::vector<uint16_t> alias_idx16;     // used when max_alias <= 65536
+        std::vector<uint32_t> alias_idx32;     // general fallback
+        bool alias_u16{false};
+
+        inline int alias_at(size_t idx) const {
+            return alias_u16 ? static_cast<int>(alias_idx16[idx])
+                             : static_cast<int>(alias_idx32[idx]);
+        }
     };
     GroupedAlias grp_alias_;
 
-    std::vector<int32_t> op_types_;
-    std::vector<int32_t> op_sites_;
+    std::vector<OpType> op_types_;
+    // N=216/full-bond fits in uint16. Larger systems automatically use the
+    // uint32 fallback; exactly one storage vector is allocated per engine.
+    bool op_sites_u16_{false};
+    std::vector<uint16_t> op_sites16_;
+    std::vector<uint32_t> op_sites32_;
+
+    inline int op_site_at(int p) const {
+        return op_sites_u16_ ? static_cast<int>(op_sites16_[p])
+                             : static_cast<int>(op_sites32_[p]);
+    }
+    inline void set_op_site_at(int p, int value) {
+        if (op_sites_u16_) op_sites16_[p] = static_cast<uint16_t>(value);
+        else               op_sites32_[p] = static_cast<uint32_t>(value);
+    }
 
     // ── On-the-fly observable data ──────────────────────────────────────
     std::vector<int32_t> state_at_M_;          // spin config at symmetry point
@@ -426,7 +457,7 @@ private:
     std::vector<double> dimer_phase_cos_;                 // [n_q * N] row-major
     std::vector<double> dimer_phase_sin_;                 // [n_q * N]
     std::vector<int>    dimer_p_indices_;                 // forward-ramp slices, sorted ascending
-    std::vector<double> dimer_deltas_used_;               // delta_sched_[p] for each p in indices
+    std::vector<double> dimer_deltas_used_;               // delta_at(p) for each p in indices
 
     // ── Snapshot data ─────────────────────────────────────────────────────
     std::vector<int> snapshot_point_indices_;             // profile-point indices to snapshot, sorted ascending

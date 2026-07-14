@@ -1,9 +1,10 @@
-# QAQMC CPU Memory Optimization：分析與實作計畫
+# QAQMC CPU Memory Optimization：均衡版實作與後續計畫
 
 最後更新：2026-07-14  
 分支：`cpu_memory_optimization`  
 基準分支：`z2_spin_lake` (`31d6c5c`)  
 第一階段範圍：standard single-replica `QAQMCEngine`，`N=216`、full bonds、超長 operator string 與 64-chain CPU production。
+當前狀態：**40% 均衡版已實作完成，等待 `cpunode02` 空出後補 64-rank native production gate。**
 
 ## 1. 目標與原則
 
@@ -22,6 +23,40 @@ representation，並讓相同 Hamiltonian 的 chains 共用 immutable tables。
 或 sample/checkpoint cadence。GPU backend、SSE、Rényi/work engine 不在第一個
 implementation gate 內；等 standard engine 驗證完成後再共用安全的資料型別與
 model-data abstraction。
+
+### 1.1 已交付的 40% 均衡版
+
+- standard engine 的 operator type 改為 `int8`，operator location 與 alias index
+  依可表示範圍自動選 `uint16`/`uint32`；`N=384` full-bond fallback 已測。
+- grouped alias table 改為 compact SoA，移除無 hot-path reader 的
+  `bond_W_max_all` 與可由 sampled index 推導的 location kind。
+- 移除常駐 `2M` double delta schedule；C++ 按 slice 計算，public API 仍可按需匯出。
+- 限制 event scratch vector 的 retained headroom，避免波動後長期保留近 2× capacity。
+- Python wrapper 不再常駐第二份 full int32 operator string；checkpoint/API
+  仍匯出原有 int32 schema。MPI profile runtime 只建立實際量測點；
+  HDF5 保留舊的 full-ramp dataset，但改為有界 chunk 串流寫入。
+- 新增 fresh-process RSS/capacity/timing probe 及 compact layout、overflow fallback、
+  checkpoint replay、profile-grid tests。
+
+### 1.2 Compute-node A/B 結果
+
+測試於空閒的 `cpunode01` 單核進行，baseline/optimized 使用相同
+portable `x86-64` Release build、`6x6 kagome_bond`、periodic、`N=216`、full
+bonds、`G=600`、seed 42。RSS 在 warmup 後、operator export 前量測。
+
+| `M` | baseline RSS | optimized RSS | process RSS 節省 | baseline s/step | optimized s/step | speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2.76M | 637.61 MiB | 385.04 MiB | **39.61%** | 0.39360 | 0.33298 | **1.182×** |
+| 27.6M | 2201.52 MiB | 1332.60 MiB | **39.47%** | 3.68268 | 3.31169 | **1.112×** |
+
+扣除 Python/MPI process baseline 後，engine incremental RSS 分別降低 42.14% 與
+40.13%。`M=27.6M` optimized logical/capacity core bytes 為 1,353,982,955 /
+1,368,392,311 bytes，顯示實際 RSS 與核心 allocation 計算一致。這個均衡版
+不但沒有速度回歸，在這兩個大 `M` 上還快 11–18%。
+
+`cpunode02` 當時正在執行本帳號的 64-core production job，因此沒有搶佔
+該 node 做 64-rank A/B。這是目前唯一尚未執行的 balanced production gate，
+不影響已完成的單-chain 實作與 correctness gates。
 
 ## 2. 現況記憶體模型
 
@@ -279,30 +314,31 @@ aggressive mutable bytes
 
 ### Phase 0：可重現 memory/performance baseline
 
-- [ ] 新增 standard QAQMC memory probe script。
-- [ ] 報告每個核心 vector 的 `size × sizeof(T)` 與 `capacity × sizeof(T)`。
-- [ ] 報告 process `VmRSS`、`VmHWM`／`ru_maxrss`。
-- [ ] 報告 `f_b`、`f_s`、event counts、alias attempts/slot。
-- [ ] 記錄 init、diagonal、cluster、profile wall time。
-- [ ] 建立 `M=276K / 2.76M / 27.6M` ladder；100M 只做資源允許的 probes。
-- [ ] 保存相同 seed 的 operator string、RNG state 與 phase timing reference。
+- [x] 新增 standard QAQMC memory probe script。
+- [x] 報告每個核心 vector 的 `size × sizeof(T)` 與 `capacity × sizeof(T)`。
+- [x] 報告 process `VmRSS`、`VmHWM`／`ru_maxrss`。
+- [x] 報告 `f_b`、`f_s` 與 event counts；不在 production hot loop 增加 alias-attempt counter。
+- [x] 記錄 init、diagonal、cluster 與 full-step wall time。
+- [x] 完成 `M=2.76M / 27.6M` 大尺度 A/B；100M 保留為後續 fit probe。
+- [x] 保存相同 seed 的 operator string、RNG state 與 phase timing reference。
 
 ### Phase 1：零風險 table cleanup
 
-- [ ] 移除 standard `GroupedAlias::bond_W_max_all`。
-- [ ] 由 alias index 推導 site/bond location。
-- [ ] compact alias arrays，先實作 general uint32，再加入 safe uint16 path。
-- [ ] 驗證 alias histogram、RNG draw count 與 same-seed trajectory。
-- [ ] 驗證 init RSS 與 steady-state RSS。
+- [x] 移除 standard `GroupedAlias::bond_W_max_all`。
+- [x] 由 alias index 推導 site/bond location。
+- [x] compact alias arrays，同時支援 safe uint16 與 general uint32 fallback。
+- [x] 驗證 RNG draw ordering 與 20-step same-seed exact trajectory。
+- [x] 驗證 init RSS 與 steady-state RSS。
 
 ### Phase 2：均衡 per-chain compression
 
-- [ ] 導入 `OpType=int8` internal representation。
-- [ ] 導入 adaptive `OpIndex16/32` representation。
-- [ ] 維持 Python/HDF5/checkpoint backward compatibility。
-- [ ] 移除 materialized `delta_sched_`，完成所有 call-site migration。
-- [ ] 跑 standard、profile、off-diagonal seam/string regression tests。
-- [ ] 跑 production-scale memory/performance A/B。
+- [x] 導入 `OpType=int8` internal representation。
+- [x] 導入 adaptive `OpIndex16/32` representation。
+- [x] 維持 Python/HDF5/checkpoint backward compatibility。
+- [x] 移除 materialized `delta_sched_`，完成所有 standard-engine call-site migration。
+- [x] 通過 standard、profile、off-diagonal seam/string 與 ED regression tests。
+- [x] 在 `cpunode01` 完成單核 production-scale memory/performance A/B。
+- [ ] `cpunode02` 空出後補 64-rank node-throughput A/B。
 
 ### Phase 3：immutable model sharing
 
@@ -329,6 +365,18 @@ aggressive mutable bytes
 - [ ] 各 engine 必須通過自己的 ED、detailed-balance 與 checkpoint gates。
 
 ## 7. Correctness tests
+
+當前結果：
+
+- baseline/optimized 在同 build flags、seed、`M=4096` 下連續 20 步的
+  `op_types`、`op_sites` 與 serialized RNG state 每步完全一致。
+- exported delta schedule bitwise exact；small profile 的 density/Z/C/p-index arrays exact。
+- compact-layout/profile-grid 11 tests 在 Release 與 `_GLIBCXX_ASSERTIONS` build 都通過。
+- seam、half-line/ED sector residence、delta-groups-vs-ED、two-site-vs-ED、
+  string ED/Jarzynski 與 fidelity-susceptibility calibration regression 通過。
+- 4×4 periodic profile CLI 已完成單 rank 取樣、HDF5 與 final-config 輸出。
+- 環境缺少 `libasan` runtime，因此沒有宣稱 ASAN gate 通過；改用
+  `_GLIBCXX_ASSERTIONS` 進行 bounds/invariant 建置驗證。
 
 ### 7.1 Bit-exact structural gates
 
@@ -404,15 +452,15 @@ aggressive mutable bytes
 
 ## 10. 交付項目
 
-- 可重現的 CPU memory/runtime probe。
-- per-array logical/capacity memory report。
-- balanced compact standard engine。
-- backward-compatible Python/checkpoint interface。
-- node-local shared immutable model-data path。
-- optional aggressive event representation與 A/B 結果。
-- 1/8/32/64-chain、M ladder benchmark報告。
-- correctness、RSS、performance regression tests。
-- README/Slurm production設定與 NUMA/core binding說明。
+- [x] 可重現的 CPU memory/runtime probe。
+- [x] per-array logical/capacity memory report。
+- [x] balanced compact standard engine。
+- [x] backward-compatible Python/checkpoint interface。
+- [x] correctness、RSS 與單-chain performance regression tests。
+- [x] README usage 說明。
+- [ ] node-local shared immutable model-data path（Phase 3）。
+- [ ] optional aggressive event representation 與 A/B 結果（Phase 4）。
+- [ ] 1/8/32/64-chain node scaling benchmark 與 NUMA/core-binding 說明。
 
 只有 balanced gates 全部通過後，才把 compact representation設成 default；
 shared model與 aggressive events 仍各自保留獨立 rollback point。

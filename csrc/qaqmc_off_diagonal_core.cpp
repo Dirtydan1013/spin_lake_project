@@ -43,10 +43,10 @@ void QAQMCOffDiagonalCore::set_seam_mask_consistent(QAQMCEngine& eng, uint64_t m
         int first_pm = -1, first_steal = -1;
         for (int p = 0; p < eng.M_total_; ++p) {
             const int ot = eng.op_types_[p];
-            if (ot == -1 && eng.op_sites_[p] == site) parity ^= 1;
-            if (first_pm < 0 && (ot == 1 || ot == -1) && eng.op_sites_[p] == site)
+            if (ot == -1 && eng.op_site_at(p) == site) parity ^= 1;
+            if (first_pm < 0 && (ot == 1 || ot == -1) && eng.op_site_at(p) == site)
                 first_pm = p;
-            if (first_steal < 0 && (ot == 2 || (ot == 1 && eng.op_sites_[p] != site)))
+            if (first_steal < 0 && (ot == 2 || (ot == 1 && eng.op_site_at(p) != site)))
                 first_steal = p;
         }
         const int want = (int)((mask >> k) & 1ULL);
@@ -59,7 +59,7 @@ void QAQMCOffDiagonalCore::set_seam_mask_consistent(QAQMCEngine& eng, uint64_t m
             // configuration is valid but atypical -- caller must decorrelate
             // before measuring, same contract as the SSE core.
             eng.op_types_[first_steal] = -1;
-            eng.op_sites_[first_steal] = site;
+            eng.set_op_site_at(first_steal, site);
             eng.vertex_counts_valid_ = false;
         } else {
             throw std::runtime_error("set_seam_mask_consistent: cannot repair "
@@ -73,7 +73,7 @@ void QAQMCOffDiagonalCore::recompute_seam_snapshots(const QAQMCEngine& eng) {
     if (m_star_ < 0) return;
     std::vector<int32_t> state(eng.N_, 0);
     for (int p = 0; p < m_star_; ++p) {
-        if (eng.op_types_[p] == -1) state[eng.op_sites_[p]] ^= 1;
+        if (eng.op_types_[p] == -1) state[eng.op_site_at(p)] ^= 1;
     }
     state_at_seam_minus_ = state;
     for (size_t k = 0; k < string_sites_.size(); ++k) {
@@ -128,11 +128,11 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
     // (invalid proposal -> caller must reject).  Non-touching bonds
     // contribute nothing and are always "valid".
     auto bond_ratio_touching_site = [&](int p) -> bool {
-        int b = eng.op_sites_[p];
+        int b = eng.op_site_at(p);
         int si = bond_sites[b * 2 + 0];
         int sj = bond_sites[b * 2 + 1];
         if (si != site && sj != site) return true;
-        double delta = eng.delta_sched_[p];  // sequential walk → array read is cheapest
+        double delta = eng.delta_at(p);
         double di = delta * eng.vij_.inv_coord[si];
         double dj = delta * eng.vij_.inv_coord[sj];
         double W[4], wmax;
@@ -150,7 +150,7 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
     if (direction_right) {
         for (int p = m_star_; p < eng.M_total_; ++p) {
             int ot = eng.op_types_[p];
-            if ((ot == 1 || ot == -1) && eng.op_sites_[p] == site) {
+            if ((ot == 1 || ot == -1) && eng.op_site_at(p) == site) {
                 out.terminal_p = p;
                 out.valid = true;
                 out.log_physical_ratio = std::log(ratio) + shift * LOG_1E100;
@@ -159,14 +159,14 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
             if (ot == 2) {
                 if (!bond_ratio_touching_site(p)) return out;
             } else if (ot == -1) {
-                local_state[eng.op_sites_[p]] ^= 1;
+                local_state[eng.op_site_at(p)] ^= 1;
             }
         }
         return out; // hit the right boundary without a terminal: invalid
     } else {
         for (int p = m_star_ - 1; p >= 0; --p) {
             int ot = eng.op_types_[p];
-            if ((ot == 1 || ot == -1) && eng.op_sites_[p] == site) {
+            if ((ot == 1 || ot == -1) && eng.op_site_at(p) == site) {
                 out.terminal_p = p;
                 out.valid = true;
                 out.log_physical_ratio = std::log(ratio) + shift * LOG_1E100;
@@ -175,7 +175,7 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
             if (ot == 2) {
                 if (!bond_ratio_touching_site(p)) return out;
             } else if (ot == -1) {
-                local_state[eng.op_sites_[p]] ^= 1;
+                local_state[eng.op_site_at(p)] ^= 1;
             }
         }
         return out; // hit the left boundary without a terminal: invalid

@@ -3,6 +3,7 @@
 #include <cassert>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 
 // ═════════════════════════════════════════════════════════════════════════════
 // V_ij builder
@@ -277,15 +278,6 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
     pos_dim_ = pos_dim;
     pos_flat_.assign(pos, pos + N * pos_dim);
 
-    // Build delta schedule: delta_min -> delta_max -> delta_min
-    delta_sched_.resize(M_total_);
-    for (int p = 0; p < M_; ++p) {
-        delta_sched_[p] = delta_min + (delta_max - delta_min) * ((double)p / M_);
-    }
-    for (int p = M_; p < M_total_; ++p) {
-        delta_sched_[p] = delta_max - (delta_max - delta_min) * ((double)(p - M_) / M_);
-    }
-
     // Build grouped alias tables
     {
         int G = delta_groups_;
@@ -305,10 +297,19 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
 
         // For each group, find the range of delta values and compute
         // envelope W_max (upper bound) for rejection sampling.
-        grp_alias_.bond_W_max_all.assign(G * n_bonds_pad, 0.0);
         grp_alias_.bond_W_rmax_all.assign(G * n_bonds_pad, 0.0);
         grp_alias_.n_alias_all.resize(G, 0);
-        grp_alias_.entries.assign((size_t)G * max_alias, AliasEntry{0.0, 0, 0});
+        const size_t alias_size = static_cast<size_t>(G) * max_alias;
+        grp_alias_.alias_prob.assign(alias_size, 0.0);
+        grp_alias_.alias_u16 = max_alias <=
+            static_cast<int>(std::numeric_limits<uint16_t>::max()) + 1;
+        if (grp_alias_.alias_u16) {
+            grp_alias_.alias_idx16.assign(alias_size, 0);
+            grp_alias_.alias_idx32.clear();
+        } else {
+            grp_alias_.alias_idx32.assign(alias_size, 0);
+            grp_alias_.alias_idx16.clear();
+        }
 
 #ifdef QAQMC_USE_OPENMP
         #pragma omp parallel for schedule(static)
@@ -322,10 +323,10 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
             // Compute envelope W_max for each bond: max over all delta in group
             // Sample boundary + midpoint deltas for envelope
             std::vector<double> sample_deltas;
-            sample_deltas.push_back(delta_sched_[p_lo]);
-            sample_deltas.push_back(delta_sched_[std::min(p_hi - 1, M_total_ - 1)]);
+            sample_deltas.push_back(delta_at(p_lo));
+            sample_deltas.push_back(delta_at(std::min(p_hi - 1, M_total_ - 1)));
             int p_mid = (p_lo + p_hi) / 2;
-            if (p_mid < M_total_) sample_deltas.push_back(delta_sched_[p_mid]);
+            if (p_mid < M_total_) sample_deltas.push_back(delta_at(p_mid));
 
             std::vector<double> env_W_max(n_bonds, 0.0);
             for (double delta : sample_deltas) {
@@ -340,27 +341,20 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
 
             // Store envelope W_max (+ reciprocal for the acceptance test)
             for (int b = 0; b < n_bonds; ++b) {
-                grp_alias_.bond_W_max_all[g * n_bonds_pad + b] = env_W_max[b];
                 grp_alias_.bond_W_rmax_all[g * n_bonds_pad + b] =
                     (env_W_max[b] > 0.0) ? 1.0 / env_W_max[b] : 0.0;
             }
 
             // Build alias table for this group
             std::vector<double> weights(max_alias);
-            std::vector<int> op_kind(max_alias);
-            std::vector<int> op_loc(max_alias);
             int n_a = 0;
 
             for (int i = 0; i < N_; ++i) {
                 weights[n_a] = Omega / 2.0;
-                op_kind[n_a] = 0;
-                op_loc[n_a] = i;
                 n_a++;
             }
             for (int b = 0; b < n_bonds; ++b) {
                 weights[n_a] = env_W_max[b];
-                op_kind[n_a] = 1;
-                op_loc[n_a] = b;
                 n_a++;
             }
 
@@ -371,7 +365,7 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
             for (int i = 0; i < n_a; ++i) total += weights[i];
 
             std::vector<double> prob_arr(n_a);
-            std::vector<int64_t> alias_arr(n_a);
+            std::vector<int32_t> alias_arr(n_a);
             for (int i = 0; i < n_a; ++i) {
                 prob_arr[i] = weights[i] * n_a / total;
                 alias_arr[i] = i;
@@ -391,18 +385,24 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
                 else large_buf.push_back(l);
             }
 
-            AliasEntry* tab = &grp_alias_.entries[(size_t)g * max_alias];
+            const size_t base = static_cast<size_t>(g) * max_alias;
             for (int i = 0; i < n_a; ++i) {
-                tab[i].prob = prob_arr[i];
-                tab[i].alias = (int32_t)alias_arr[i];
-                tab[i].loc_kind = (op_loc[i] << 1) | op_kind[i];
+                grp_alias_.alias_prob[base + i] = prob_arr[i];
+                if (grp_alias_.alias_u16)
+                    grp_alias_.alias_idx16[base + i] = static_cast<uint16_t>(alias_arr[i]);
+                else
+                    grp_alias_.alias_idx32[base + i] = static_cast<uint32_t>(alias_arr[i]);
             }
         }
     }
 
     // Initialize operator string: all diagonal site ops
     op_types_.assign(M_total_, 1);
-    op_sites_.assign(M_total_, 0);
+    const uint64_t max_location = static_cast<uint64_t>(
+        std::max(N_, std::max(vij_.n_bonds, 1)) - 1);
+    op_sites_u16_ = max_location <= std::numeric_limits<uint16_t>::max();
+    if (op_sites_u16_) op_sites16_.assign(M_total_, 0);
+    else               op_sites32_.assign(M_total_, 0);
 
     // State at midpoint for on-the-fly observables
     state_at_M_.assign(N_, 0);
@@ -418,6 +418,86 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
 
 // ─── Checkpoint helpers ──────────────────────────────────────────────────────
 
+std::vector<double> QAQMCEngine::get_delta_schedule() const {
+    std::vector<double> out(M_total_);
+    for (int p = 0; p < M_total_; ++p) out[p] = delta_at(p);
+    return out;
+}
+
+void QAQMCEngine::export_op_types(int32_t* out, int len) const {
+    if (len != M_total_)
+        throw std::invalid_argument("export_op_types: output length mismatch");
+    for (int p = 0; p < M_total_; ++p)
+        out[p] = static_cast<int32_t>(op_types_[p]);
+}
+
+void QAQMCEngine::export_op_sites(int32_t* out, int len) const {
+    if (len != M_total_)
+        throw std::invalid_argument("export_op_sites: output length mismatch");
+    for (int p = 0; p < M_total_; ++p)
+        out[p] = static_cast<int32_t>(op_site_at(p));
+}
+
+std::map<std::string, uint64_t> QAQMCEngine::get_memory_breakdown() const {
+    std::map<std::string, uint64_t> out;
+    auto record = [&](const std::string& name, uint64_t size_bytes,
+                      uint64_t capacity_bytes) {
+        out[name + "_size_bytes"] = size_bytes;
+        out[name + "_capacity_bytes"] = capacity_bytes;
+    };
+    auto vec_bytes = [&](const std::string& name, const auto& v) {
+        using T = typename std::decay_t<decltype(v)>::value_type;
+        record(name, static_cast<uint64_t>(v.size()) * sizeof(T),
+               static_cast<uint64_t>(v.capacity()) * sizeof(T));
+    };
+
+    vec_bytes("alias_prob", grp_alias_.alias_prob);
+    vec_bytes("alias_idx16", grp_alias_.alias_idx16);
+    vec_bytes("alias_idx32", grp_alias_.alias_idx32);
+    vec_bytes("bond_W_rmax", grp_alias_.bond_W_rmax_all);
+    vec_bytes("n_alias", grp_alias_.n_alias_all);
+    vec_bytes("op_types", op_types_);
+    vec_bytes("op_sites16", op_sites16_);
+    vec_bytes("op_sites32", op_sites32_);
+    vec_bytes("bond_spin", bond_spin_);
+    vec_bytes("site_op_list", site_op_list_);
+    vec_bytes("site_bond_list", site_bond_list_);
+    vec_bytes("site_op_count", site_op_count_);
+    vec_bytes("site_op_head", site_op_head_);
+    vec_bytes("site_bond_count", site_bond_count_);
+    vec_bytes("site_bond_head", site_bond_head_);
+    vec_bytes("spin_now", spin_now_);
+    vec_bytes("seg_flipped", seg_flipped_);
+    record("delta_schedule", 0, 0);
+
+    uint64_t total_size = 0, total_capacity = 0;
+    for (const auto& kv : out) {
+        const std::string& key = kv.first;
+        if (key.size() >= 11 && key.compare(key.size() - 11, 11, "_size_bytes") == 0)
+            total_size += kv.second;
+        else if (key.size() >= 15 &&
+                 key.compare(key.size() - 15, 15, "_capacity_bytes") == 0)
+            total_capacity += kv.second;
+    }
+    out["total_size_bytes"] = total_size;
+    out["total_capacity_bytes"] = total_capacity;
+    out["compact_op_sites"] = op_sites_u16_ ? 1 : 0;
+    out["compact_alias_indices"] = grp_alias_.alias_u16 ? 1 : 0;
+    uint64_t site_ops = 0, bond_ops = 0, offdiag_ops = 0;
+    for (const OpType type : op_types_) {
+        if (type == 2) ++bond_ops;
+        else {
+            ++site_ops;
+            if (type == -1) ++offdiag_ops;
+        }
+    }
+    out["operator_slots"] = static_cast<uint64_t>(M_total_);
+    out["site_operator_count"] = site_ops;
+    out["bond_operator_count"] = bond_ops;
+    out["offdiag_operator_count"] = offdiag_ops;
+    return out;
+}
+
 std::string QAQMCEngine::get_rng_state() const {
     std::ostringstream oss;
     oss << rng_;
@@ -430,9 +510,22 @@ void QAQMCEngine::set_rng_state(const std::string& state_str) {
 }
 
 void QAQMCEngine::set_op_string(const int32_t* types, const int32_t* sites, int len) {
-    if (len != M_total_) return;
-    std::memcpy(op_types_.data(), types, len * sizeof(int32_t));
-    std::memcpy(op_sites_.data(), sites, len * sizeof(int32_t));
+    if (len != M_total_)
+        throw std::invalid_argument("set_op_string: operator string length mismatch");
+    for (int p = 0; p < len; ++p) {
+        const int type = types[p];
+        const int site = sites[p];
+        if (type != -1 && type != 1 && type != 2)
+            throw std::invalid_argument("set_op_string: invalid operator type");
+        const int limit = (type == 2) ? vij_.n_bonds : N_;
+        if (site < 0 || site >= limit)
+            throw std::invalid_argument("set_op_string: operator location out of range");
+    }
+    for (int p = 0; p < len; ++p) {
+        const int type = types[p];
+        op_types_[p] = static_cast<OpType>(type);
+        set_op_site_at(p, sites[p]);
+    }
     // Externally-replaced ops invalidate the counts fused into the last
     // diagonal sweep; build_vertex_lists will re-count.
     vertex_counts_valid_ = false;
@@ -735,7 +828,7 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
 
     for (int p = 0; p < M_total_ && out_idx < n_points; ++p) {
         // Off-diagonal operator: flip the site
-        if (op_types_[p] == -1) state[op_sites_[p]] ^= 1;
+        if (op_types_[p] == -1) state[op_site_at(p)] ^= 1;
 
         if ((p + 1) % profile_step == 0) {
             profile_measure_point(state, out_idx, prof, next_snap, next_occ);
@@ -897,9 +990,6 @@ void QAQMCEngine::set_dimer_sf_measure_p_indices(
         const std::vector<int>& p_indices) {
     dimer_p_indices_.clear();
     dimer_deltas_used_.clear();
-    if (delta_sched_.empty()) {
-        throw std::runtime_error("set_dimer_sf_measure_p_indices: delta schedule not built");
-    }
     for (int p : p_indices) {
         if (p < 0 || p >= M_) {
             throw std::runtime_error(
@@ -910,23 +1000,20 @@ void QAQMCEngine::set_dimer_sf_measure_p_indices(
     // Sort ascending so propagation in measure_dimer_sf is a single forward sweep.
     std::sort(dimer_p_indices_.begin(), dimer_p_indices_.end());
     for (int p : dimer_p_indices_) {
-        dimer_deltas_used_.push_back(delta_sched_[p]);
+        dimer_deltas_used_.push_back(delta_at(p));
     }
 }
 
 void QAQMCEngine::set_dimer_sf_measure_deltas(
         const std::vector<double>& target_deltas) {
-    if (delta_sched_.empty()) {
-        throw std::runtime_error("set_dimer_sf_measure_deltas: delta schedule not built");
-    }
     std::vector<int> p_idx;
     p_idx.reserve(target_deltas.size());
     for (double target : target_deltas) {
         // Forward ramp only: argmin over p ∈ [0, M).
         int best_p = 0;
-        double best_diff = std::abs(delta_sched_[0] - target);
+        double best_diff = std::abs(delta_at(0) - target);
         for (int p = 1; p < M_; ++p) {
-            double d = std::abs(delta_sched_[p] - target);
+            double d = std::abs(delta_at(p) - target);
             if (d < best_diff) { best_diff = d; best_p = p; }
         }
         p_idx.push_back(best_p);
@@ -992,7 +1079,7 @@ QAQMCEngine::DimerSFSample QAQMCEngine::measure_dimer_sf() const {
         }
         // Apply op at slot p to advance state for the next iteration.
         if (p < M_total_ && op_types_[p] == -1) {
-            state[op_sites_[p]] ^= 1;
+            state[op_site_at(p)] ^= 1;
         }
     }
     (void)0;  // silence unused-var warnings if any
@@ -1065,34 +1152,32 @@ void QAQMCEngine::diagonal_update_profiled(ProfileObservables* prof, int profile
 
         int ot = op_types_[p];
         if (ot == -1) {
-            int s = op_sites_[p];
+            int s = op_site_at(p);
             state[s] ^= 1;
             site_op_count_[s]++;
         } else if (ot == 1 || ot == 2) {
             int n_alias_g = grp_alias_.n_alias_all[g];
-            const AliasEntry* tab = &grp_alias_.entries[(size_t)g * max_alias];
+            const size_t alias_base = static_cast<size_t>(g) * max_alias;
+            const double* alias_prob = grp_alias_.alias_prob.data() + alias_base;
             const double* rmax_g = &grp_alias_.bond_W_rmax_all[(size_t)g * n_bonds_pad];
             // delta depends only on the slice: hoist out of the rejection loop.
-            // Sequential array read — cheaper than recomputing per attempt.
-            const double delta = delta_sched_[p];
+            const double delta = delta_at(p);
 
             bool inserted = false;
             while (!inserted) {
                 int i = randint(rng_, n_alias_g);
-                const AliasEntry& e = tab[i];
-                int idx = (uniform01(rng_) < e.prob) ? i : (int)e.alias;
-                int lk = tab[idx].loc_kind;
-                int loc = lk >> 1;
+                int idx = (uniform01(rng_) < alias_prob[i])
+                    ? i : grp_alias_.alias_at(alias_base + i);
 
-                if ((lk & 1) == 0) {
+                if (idx < N_) {
                     // Site op: always accept
                     op_types_[p] = 1;
-                    op_sites_[p] = loc;
-                    site_op_count_[loc]++;
+                    set_op_site_at(p, idx);
+                    site_op_count_[idx]++;
                     inserted = true;
                 } else {
                     // Bond op: rejection with real per-slice weights
-                    int b = loc;
+                    int b = idx - N_;
                     int si = bond_sites[b * 2 + 0];
                     int sj = bond_sites[b * 2 + 1];
                     int w_idx = state[si] * 2 + state[sj];
@@ -1107,7 +1192,7 @@ void QAQMCEngine::diagonal_update_profiled(ProfileObservables* prof, int profile
                     // rmax == 0 when the envelope is <= 0, making the test false).
                     if (uniform01(rng_) < W[w_idx] * rmax_g[b]) {
                         op_types_[p] = 2;
-                        op_sites_[p] = b;
+                        set_op_site_at(p, b);
                         site_bond_count_[si]++;
                         site_bond_count_[sj]++;
                         inserted = true;
@@ -1135,6 +1220,28 @@ void QAQMCEngine::diagonal_update_profiled(ProfileObservables* prof, int profile
 // pass here is additionally fused with the former cluster Phase B: it
 // propagates spin_now_ and records bond_spin_[p] in the same sweep.
 
+template <typename T>
+static void resize_scratch_with_bounded_headroom(std::vector<T>& v,
+                                                 size_t required) {
+    // std::vector::resize commonly doubles capacity when a stationary event
+    // count fluctuates just above the previous high-water mark.  For an O(M)
+    // bond-event list that can retain almost a second full copy forever.
+    // These lists are scratch and overwritten immediately, so allocate a
+    // small explicit cushion without copying the old contents.
+    const size_t growth_headroom = std::max<size_t>(1024, required / 64); // ~1.6%
+    const size_t shrink_slack = std::max<size_t>(4096, required / 8);     // 12.5%
+    const bool must_grow = required > v.capacity();
+    const bool materially_oversized = v.capacity() > required + shrink_slack;
+    if (must_grow || materially_oversized) {
+        std::vector<T> replacement;
+        replacement.reserve(required + growth_headroom);
+        replacement.resize(required);
+        v.swap(replacement);
+    } else {
+        v.resize(required);
+    }
+}
+
 void QAQMCEngine::build_vertex_lists() {
     const int M = M_total_, N = N_;
     const int* bond_sites = vij_.bond_sites_flat.data();
@@ -1145,9 +1252,9 @@ void QAQMCEngine::build_vertex_lists() {
         for (int p = 0; p < M; ++p) {
             int ot = op_types_[p];
             if (ot == 1 || ot == -1) {
-                site_op_count_[op_sites_[p]]++;
+                site_op_count_[op_site_at(p)]++;
             } else if (ot == 2) {
-                int b  = op_sites_[p];
+                int b  = op_site_at(p);
                 site_bond_count_[bond_sites[b * 2 + 0]]++;
                 site_bond_count_[bond_sites[b * 2 + 1]]++;
             }
@@ -1163,8 +1270,10 @@ void QAQMCEngine::build_vertex_lists() {
     int total_sops  = site_op_head_[N-1]   + site_op_count_[N-1];
     int total_bents = site_bond_head_[N-1] + site_bond_count_[N-1];
 
-    site_op_list_.resize(total_sops);
-    site_bond_list_.resize(total_bents);
+    resize_scratch_with_bounded_headroom(site_op_list_,
+                                         static_cast<size_t>(total_sops));
+    resize_scratch_with_bounded_headroom(site_bond_list_,
+                                         static_cast<size_t>(total_bents));
 
     std::vector<int32_t> cur_op(N, 0);
     std::vector<int32_t> cur_bond(N, 0);
@@ -1179,11 +1288,11 @@ void QAQMCEngine::build_vertex_lists() {
 
         int ot = op_types_[p];
         if (ot == 1 || ot == -1) {
-            int s = op_sites_[p];
+            int s = op_site_at(p);
             site_op_list_[site_op_head_[s] + cur_op[s]++] = p;
             if (ot == -1) spin_now_[s] ^= 1;
         } else if (ot == 2) {
-            int b  = op_sites_[p];
+            int b  = op_site_at(p);
             int si = bond_sites[b * 2 + 0];
             int sj = bond_sites[b * 2 + 1];
             bond_spin_[p] = spin_now_[si] * 2 + spin_now_[sj];
