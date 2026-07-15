@@ -122,9 +122,13 @@ if(QAQMC_ENABLE_CUDA)
         csrc/cuda/bindings_cuda_runtime.cpp
         csrc/cuda/bindings_cuda_diagonal.cpp
         csrc/cuda/bindings_cuda_renyi.cpp
+        csrc/cuda/bindings_cuda_batch_diagonal.cpp
+        csrc/cuda/bindings_cuda_batch_renyi.cpp
         csrc/cuda/qaqmc_cuda_scan.cu
         csrc/cuda/qaqmc_cuda_diagonal.cu
         csrc/cuda/qaqmc_cuda_renyi.cu
+        csrc/cuda/qaqmc_cuda_batch_diagonal.cu
+        csrc/cuda/qaqmc_cuda_batch_renyi.cu
     )
     target_include_directories(qaqmc_cuda PRIVATE csrc/cuda)
     target_link_libraries(qaqmc_cuda PRIVATE CUDA::cudart)
@@ -141,5 +145,9 @@ if(QAQMC_ENABLE_CUDA)
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        # Batch engines launch independent chains from separate host threads.
+        # Per-thread default streams let those kernels overlap without changing
+        # the established single-chain launch signatures.
+        $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
     )
 endif()

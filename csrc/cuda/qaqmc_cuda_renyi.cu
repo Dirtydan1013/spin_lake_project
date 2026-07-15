@@ -55,6 +55,10 @@ RenyiEngine::RenyiEngine(int n_sites,
     x.max_alias = max_alias;
     x.n_bonds = n_bonds;
     x.n_tiles = (x.length + kBlockSize - 1) / kBlockSize;
+    x.model = make_device_hamiltonian(
+        n_sites, delta_min, delta_max, epsilon, n_groups, max_alias, n_bonds,
+        host_bond_sites, host_bond_vij, host_inv_coord, host_alias_prob,
+        host_alias_index, host_alias_loc_kind, host_bond_rmax, device_index);
     switch (x.words) {
         case 1: x.scan_temp_bytes = dual_tile_scan_temp_bytes<1>(x.n_tiles); break;
         case 2: x.scan_temp_bytes = dual_tile_scan_temp_bytes<2>(x.n_tiles); break;
@@ -67,15 +71,17 @@ RenyiEngine::RenyiEngine(int n_sites,
     const std::size_t two_l = 2 * x.length;
     x.types = DeviceBuffer<int32_t>(two_l);
     x.sites = DeviceBuffer<int32_t>(two_l);
-    x.bond_sites = DeviceBuffer<int32_t>(static_cast<std::size_t>(2) * n_bonds);
-    x.bond_vij = DeviceBuffer<double>(n_bonds);
-    x.inv_coord = DeviceBuffer<double>(n_sites);
     const std::size_t alias_count = static_cast<std::size_t>(n_groups) * max_alias;
     const std::size_t rmax_count = static_cast<std::size_t>(n_groups) * n_bonds;
-    x.alias_prob = DeviceBuffer<double>(alias_count);
-    x.alias_index = DeviceBuffer<int32_t>(alias_count);
-    x.alias_loc_kind = DeviceBuffer<int32_t>(alias_count);
-    x.bond_rmax = DeviceBuffer<double>(rmax_count);
+    x.bond_sites = DeviceBuffer<int32_t>::view(
+        x.model->bond_sites.get(), static_cast<std::size_t>(2) * n_bonds);
+    x.bond_vij = DeviceBuffer<double>::view(x.model->bond_vij.get(), n_bonds);
+    x.inv_coord = DeviceBuffer<double>::view(x.model->inv_coord.get(), n_sites);
+    x.alias_prob = DeviceBuffer<double>::view(x.model->alias_prob.get(), alias_count);
+    x.alias_index = DeviceBuffer<int32_t>::view(x.model->alias_index.get(), alias_count);
+    x.alias_loc_kind = DeviceBuffer<int32_t>::view(
+        x.model->alias_loc_kind.get(), alias_count);
+    x.bond_rmax = DeviceBuffer<double>::view(x.model->bond_rmax.get(), rmax_count);
     x.mask_words = DeviceBuffer<uint64_t>(x.words);
     const std::size_t tile_bytes = x.n_tiles * 2 * x.words * sizeof(uint64_t);
     x.tile_parity = DeviceBuffer<uint8_t>(tile_bytes);
@@ -91,29 +97,6 @@ RenyiEngine::RenyiEngine(int n_sites,
                           cudaMemcpyHostToDevice), "copy Renyi operator types");
     check_cuda(cudaMemcpy(x.sites.get(), host_sites, two_l * sizeof(int32_t),
                           cudaMemcpyHostToDevice), "copy Renyi operator sites");
-    if (n_bonds > 0) {
-        check_cuda(cudaMemcpy(x.bond_sites.get(), host_bond_sites,
-                              static_cast<std::size_t>(2) * n_bonds * sizeof(int32_t),
-                              cudaMemcpyHostToDevice), "copy Renyi bond sites");
-        check_cuda(cudaMemcpy(x.bond_vij.get(), host_bond_vij,
-                              static_cast<std::size_t>(n_bonds) * sizeof(double),
-                              cudaMemcpyHostToDevice), "copy Renyi bond strengths");
-        check_cuda(cudaMemcpy(x.bond_rmax.get(), host_bond_rmax,
-                              rmax_count * sizeof(double), cudaMemcpyHostToDevice),
-                   "copy Renyi bond envelopes");
-    }
-    check_cuda(cudaMemcpy(x.inv_coord.get(), host_inv_coord,
-                          static_cast<std::size_t>(n_sites) * sizeof(double),
-                          cudaMemcpyHostToDevice), "copy Renyi inverse coordination");
-    check_cuda(cudaMemcpy(x.alias_prob.get(), host_alias_prob,
-                          alias_count * sizeof(double), cudaMemcpyHostToDevice),
-               "copy Renyi alias probabilities");
-    check_cuda(cudaMemcpy(x.alias_index.get(), host_alias_index,
-                          alias_count * sizeof(int32_t), cudaMemcpyHostToDevice),
-               "copy Renyi alias indices");
-    check_cuda(cudaMemcpy(x.alias_loc_kind.get(), host_alias_loc_kind,
-                          alias_count * sizeof(int32_t), cudaMemcpyHostToDevice),
-               "copy Renyi alias locations");
     check_cuda(cudaMemset(x.mask_words.get(), 0,
                           static_cast<std::size_t>(x.words) * sizeof(uint64_t)),
                "clear Renyi mask");
@@ -642,5 +625,6 @@ std::size_t RenyiEngine::length() const { return impl_->length; }
 int RenyiEngine::cut() const { return impl_->cut; }
 int RenyiEngine::packed_words() const { return impl_->words; }
 std::size_t RenyiEngine::device_bytes() const { return impl_->allocated_bytes(); }
+
 
 }  // namespace qaqmc_cuda

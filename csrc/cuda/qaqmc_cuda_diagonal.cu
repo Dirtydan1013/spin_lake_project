@@ -53,6 +53,10 @@ DiagonalEngine::DiagonalEngine(int n_sites,
     x.max_alias = max_alias;
     x.n_bonds = n_bonds;
     x.n_tiles = (x.length + kBlockSize - 1) / kBlockSize;
+    x.model = make_device_hamiltonian(
+        n_sites, delta_min, delta_max, epsilon, n_groups, max_alias, n_bonds,
+        host_bond_sites, host_bond_vij, host_inv_coord, host_alias_prob,
+        host_alias_index, host_alias_loc_kind, host_bond_rmax, device_index);
 
     switch (x.words) {
         case 1: x.scan_temp_bytes = tile_scan_temp_bytes<1>(x.n_tiles); break;
@@ -66,15 +70,17 @@ DiagonalEngine::DiagonalEngine(int n_sites,
 
     x.types = DeviceBuffer<int32_t>(x.length);
     x.sites = DeviceBuffer<int32_t>(x.length);
-    x.bond_sites = DeviceBuffer<int32_t>(static_cast<std::size_t>(2) * n_bonds);
-    x.bond_vij = DeviceBuffer<double>(n_bonds);
-    x.inv_coord = DeviceBuffer<double>(n_sites);
     const std::size_t alias_count = static_cast<std::size_t>(n_groups) * max_alias;
     const std::size_t rmax_count = static_cast<std::size_t>(n_groups) * n_bonds;
-    x.alias_prob = DeviceBuffer<double>(alias_count);
-    x.alias_index = DeviceBuffer<int32_t>(alias_count);
-    x.alias_loc_kind = DeviceBuffer<int32_t>(alias_count);
-    x.bond_rmax = DeviceBuffer<double>(rmax_count);
+    x.bond_sites = DeviceBuffer<int32_t>::view(
+        x.model->bond_sites.get(), static_cast<std::size_t>(2) * n_bonds);
+    x.bond_vij = DeviceBuffer<double>::view(x.model->bond_vij.get(), n_bonds);
+    x.inv_coord = DeviceBuffer<double>::view(x.model->inv_coord.get(), n_sites);
+    x.alias_prob = DeviceBuffer<double>::view(x.model->alias_prob.get(), alias_count);
+    x.alias_index = DeviceBuffer<int32_t>::view(x.model->alias_index.get(), alias_count);
+    x.alias_loc_kind = DeviceBuffer<int32_t>::view(
+        x.model->alias_loc_kind.get(), alias_count);
+    x.bond_rmax = DeviceBuffer<double>::view(x.model->bond_rmax.get(), rmax_count);
     const std::size_t tile_bytes = x.n_tiles * x.words * sizeof(uint64_t);
     x.tile_parity = DeviceBuffer<uint8_t>(tile_bytes);
     x.tile_prefix = DeviceBuffer<uint8_t>(tile_bytes);
@@ -90,31 +96,7 @@ DiagonalEngine::DiagonalEngine(int n_sites,
                "clear seam words");
     check_cuda(cudaMemset(x.seam_mask.get(), 0, sizeof(uint64_t)),
                "clear seam mask");
-
     set_operator_string(host_types, host_sites);
-    if (n_bonds > 0) {
-        check_cuda(cudaMemcpy(x.bond_sites.get(), host_bond_sites,
-                              static_cast<std::size_t>(2) * n_bonds * sizeof(int32_t),
-                              cudaMemcpyHostToDevice), "copy bond sites to device");
-        check_cuda(cudaMemcpy(x.bond_vij.get(), host_bond_vij,
-                              static_cast<std::size_t>(n_bonds) * sizeof(double),
-                              cudaMemcpyHostToDevice), "copy bond strengths to device");
-        check_cuda(cudaMemcpy(x.bond_rmax.get(), host_bond_rmax,
-                              rmax_count * sizeof(double), cudaMemcpyHostToDevice),
-                   "copy bond envelopes to device");
-    }
-    check_cuda(cudaMemcpy(x.inv_coord.get(), host_inv_coord,
-                          static_cast<std::size_t>(n_sites) * sizeof(double),
-                          cudaMemcpyHostToDevice), "copy inverse coordination to device");
-    check_cuda(cudaMemcpy(x.alias_prob.get(), host_alias_prob,
-                          alias_count * sizeof(double), cudaMemcpyHostToDevice),
-               "copy alias probabilities to device");
-    check_cuda(cudaMemcpy(x.alias_index.get(), host_alias_index,
-                          alias_count * sizeof(int32_t), cudaMemcpyHostToDevice),
-               "copy alias indices to device");
-    check_cuda(cudaMemcpy(x.alias_loc_kind.get(), host_alias_loc_kind,
-                          alias_count * sizeof(int32_t), cudaMemcpyHostToDevice),
-               "copy alias locations to device");
 }
 
 DiagonalEngine::~DiagonalEngine() = default;
@@ -707,5 +689,6 @@ int DiagonalEngine::string_site_count() const {
     return static_cast<int>(impl_->host_string_sites.size());
 }
 int DiagonalEngine::seam_cut() const { return impl_->seam_cut; }
+
 
 }  // namespace qaqmc_cuda

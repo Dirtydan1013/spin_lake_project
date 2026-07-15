@@ -75,6 +75,66 @@ public:
     std::size_t device_bytes() const;
 
 private:
+    friend class BatchedDiagonalEngine;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// One CUDA process managing B statistically independent standard or
+// off-diagonal chains. Immutable Hamiltonian/alias tables are shared once;
+// operator strings, workspaces, topology state and checkpoints are per-chain.
+class BatchedDiagonalEngine {
+public:
+    BatchedDiagonalEngine(
+        int batch_size,
+        int n_sites,
+        int half_length,
+        double delta_min,
+        double delta_max,
+        double epsilon,
+        int n_groups,
+        int max_alias,
+        int n_bonds,
+        const int32_t* bond_sites,
+        const double* bond_vij,
+        const double* inv_coord,
+        const double* alias_prob,
+        const int32_t* alias_index,
+        const int32_t* alias_loc_kind,
+        const double* bond_rmax,
+        const int32_t* op_types_bxl,
+        const int32_t* op_sites_bxl,
+        int device_index = 0);
+    ~BatchedDiagonalEngine();
+
+    BatchedDiagonalEngine(const BatchedDiagonalEngine&) = delete;
+    BatchedDiagonalEngine& operator=(const BatchedDiagonalEngine&) = delete;
+    BatchedDiagonalEngine(BatchedDiagonalEngine&&) noexcept;
+    BatchedDiagonalEngine& operator=(BatchedDiagonalEngine&&) noexcept;
+
+    std::vector<DiagonalStats> diagonal_update(
+        const uint64_t* seeds, const uint64_t* sweep_ids);
+    std::vector<ClusterStats> cluster_update(
+        const uint64_t* seeds, const uint64_t* sweep_ids);
+    void set_string_sites(const int32_t* sites, int count, int m_star);
+    void set_seam_masks_consistent(const uint64_t* masks);
+    std::vector<TopologyStats> topology_sweep(
+        double lambda, const uint64_t* seeds, const uint64_t* sweep_ids);
+    void save_checkpoint();
+    void restore_checkpoint();
+    bool has_checkpoint() const;
+    void get_operator_strings(int32_t* types_bxl, int32_t* sites_bxl) const;
+    void set_operator_strings(const int32_t* types_bxl, const int32_t* sites_bxl);
+    void get_profile_states(int profile_step, uint64_t* output_bxpxw) const;
+    void get_seam_masks(uint64_t* masks) const;
+
+    int batch_size() const;
+    int n_sites() const;
+    std::size_t length() const;
+    std::size_t shared_model_bytes() const;
+    std::size_t device_bytes() const;
+
+private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

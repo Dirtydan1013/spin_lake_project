@@ -7,6 +7,7 @@
 namespace qaqmc_cuda {
 using namespace detail;
 struct RenyiEngine::Impl {
+    std::shared_ptr<DeviceHamiltonian> model;
     int device_index{0};
     int n_sites{0};
     int half_length{0};
@@ -54,11 +55,8 @@ struct RenyiEngine::Impl {
     DeviceBuffer<int32_t> checkpoint_types, checkpoint_sites;
     bool checkpoint_valid{false};
 
-    std::size_t allocated_bytes() const {
-        return (types.size() + sites.size() + bond_sites.size()) * sizeof(int32_t)
-             + (bond_vij.size() + inv_coord.size() + alias_prob.size()
-                + bond_rmax.size()) * sizeof(double)
-             + (alias_index.size() + alias_loc_kind.size()) * sizeof(int32_t)
+    std::size_t state_bytes() const {
+        return (types.size() + sites.size()) * sizeof(int32_t)
              + mask_words.size() * sizeof(uint64_t)
              + tile_parity.size() + tile_prefix.size() + scan_temp.size()
              + diagonal_stats.size() * sizeof(DeviceDiagonalStats)
@@ -78,6 +76,10 @@ struct RenyiEngine::Impl {
              + topology_stats.size() * sizeof(DeviceTopologyStats)
              + topology_ratio.size() * sizeof(DeviceTopologyRatio)
              + (checkpoint_types.size() + checkpoint_sites.size()) * sizeof(int32_t);
+    }
+
+    std::size_t allocated_bytes() const {
+        return state_bytes() + (model ? model->allocated_bytes() : 0);
     }
 };
 

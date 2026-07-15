@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -62,20 +63,29 @@ public:
         }
     }
     ~DeviceBuffer() {
-        if (ptr_) cudaFree(ptr_);
+        if (ptr_ && owns_) cudaFree(ptr_);
     }
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
     DeviceBuffer(DeviceBuffer&& other) noexcept
         : ptr_(std::exchange(other.ptr_, nullptr)),
-          count_(std::exchange(other.count_, 0)) {}
+          count_(std::exchange(other.count_, 0)),
+          owns_(std::exchange(other.owns_, true)) {}
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
         if (this != &other) {
-            if (ptr_) cudaFree(ptr_);
+            if (ptr_ && owns_) cudaFree(ptr_);
             ptr_ = std::exchange(other.ptr_, nullptr);
             count_ = std::exchange(other.count_, 0);
+            owns_ = std::exchange(other.owns_, true);
         }
         return *this;
+    }
+    static DeviceBuffer view(T* ptr, std::size_t count) {
+        DeviceBuffer result;
+        result.ptr_ = ptr;
+        result.count_ = count;
+        result.owns_ = false;
+        return result;
     }
     T* get() { return ptr_; }
     const T* get() const { return ptr_; }
@@ -84,7 +94,110 @@ public:
 private:
     T* ptr_{nullptr};
     std::size_t count_{0};
+    bool owns_{true};
 };
+
+// Immutable Hamiltonian and proposal tables shared by every chain in one
+// batched engine.  Keeping this object reference-counted prevents B chains
+// from duplicating the O(G * (N + Nbonds)) alias/envelope data on the GPU.
+struct DeviceHamiltonian {
+    int device_index{0};
+    int n_sites{0};
+    double delta_min{0.0};
+    double delta_max{0.0};
+    double epsilon{0.0};
+    int n_groups{0};
+    int max_alias{0};
+    int n_bonds{0};
+
+    DeviceBuffer<int32_t> bond_sites;
+    DeviceBuffer<double> bond_vij;
+    DeviceBuffer<double> inv_coord;
+    DeviceBuffer<double> alias_prob;
+    DeviceBuffer<int32_t> alias_index;
+    DeviceBuffer<int32_t> alias_loc_kind;
+    DeviceBuffer<double> bond_rmax;
+
+    std::size_t allocated_bytes() const {
+        return bond_sites.size() * sizeof(int32_t)
+             + bond_vij.size() * sizeof(double)
+             + inv_coord.size() * sizeof(double)
+             + alias_prob.size() * sizeof(double)
+             + alias_index.size() * sizeof(int32_t)
+             + alias_loc_kind.size() * sizeof(int32_t)
+             + bond_rmax.size() * sizeof(double);
+    }
+};
+
+inline std::shared_ptr<DeviceHamiltonian> make_device_hamiltonian(
+    int n_sites,
+    double delta_min,
+    double delta_max,
+    double epsilon,
+    int n_groups,
+    int max_alias,
+    int n_bonds,
+    const int32_t* host_bond_sites,
+    const double* host_bond_vij,
+    const double* host_inv_coord,
+    const double* host_alias_prob,
+    const int32_t* host_alias_index,
+    const int32_t* host_alias_loc_kind,
+    const double* host_bond_rmax,
+    int device_index) {
+    if (n_sites <= 0 || n_sites > 64 * kMaxWords)
+        throw std::invalid_argument("n_sites must be in [1, 384]");
+    if (n_groups <= 0 || max_alias <= 0)
+        throw std::invalid_argument("n_groups and max_alias must be positive");
+    if (n_bonds < 0)
+        throw std::invalid_argument("n_bonds must be non-negative");
+    if (max_alias != n_sites + n_bonds)
+        throw std::invalid_argument("max_alias must equal n_sites + n_bonds");
+
+    check_cuda(cudaSetDevice(device_index), "cudaSetDevice for shared model");
+    auto model = std::make_shared<DeviceHamiltonian>();
+    model->device_index = device_index;
+    model->n_sites = n_sites;
+    model->delta_min = delta_min;
+    model->delta_max = delta_max;
+    model->epsilon = epsilon;
+    model->n_groups = n_groups;
+    model->max_alias = max_alias;
+    model->n_bonds = n_bonds;
+    model->bond_sites = DeviceBuffer<int32_t>(static_cast<std::size_t>(2) * n_bonds);
+    model->bond_vij = DeviceBuffer<double>(n_bonds);
+    model->inv_coord = DeviceBuffer<double>(n_sites);
+    const std::size_t alias_count = static_cast<std::size_t>(n_groups) * max_alias;
+    const std::size_t rmax_count = static_cast<std::size_t>(n_groups) * n_bonds;
+    model->alias_prob = DeviceBuffer<double>(alias_count);
+    model->alias_index = DeviceBuffer<int32_t>(alias_count);
+    model->alias_loc_kind = DeviceBuffer<int32_t>(alias_count);
+    model->bond_rmax = DeviceBuffer<double>(rmax_count);
+    if (n_bonds > 0) {
+        check_cuda(cudaMemcpy(model->bond_sites.get(), host_bond_sites,
+                              static_cast<std::size_t>(2) * n_bonds * sizeof(int32_t),
+                              cudaMemcpyHostToDevice), "copy shared bond sites");
+        check_cuda(cudaMemcpy(model->bond_vij.get(), host_bond_vij,
+                              static_cast<std::size_t>(n_bonds) * sizeof(double),
+                              cudaMemcpyHostToDevice), "copy shared bond strengths");
+        check_cuda(cudaMemcpy(model->bond_rmax.get(), host_bond_rmax,
+                              rmax_count * sizeof(double), cudaMemcpyHostToDevice),
+                   "copy shared bond envelopes");
+    }
+    check_cuda(cudaMemcpy(model->inv_coord.get(), host_inv_coord,
+                          static_cast<std::size_t>(n_sites) * sizeof(double),
+                          cudaMemcpyHostToDevice), "copy shared inverse coordination");
+    check_cuda(cudaMemcpy(model->alias_prob.get(), host_alias_prob,
+                          alias_count * sizeof(double), cudaMemcpyHostToDevice),
+               "copy shared alias probabilities");
+    check_cuda(cudaMemcpy(model->alias_index.get(), host_alias_index,
+                          alias_count * sizeof(int32_t), cudaMemcpyHostToDevice),
+               "copy shared alias indices");
+    check_cuda(cudaMemcpy(model->alias_loc_kind.get(), host_alias_loc_kind,
+                          alias_count * sizeof(int32_t), cudaMemcpyHostToDevice),
+               "copy shared alias locations");
+    return model;
+}
 
 struct DeviceDiagonalStats {
     unsigned long long updated_slots;

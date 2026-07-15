@@ -70,6 +70,66 @@ public:
     std::size_t device_bytes() const;
 
 private:
+    friend class BatchedRenyiEngine;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Batched two-replica work engine. Each chain owns two operator strings and
+// its own mask/topology/checkpoint state while the immutable model is shared.
+class BatchedRenyiEngine {
+public:
+    BatchedRenyiEngine(
+        int batch_size,
+        int n_sites,
+        int half_length,
+        double delta_min,
+        double delta_max,
+        double epsilon,
+        int n_groups,
+        int max_alias,
+        int n_bonds,
+        const int32_t* bond_sites,
+        const double* bond_vij,
+        const double* inv_coord,
+        const double* alias_prob,
+        const int32_t* alias_index,
+        const int32_t* alias_loc_kind,
+        const double* bond_rmax,
+        const int32_t* op_types_bx2xl,
+        const int32_t* op_sites_bx2xl,
+        int device_index = 0);
+    ~BatchedRenyiEngine();
+
+    BatchedRenyiEngine(const BatchedRenyiEngine&) = delete;
+    BatchedRenyiEngine& operator=(const BatchedRenyiEngine&) = delete;
+    BatchedRenyiEngine(BatchedRenyiEngine&&) noexcept;
+    BatchedRenyiEngine& operator=(BatchedRenyiEngine&&) noexcept;
+
+    void set_cut(int cut);
+    void set_masks(const uint8_t* masks_bxn);
+    void get_masks(uint8_t* masks_bxn) const;
+    std::vector<DiagonalStats> diagonal_update(
+        const uint64_t* seeds, const uint64_t* sweep_ids);
+    std::vector<ClusterStats> cluster_update(
+        const uint64_t* seeds, const uint64_t* sweep_ids);
+    std::vector<TopologyStats> topology_sweep(
+        const int32_t* topology_sites, int count, double lambda,
+        const uint64_t* seeds, const uint64_t* sweep_ids);
+    void save_checkpoint();
+    void restore_checkpoint();
+    bool has_checkpoint() const;
+    void get_operator_strings(int32_t* types_bx2xl, int32_t* sites_bx2xl) const;
+    void set_operator_strings(
+        const int32_t* types_bx2xl, const int32_t* sites_bx2xl);
+
+    int batch_size() const;
+    int n_sites() const;
+    std::size_t length() const;
+    std::size_t shared_model_bytes() const;
+    std::size_t device_bytes() const;
+
+private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

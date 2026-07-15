@@ -7,6 +7,7 @@
 namespace qaqmc_cuda {
 using namespace detail;
 struct DiagonalEngine::Impl {
+    std::shared_ptr<DeviceHamiltonian> model;
     int device_index;
     int n_sites;
     int half_length;
@@ -69,16 +70,9 @@ struct DiagonalEngine::Impl {
     DeviceBuffer<DeviceClusterStats> cluster_stats;
     DeviceBuffer<uint64_t> profile_output;
 
-    std::size_t allocated_bytes() const {
+    std::size_t state_bytes() const {
         return types.size() * sizeof(int32_t)
              + sites.size() * sizeof(int32_t)
-             + bond_sites.size() * sizeof(int32_t)
-             + bond_vij.size() * sizeof(double)
-             + inv_coord.size() * sizeof(double)
-             + alias_prob.size() * sizeof(double)
-             + alias_index.size() * sizeof(int32_t)
-             + alias_loc_kind.size() * sizeof(int32_t)
-             + bond_rmax.size() * sizeof(double)
              + tile_parity.size() + tile_prefix.size() + scan_temp.size()
              + stats.size() * sizeof(DeviceDiagonalStats)
              + string_sites.size() * sizeof(int32_t)
@@ -108,6 +102,10 @@ struct DiagonalEngine::Impl {
              + segment_flags.size()
              + cluster_stats.size() * sizeof(DeviceClusterStats)
              + profile_output.size() * sizeof(uint64_t);
+    }
+
+    std::size_t allocated_bytes() const {
+        return state_bytes() + (model ? model->allocated_bytes() : 0);
     }
 };
 

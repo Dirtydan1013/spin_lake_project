@@ -9,4 +9,6 @@ PYBIND11_MODULE(qaqmc_cuda, module) {
     qaqmc_cuda::bindings::bind_runtime(module);
     qaqmc_cuda::bindings::bind_diagonal_engine(module);
     qaqmc_cuda::bindings::bind_renyi_engine(module);
+    qaqmc_cuda::bindings::bind_batched_diagonal_engine(module);
+    qaqmc_cuda::bindings::bind_batched_renyi_engine(module);
 }
