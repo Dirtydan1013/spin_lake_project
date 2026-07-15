@@ -119,7 +119,12 @@ if(QAQMC_ENABLE_CUDA)
 
     pybind11_add_module(qaqmc_cuda
         csrc/cuda/bindings_cuda.cpp
+        csrc/cuda/bindings_cuda_runtime.cpp
+        csrc/cuda/bindings_cuda_diagonal.cpp
+        csrc/cuda/bindings_cuda_renyi.cpp
         csrc/cuda/qaqmc_cuda_scan.cu
+        csrc/cuda/qaqmc_cuda_diagonal.cu
+        csrc/cuda/qaqmc_cuda_renyi.cu
     )
     target_include_directories(qaqmc_cuda PRIVATE csrc/cuda)
     target_link_libraries(qaqmc_cuda PRIVATE CUDA::cudart)
