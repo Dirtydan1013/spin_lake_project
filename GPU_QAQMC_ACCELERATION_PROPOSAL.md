@@ -1,10 +1,10 @@
 # QAQMC GPU 加速提案：從 prefix-XOR diagonal update 到 device-resident cluster update
 
-狀態：M0–M5 已實作，M6 production hardening 進行中（`gpu_version` branch）
-範圍：`QAQMCEngine` single-replica diagonal/profile engine，先不涵蓋 Renyi、work protocol 與 off-diagonal string seam  
+狀態：standard 與兩個 work-engine CUDA core 已實作，real-GPU production hardening 進行中（`gpu_version` branch）
+範圍：原始設計以 `QAQMCEngine` single-replica diagonal/profile 為主；2026-07-15 已延伸至 off-diagonal string-work 與 two-replica Rényi-work（見 §16）
 基準版本：`z2_spin_lake` commit `31d6c5c`
 
-## 0. 2026-07-14 實作結果
+## 0. 2026-07-15 實作結果
 
 目前 branch 已不只是可行性提案。以下路徑已完成並在 gpunode02 V100
 通過 exact/invariant tests：
@@ -36,10 +36,10 @@ CPU core/GPU 上測量：
 與 checkpoint 不在每個 transition step 的 22.05 ms 內，production
 throughput仍取決於 measurement cadence 與 filesystem。
 
-目前刻意未宣稱完成的範圍是 off-diagonal seam/string、Rényi replica/work
-engine，以及 occupation-SF matrix 的 device-side accumulation；它們不應在
-沒有各自 detailed-balance/reference tests 的情況下假裝共用 standard
-single-replica kernel。
+off-diagonal seam/string 與 Rényi replica/work engine 現已實作，但最新 build
+仍刻意不宣稱 production-ready：它們各自的 real-GPU detailed-balance、ED、
+checkpoint/restart tests 正等待 Slurm allocation。尚未實作的主要範圍是
+batch-of-chains 與 occupation-SF matrix 的 device-side accumulation。
 
 ## 1. 結論先行
 
@@ -648,3 +648,60 @@ check : prefix states、distribution、throughput、L2 hit、rejection divergenc
 一張目標 GPU 的 effective samples/hour 明顯勝過現有 CPU node，
 且能在 production M 下穩定 checkpoint/restart。
 ```
+
+## 16. Off-diagonal string-work 與 Rényi-work 延伸設計
+
+兩個 work engine 都重用 standard backend 的 grouped-alias diagonal、packed
+prefix scan、event sort 與 cluster machinery，但 topology state 不同，不能只把
+CPU 外層 trajectory loop 換成 CUDA 名稱。
+
+### 16.1 Off-diagonal string-work
+
+string protocol 的 physical sector 由最多 64 個 string sites 的 seam mask 定義。
+CUDA scan 將 seam 視為 fixed-boundary worldline 的額外 XOR constraint：
+
+1. `set_seam_mask_consistent()` 在 device 上檢查每個 string site 的
+   off-diagonal parity；必要時 repurpose 一個合法 diagonal slot 修復 closure。
+2. event stream 增加 terminal event，topology proposal 對 cut 左／右 half-line
+   做增量 log-ratio reduction，而不是下載 operator string 給 CPU 重掃。
+3. accepted move 同時更新 terminal operator type、touching-bond `bond_spin` 與
+   64-bit seam mask；上層每個 topology sweep 只同步固定 8 bytes sector state。
+4. 每條 trajectory 的 start sector 保留為 D2D rolling checkpoint，operator
+   string 不經 PCIe reset。forward 與 reverse checkpoint mask 分別為 empty/full。
+
+一條 chain 的 resident checkpoint 額外成本為一份 `types/sites`，即
+`2 * (2M) * 4` bytes，加上極小的 seam words/mask。HDF5 continuation 另以
+`int8` type 與最小 unsigned site dtype 儲存，production `M=2.76e6` 時 raw
+host/disk staging 約由 42.1 MiB 降至 15.8 MiB（不含壓縮）。
+
+### 16.2 Two-replica Rényi-work
+
+Rényi protocol 保留兩條 `[2, 2M]` operator strings。cut 之後的 physical replica
+依 `channel = replica XOR A_mask[site]` remap，因此 site/bond events 與 cluster
+segments 都在 channel space 建構，但 site update order 仍與 CPU reference 一致。
+
+原型曾想常駐完整 actual-replica prefix，成本為
+`2 * (2M+1) * ceil(N/64) * 8` bytes。完整枚舉與隨機路徑驗證得到更強的 closure
+theorem：合法 single-site toggle 時，兩 replicas 在 cut 的 occupation 必相同，
+因此 actual-replica bond occupancy 不變、QAQMC physical log-ratio 精確為 0。
+production topology 只需兩 replicas 的 cut/terminal boundaries，共
+`4 * ceil(N/64) * 8` bytes；accepted move 只改 dynamic region mask。
+
+兩 replica D2D checkpoint 需要另一份 operator state。HDF5 continuation 使用
+相同的 lossless narrow dtype，`M=2.76e6` 時 raw staging 約由 84.2 MiB 降至
+31.6 MiB。每條 trajectory 的五組 host diagnostics 固定為 32 bytes，因此
+100,000 trajectories 約 3.05 MiB。
+
+### 16.3 MPI、transaction 與 exact resume contract
+
+每個 MPI rank 擁有一條 chain，依 node-local rank 選 GPU。raw samples 與「下一
+chunk 所需的 rolling operator state + site permutation + Philox
+`sweep_id/topology_id`」先寫到 `_pending_chunkN`，flush 後才發布成 `chunkN`；
+reader 忽略未發布 transaction。舊 sample chunks 全保留，但只有最新 chunk
+保留 large continuation state，所以 checkpoint storage 不隨 chunk 數乘上 M。
+
+resume 前會逐項驗證 rank count、Hamiltonian scalars、position/box SHA-256、
+region/string sites、K/schedule、decorrelation與 topology cadence；任何不相容都
+fail-fast。CPU fake-engine interruption tests 已證明 resumed raw stream 與
+uninterrupted stream 逐元素相同；真正 CUDA D2D/HDF round-trip tests 已加入
+`tests/gpu`，必須在 V100/A100 通過後才完成這項 gate。
