@@ -1,10 +1,12 @@
 # QAQMC CPU Memory Optimization：均衡版實作與後續計畫
 
-最後更新：2026-07-14  
+最後更新：2026-07-15
 分支：`cpu_memory_optimization`  
 基準分支：`z2_spin_lake` (`31d6c5c`)  
 第一階段範圍：standard single-replica `QAQMCEngine`，`N=216`、full bonds、超長 operator string 與 64-chain CPU production。
-當前狀態：**40% 均衡版已實作完成，等待 `cpunode02` 空出後補 64-rank native production gate。**
+當前狀態：**均衡版、process-local shared model、多 chain threaded runner 與
+三種 event layouts 均已實作；單 socket 與 `M=100M` fit gate 已完成。
+`cpunode02` 的 64-rank/4-socket NUMA jobs 已提交，等待既有 production job 釋放 node。**
 
 ## 1. 目標與原則
 
@@ -57,6 +59,51 @@ bonds、`G=600`、seed 42。RSS 在 warmup 後、operator export 前量測。
 `cpunode02` 當時正在執行本帳號的 64-core production job，因此沒有搶佔
 該 node 做 64-rank A/B。這是目前唯一尚未執行的 balanced production gate，
 不影響已完成的單-chain 實作與 correctness gates。
+
+### 1.3 Shared-model 與大 M 實測結論
+
+Phase 3 採用「每個 NUMA socket 一個 MPI process、process 內以 threads 跑多條
+chains」；所有 chains 共用一份 240.93 MiB immutable model，operator string、
+RNG、event scratch 與 observables 仍完全獨立。C++ transition/profile path 會釋放
+Python GIL，因此 chain kernels 確實可同時執行。
+
+在 `cpunode01`（8 physical cores / 16 hardware threads）、`M=2.76M`、`packed64`
+下的結果：
+
+| chains/process | chain-steps/s | dominant resident | process RSS |
+| ---: | ---: | ---: | ---: |
+| 1 | 2.784 | 347.40 MiB | 466.27 MiB |
+| 2 | 5.882 | 453.87 MiB | 573.94 MiB |
+| 4 | 10.370 | 666.80 MiB | 787.69 MiB |
+| 8 | 15.484 | 1092.67 MiB | 1212.43 MiB |
+| 16 | 17.716 | 1944.41 MiB | 2059.90 MiB |
+
+16 chains 相對單 chain throughput 為 **6.36×**；超過 8 physical cores 後因 SMT
+而趨於飽和。若用 16 個獨立 B=1 processes 外推，RSS 約 7.29 GiB；shared-model
+B=16 實測 2.01 GiB，node process RSS 約省 **72%**。這項節省主要來自只保留
+一份 model 與一份 Python runtime，不是改變 Markov chain。
+
+同一個 B=16 gate 使用 `p_bond16` 時為 18.27 chain-steps/s、1720.38 MiB RSS；
+相對 `packed64` 再省 16.5% RSS，throughput 沒有下降。這支持目前 N=216
+production 採 `p_bond16`，但 64-core node 結論仍以 pending NUMA gate 為準。
+
+單 chain 大 M fit 結果如下；數值為 warmup 後 RSS：
+
+| `M` | layout | RSS | 相對 packed 節省 | chain-step/s | 相對 packed |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 2.76M | `packed64` | 466.27 MiB | — | 2.784 | — |
+| 2.76M | `p_bond16` | 446.00 MiB | 4.3% | 2.828 | +1.6% |
+| 2.76M | `p_only32` | 423.59 MiB | 9.2% | 2.490 | -10.5% |
+| 27.6M | `packed64` | 1416.59 MiB | — | 0.2912 | — |
+| 27.6M | `p_bond16` | 1205.59 MiB | 14.9% | 0.2970 | +2.0% |
+| 27.6M | `p_only32` | 995.54 MiB | 29.7% | 0.1984 | -31.9% |
+| 100M | `packed64` | 4174.41 MiB | — | 0.07938 | — |
+| 100M | `p_bond16` | 3415.61 MiB | **18.2%** | 0.07846 | -1.2% |
+| 100M | `p_only32` | 2652.67 MiB | **36.5%** | 0.05595 | -29.5% |
+
+raw C++/Python API 為 backward compatibility 仍以 `packed64` 為預設。對目前
+`N=216` production，**建議使用 `p_bond16`**：大 M 省 15–18% RSS，未觀察到
+顯著 throughput regression。`p_only32` 只在 RAM 是 hard limit 時使用。
 
 ## 2. 現況記憶體模型
 
@@ -245,21 +292,24 @@ QAQMCChainState (mutable, one per chain)
 
 單 engine API 可持有 `shared_ptr<const QAQMCModelData>`，確保 non-MPI usage 不變。
 
-### 4.2 Cross-process sharing 候選方案
+### 4.2 已選擇的 sharing architecture
 
-優先評估保留 one-MPI-rank-per-chain 的 read-only mapped table：
+實作選擇一個 process 管多條 chains，而非 cross-process `mmap`：
 
-1. node-local rank 0 建立 packed model-data blob；
-2. 以 Hamiltonian/config hash 作 identity；
-3. 其他 local ranks 在 barrier 後 read-only `mmap` 同一份 pages；
-4. 每個 NUMA socket可各 first-touch 一份，避免跨 socket remote reads；
-5. C++ core 使用 owning storage 或 immutable `TableView`，不強迫依賴 MPI library。
+1. 第一條 chain 建立 `QAQMCModelData`；
+2. 後續 `QAQMCEngine(model_data, seed)` 只配置自己的 mutable state；
+3. `QAQMCSharedModelBatch` 使用 persistent thread pool，一個 worker 對應一條 chain；
+4. 每個 NUMA socket 啟動一個 MPI rank，使 model pages 與 chain scratch first-touch
+   留在 socket local memory；
+5. 每條 lane 使用 deterministic `seed + lane * seed_stride`，profile result schema
+   與單 chain API 不變。
 
-若 mapping/lifetime 過於複雜，第二方案是一個 process 管多條 chains，以 OpenMP
-在 chain dimension 平行，所有 chain objects 共用 `QAQMCModelData`。這會影響
-現有 Python/MPI output architecture，應在 per-rank balanced version 穩定後再做。
+這條路徑不需要 shared-file identity、configuration hash 或 stale-mapping cleanup；
+ownership 由 `shared_ptr` 管理，最後一條 chain 結束時才釋放 model。代價是 production
+launcher 要由 64 ranks 改成 4 MPI ranks × 16 threaded chains。既有 one-rank-per-chain
+CLI 完全保留，可逐批遷移。
 
-### 4.3 Shared-table node memory 預估
+### 4.3 Shared-table node memory
 
 假設每個 NUMA socket 一份 240.39 MiB table：
 
@@ -272,12 +322,18 @@ QAQMCChainState (mutable, one per chain)
 100M 的 238 GiB 尚未包含 runtime/observable overhead，因此仍不足以安全使用
 240 GB node；需要 aggressive event compression 或減少 ranks。
 
+上述表格是設計期保守估值；實作後應以 probe 的
+`shared_model_bytes + sum(per_chain_capacity_bytes)` 與 process RSS 為準。
+`cpunode01` 的 1/2/4/8/16-chain scaling 已完成；`cpunode02` 的 4 ranks ×
+1/2/4/8/16 chains job `26732` 已提交但仍等候 node；獨立 64-rank A/B 是
+job `26731`。
+
 ## 5. Optional aggressive memory mode
 
 目前每個 bond endpoint event 儲存 packed `(p,bond,endpoint)` 共 8 bytes。一個
 bond operator 產生兩個 endpoint events，所以幾乎占 `16L` bytes。
 
-aggressive mode 改成每個 endpoint 只存 `uint32 p`：
+最小的 aggressive mode 改成每個 endpoint 只存 `uint32 p`：
 
 - `bond = op_sites_[p]`；
 - endpoint 由 owning site 與 `bond_sites[bond]` 比較得出；
@@ -307,8 +363,13 @@ aggressive mutable bytes
 - 與 balanced 8-byte packed event 做相同 allocation 下的 A/B benchmark；
 - 不作為預設值，除非大-M node throughput 沒有顯著退步。
 
-另一個折衷是 event `p:uint32[] + bond:uint16[]` SoA；N=216 時每 endpoint
-6 bytes，節省較少但能避免 dependent lookup，也應納入 benchmark。
+另有 `p_bond16` 折衷：event 使用 `p:uint32[] + bond:uint16[]` SoA；當
+`n_bonds <= 65535` 時每 endpoint 6 bytes，避免 `op_sites_[p]` dependent lookup，
+endpoint 仍由 owning site 推導。超出 16-bit bond range 時 constructor 會拒絕，
+不做 silent narrowing。三種 layouts 都保持 event order、RNG state 與逐步
+trajectory exact。`p_bond16` 在 `M=2.76M/27.6M/100M` 分別省
+4.3%/14.9%/18.2% process RSS，throughput 差異為 +1.6%/+2.0%/-1.2%，
+通過 3% single-chain gate。
 
 ## 6. 實作順序
 
@@ -342,20 +403,21 @@ aggressive mutable bytes
 
 ### Phase 3：immutable model sharing
 
-- [ ] 拆出 `QAQMCModelData` 與 `QAQMCChainState`。
-- [ ] 單 process 多 engine 共用 model-data unit test。
-- [ ] 選擇 mmap table view 或 threaded multi-chain runner。
-- [ ] 實作 configuration hash、ownership/lifetime 與 failure cleanup。
-- [ ] 每 NUMA socket一份 model pages，驗證 first-touch/core binding。
-- [ ] 1/8/32/64 chains node scaling benchmark。
+- [x] 拆出 immutable `QAQMCModelData`；mutable chain state 保留在 `QAQMCEngine`。
+- [x] 單 process 多 engine 共用 model-data unit test。
+- [x] 選擇並實作 threaded multi-chain runner。
+- [x] 以 `shared_ptr` 實作 ownership/lifetime 與 exception cleanup。
+- [x] 完成單 socket 1/2/4/8/16 chains scaling benchmark。
+- [ ] 在 `cpunode02` 驗證每 NUMA socket 一份 model、4×16 core binding。
 
 ### Phase 4：optional aggressive events
 
-- [ ] p-only endpoint event prototype。
-- [ ] 6-byte logical SoA event prototype。
-- [ ] fixed operator string 的 event multiset、segment boundaries exact comparison。
-- [ ] `M` ladder memory與 cluster throughput A/B。
-- [ ] 只有在 node-level throughput/fit 明確受益時保留 production option。
+- [x] p-only endpoint event prototype。
+- [x] 6-byte `p_bond16` SoA event prototype與 16-bit range guard。
+- [x] same-seed operator string、RNG、逐 step trajectory exact comparison。
+- [x] `p_only32` 完成 `M=2.76M/27.6M/100M` memory與 throughput A/B。
+- [x] `p_bond16` 完成 `M=2.76M/27.6M/100M` A/B；列為 N=216 建議模式。
+- [x] `p_only32` slowdown 超過 10%，保留 production option但不設為預設。
 
 ### Phase 5：擴展至其他 engines
 
@@ -368,10 +430,12 @@ aggressive mutable bytes
 
 當前結果：
 
+- portable Release build 的 `tests/engines tests/mpi` 完整 suite：**96 passed**。
 - baseline/optimized 在同 build flags、seed、`M=4096` 下連續 20 步的
   `op_types`、`op_sites` 與 serialized RNG state 每步完全一致。
 - exported delta schedule bitwise exact；small profile 的 density/Z/C/p-index arrays exact。
-- compact-layout/profile-grid 11 tests 在 Release 與 `_GLIBCXX_ASSERTIONS` build 都通過。
+- compact/shared-model/event-layout/profile-grid 18 tests 在 portable Release 與
+  `_GLIBCXX_ASSERTIONS` builds 都通過。
 - seam、half-line/ED sector residence、delta-groups-vs-ED、two-site-vs-ED、
   string ED/Jarzynski 與 fidelity-susceptibility calibration regression 通過。
 - 4×4 periodic profile CLI 已完成單 rank 取樣、HDF5 與 final-config 輸出。
@@ -458,9 +522,11 @@ aggressive mutable bytes
 - [x] backward-compatible Python/checkpoint interface。
 - [x] correctness、RSS 與單-chain performance regression tests。
 - [x] README usage 說明。
-- [ ] node-local shared immutable model-data path（Phase 3）。
-- [ ] optional aggressive event representation 與 A/B 結果（Phase 4）。
-- [ ] 1/8/32/64-chain node scaling benchmark 與 NUMA/core-binding 說明。
+- [x] node-local shared immutable model-data path（Phase 3）。
+- [x] optional aggressive event representations（Phase 4）。
+- [x] 1/2/4/8/16-chain single-socket scaling benchmark。
+- [ ] `cpunode02` 64-rank與64-chain NUMA/core-binding benchmark
+  （jobs `26731`/`26732` pending）。
 
-只有 balanced gates 全部通過後，才把 compact representation設成 default；
-shared model與 aggressive events 仍各自保留獨立 rollback point。
+balanced compact representation維持 default；shared model是 opt-in batch API，
+aggressive events是 runtime option，三者都有獨立 rollback surface。
