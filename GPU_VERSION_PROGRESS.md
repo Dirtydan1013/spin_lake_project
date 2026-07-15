@@ -5,9 +5,11 @@
 基準分支：`z2_spin_lake` (`31d6c5c`)  
 目前狀態：standard、off-diagonal string-work 與 two-replica Rényi-work CUDA
 核心均已實作並成功產生 V100/A100 fat binary；兩個 work MPI driver 亦具備
-transactional HDF5 exact resume。CUDA 核心模組化後已在 V100 通過 98 個
-real-GPU tests；最新的 Python binding 拆分版也由 Slurm job `26707` 在 V100
-再次通過 98 個 tests 與 string/Rényi probes。batch-of-chains 尚未完成。
+transactional HDF5 exact resume。standard、off-diagonal string-work 與 Rényi-work
+的 true in-process batch-chain 均已完成，最終 clean-build 版本由 Slurm job
+`26721` 在 V100 通過 108 個 real-GPU tests 及三個 probes，stderr 為空；
+job `26720` 完成 production-size
+`B=1/2/4/8` benchmark，V100 最佳點為 `B=4`。
 
 本機（無可見 GPU）最新 gate：CUDA extension build clean；engine/MPI 廣泛
 regression `105 passed`，其中 exact interruption/resume、HDF5 space reuse、完整
@@ -53,7 +55,8 @@ login node 無 GPU，非失敗）。最新 CUDA build 的 real-GPU gate 仍由 S
   - V100 CUDA：`22.05 ms/step`。
   - 單 chain transition speedup：`46.8x`。
   - event/cluster workspace 配置後約 `1.0 GiB VRAM`。
-- 現行執行模型仍為一個 process／一條 chain／一張 GPU；尚未做 batched chains。
+- 現行 batch 模型為一個 process／一張 GPU／`B` 條 independent chains；
+  immutable Hamiltonian/alias tables 共享，mutable state 與 RNG counters 每條獨立。
 - off-diagonal engine 已將 seam-aware scan、half-line topology toggle、closure
   repair 與 string-work protocol 接上同一個 device-resident transition backend。
 - Rényi engine 已支援兩條 replica operator strings、cut 後 channel remapping、
@@ -158,17 +161,29 @@ CPU + 一張 GPU 的測試 allocation。
 
 ## Milestone 6：batched multi-chain GPU
 
-這是下一個決定 GPU node 是否真正勝過 CPU64 的關鍵階段。
-
-- [ ] 將 immutable Hamiltonian/grouped-alias tables 與 per-chain state 分離。
-- [ ] 設計單一 CUDA process 內的 batch dimension。
-- [ ] 支援每張 GPU 同時推進 `B=2/4/8` independent chains。
-- [ ] 保持每條 chain 的 Philox stream、checkpoint 與 sweep id 獨立。
-- [ ] benchmark V100、A100 的 `B=1/2/4/8` throughput。
-- [ ] 找出 throughput sweet spot，而不是只追求 VRAM 可容納的最大 chain 數。
+- [x] 將 immutable Hamiltonian/grouped-alias tables 與 per-chain state 分離。
+- [x] 設計單一 CUDA process 內的 batch ownership。
+- [x] 支援 standard、string-work、Rényi-work 的 `B=2/4/8` independent chains。
+- [x] 保持每條 chain 的 Philox stream、checkpoint、sweep/topology id 獨立。
+- [x] V100 production-size `B=1/2/4/8` throughput 與 VRAM benchmark。
+- [x] V100 throughput sweet spot 為 `B=4`；`B=8` 可容納但已降速。
+- [-] A100 與第二張 V100 的三卡 job `26722` 已送出；目前另一
+  job 佔有一張 GPU，無法同時 allocation 三卡而 pending。
 - [ ] 比較 GPU node chain-steps/s 與 CPU64 chain-steps/s。
 - [ ] 比較 effective samples/s，包括 integrated autocorrelation time。
-- [ ] 實作一個 process／GPU，再以 Slurm job array 或 MPI 使用三張 GPU。
+- [x] 實作一個 process／GPU；現有 Slurm 可各卡單獨啟動，三卡
+  throughput probe 也已送出。
+
+V100、`N=216`、`M=2,760,000` 實測：
+
+| Engine | B=1 chain-step/s | B=4 chain-step/s | B=4 gain | B=4 VRAM |
+| --- | ---: | ---: | ---: | ---: |
+| standard | 47.16 | 71.34 | 1.512x | 3058.3 MiB |
+| string-work | 49.66 | 70.73 | 1.424x | 3058.3 MiB |
+| Rényi-work | 23.25 | 34.81 | 1.497x | 4784.7 MiB |
+
+設計、API、記憶體公式與完整 `B=1/2/4/8` 數字見
+[GPU_BATCH_CHAINS.md](GPU_BATCH_CHAINS.md)。
 
 ### Batch go/no-go gate
 
@@ -263,8 +278,8 @@ string-work checkpoint 會 lazy 增加一份 types/sites（`2 * 2M * 4` bytes）
   bytes；100,000 條 raw arrays 約 `3.05 MiB`，沒有額外 Python-object list。
 - event buffers 以最壞容量配置：site `2*(2M)`、bond `4*(2M)` events 加 CUB
   sort workspace；實際 MiB 由 `device_bytes` 在 lazy allocation 前後直接回報。
-- immutable Hamiltonian/grouped-alias tables 目前仍是每個 engine instance 一份；
-  真正 batch-chain 版本需先拆成 shared model data，列於 Milestone 6。
+- batch-chain 中 immutable Hamiltonian/grouped-alias tables 已拆成 shared model
+  data；Rényi 的雙 replica mutable state 仍是每條 chain 各自保有。
 
 ### 高頻同步巡檢
 
@@ -330,7 +345,8 @@ standard GPU backend 只有在以下條件全部成立後才算完成：
 - [ ] A100 smoke/performance test 通過。
 - [ ] production checkpoint/resume 與 HDF5 recovery 通過。
 - [ ] production `M` 下無 per-step PCIe operator-string round trip。
-- [ ] batch-chain throughput 與 VRAM benchmark 完成。
+- [x] V100 batch-chain throughput 與 VRAM benchmark 完成；A100 三卡 gate 待
+  `gpunode02` 恢復 allocation。
 - [ ] off-diagonal interacting exact/ED gates 在 V100 與 A100 通過。
 - [ ] Rényi interacting closure/ratio/mask-toggle、checkpoint 與 ED gates通過。
 - [x] CPU reference regressions 全數通過（最新廣泛 engine/MPI gate 105 passed，
