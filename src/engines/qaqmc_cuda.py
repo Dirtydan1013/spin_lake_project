@@ -30,6 +30,7 @@ except (ImportError, OSError):
 _U64_MASK = (1 << 64) - 1
 _DIAGONAL_STREAM = 0xD1A60A1C5EED1234
 _CLUSTER_STREAM = 0xC1057E2A5EED5678
+_TOPOLOGY_STREAM = 0x5701A65E5EED9ABC
 
 
 def cuda_available() -> bool:
@@ -66,6 +67,7 @@ class CudaDiagonalBackend:
     engine: Any
     seed: int = 0
     sweep_id: int = 0
+    topology_id: int = 0
     _bulk_sites: np.ndarray = field(default_factory=lambda: np.empty(0, np.int32))
     _loop_sets: list[np.ndarray] = field(default_factory=list)
     _loop_group: np.ndarray = field(default_factory=lambda: np.empty(0, np.int32))
@@ -153,6 +155,47 @@ class CudaDiagonalBackend:
         for _ in range(count):
             self.mc_step()
 
+    @property
+    def seam_mask(self) -> int:
+        return int(self.engine.seam_mask)
+
+    def set_string_sites(
+        self, sites: Sequence[int], m_star: int | None = None
+    ) -> None:
+        arr = np.ascontiguousarray(sites, dtype=np.int32)
+        if arr.ndim != 1 or len(arr) > 64:
+            raise ValueError("string_sites must be one-dimensional with at most 64 sites")
+        if np.any((arr < 0) | (arr >= self.N)) or len(np.unique(arr)) != len(arr):
+            raise ValueError("string_sites must contain unique valid physical sites")
+        cut = self.M if m_star is None else int(m_star)
+        self.engine.set_string_sites(arr, cut)
+        self.topology_id = 0
+
+    def set_seam_mask_consistent(self, mask: int) -> None:
+        self.engine.set_seam_mask_consistent(int(mask))
+
+    @property
+    def has_checkpoint(self) -> bool:
+        return bool(self.engine.has_checkpoint)
+
+    def save_device_checkpoint(self) -> None:
+        self.engine.save_checkpoint()
+
+    def restore_device_checkpoint(self) -> None:
+        self.engine.restore_checkpoint()
+
+    def topology_sweep(self, lambda_: float) -> dict[str, int | float]:
+        topology = int(self.topology_id)
+        result = dict(
+            self.engine.topology_sweep(
+                lambda_=float(lambda_),
+                seed=(self.seed ^ _TOPOLOGY_STREAM) & _U64_MASK,
+                sweep_id=topology,
+            )
+        )
+        self.topology_id += 1
+        return result
+
     def get_operator_string(self) -> tuple[np.ndarray, np.ndarray]:
         types, sites = self.engine.get_operator_string()
         return np.asarray(types), np.asarray(sites)
@@ -163,6 +206,17 @@ class CudaDiagonalBackend:
         if types.shape != (self.M_total,) or sites.shape != (self.M_total,):
             raise ValueError(f"operator arrays must have shape ({self.M_total},)")
         self.engine.set_operator_string(types, sites)
+
+    @property
+    def op_types(self) -> np.ndarray:
+        return self.get_operator_string()[0]
+
+    @property
+    def op_sites(self) -> np.ndarray:
+        return self.get_operator_string()[1]
+
+    def set_op_string(self, types: np.ndarray, sites: np.ndarray) -> None:
+        self.set_operator_string(types, sites)
 
     def profile_states(self, profile_step: int) -> np.ndarray:
         """Return uint8 states after every ``profile_step`` operator slices."""
@@ -394,6 +448,7 @@ class CudaDiagonalBackend:
             "half_length": self.M,
             "seed": int(self.seed),
             "sweep_id": int(self.sweep_id),
+            "topology_id": int(self.topology_id),
             "op_types": types.astype(np.int8, copy=False),
             "op_sites": sites.astype(np.int32, copy=False),
         }
@@ -406,6 +461,7 @@ class CudaDiagonalBackend:
         self.set_operator_string(state["op_types"], state["op_sites"])
         self.seed = int(state["seed"]) & _U64_MASK
         self.sweep_id = int(state["sweep_id"])
+        self.topology_id = int(state.get("topology_id", 0))
 
     def save_checkpoint(self, path: str | os.PathLike[str]) -> None:
         """Atomically save operator string and stateless Philox replay counter."""
