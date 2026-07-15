@@ -6,7 +6,7 @@ X_C = prod_{i in C} sigma_i^x, via the same interpolating-ensemble /
 Jarzynski-work protocol as the QAQMC version (src/engines/qaqmc_string_work.py)
 — the trajectory logic is inherited unchanged; only the engine differs
 (finite-temperature SSEEngine with a periodic-tau seam, see
-csrc/sse_off_diagonal_core.hpp).  The seam defaults to m_star = 0 (tau = 0):
+csrc/cpu/detail/sse_off_diagonal_core.hpp).  The seam defaults to m_star = 0 (tau = 0):
 the trace is tau-translation invariant and slot 0 stays valid as M grows.
 """
 

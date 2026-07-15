@@ -8,7 +8,7 @@
 也是 X-BFFM（排 trivial）的基礎設施。
 
 ## 設定（實作）
-- `csrc/sse_off_diagonal_core.{hpp,cpp}`：QAQMCOffDiagonalCore 的熱態移植
+- `csrc/cpu/detail/sse_off_diagonal_core.{hpp,cpp}`：QAQMCOffDiagonalCore 的熱態移植
   （seam mask ＋ half-line ＋ λ-topology Metropolis ＋ Jarzynski）
 - 週期 τ 的三個結構差異：(1) walk 繞過 τ=0（過界 commit 翻 `state_`）、
   (2) 無效條件 = 該站整條 string 無單站算符、(3) seam 快取更新按方向分流

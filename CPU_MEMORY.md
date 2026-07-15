@@ -8,6 +8,9 @@
 三種 event layouts 均已實作；單 socket 與 `M=100M` fit gate 已完成。
 `cpunode02` 的 64-rank/4-socket NUMA jobs 已提交，等待既有 production job 釋放 node。**
 
+CPU native source 已集中到 `csrc/cpu/{detail,module}`，`qaqmc_cpp` public API、
+Python/MPI imports 與舊 C++ include paths保持相容，方便後續與 `csrc/cuda` 合併。
+
 ## 1. 目標與原則
 
 本工作的主要目標不是用速度換記憶體，而是先移除冗餘資料、縮小 lossless
@@ -430,12 +433,13 @@ trajectory exact。`p_bond16` 在 `M=2.76M/27.6M/100M` 分別省
 
 當前結果：
 
-- portable Release build 的 `tests/engines tests/mpi` 完整 suite：**96 passed**。
+- portable Release build 的 `tests/engines tests/mpi` 完整 suite：**106 passed**。
 - baseline/optimized 在同 build flags、seed、`M=4096` 下連續 20 步的
   `op_types`、`op_sites` 與 serialized RNG state 每步完全一致。
 - exported delta schedule bitwise exact；small profile 的 density/Z/C/p-index arrays exact。
-- compact/shared-model/event-layout/profile-grid 18 tests 在 portable Release 與
-  `_GLIBCXX_ASSERTIONS` builds 都通過。
+- modular API、CPU→CUDA bridge、compact/shared-model/event-layout、四個 engines
+  與 profile-grid 的 focused gate：portable Release 與 `_GLIBCXX_ASSERTIONS`
+  builds 都是 **32 passed**。
 - seam、half-line/ED sector residence、delta-groups-vs-ED、two-site-vs-ED、
   string ED/Jarzynski 與 fidelity-susceptibility calibration regression 通過。
 - 4×4 periodic profile CLI 已完成單 rank 取樣、HDF5 與 final-config 輸出。
@@ -524,6 +528,7 @@ trajectory exact。`p_bond16` 在 `M=2.76M/27.6M/100M` 分別省
 - [x] README usage 說明。
 - [x] node-local shared immutable model-data path（Phase 3）。
 - [x] optional aggressive event representations（Phase 4）。
+- [x] CPU public/detail/pybind source tree 模組化與 legacy header compatibility gate。
 - [x] 1/2/4/8/16-chain single-socket scaling benchmark。
 - [ ] `cpunode02` 64-rank與64-chain NUMA/core-binding benchmark
   （jobs `26731`/`26732` pending）。

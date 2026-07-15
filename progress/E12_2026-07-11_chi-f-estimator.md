@@ -7,8 +7,9 @@ trivial→RCSL 轉變（W–P：VdW δ≈3.5）沒有局域序參量，定位要
 兩者都先對 ED 釘死歸一化，之後可互相驗證＋做 KZ 定位（配 FM 弦比值交點）。
 
 ## 設定
-- 分支 `z2_spin_lake`。改動：`csrc/sse_core.{hpp,cpp}`（`bond_dlnW_` 表＋`measure_chi_f_terms`）、
-  `csrc/bindings.cpp`（run() 加 `measure_chi_f`）、`src/mpi/sse_mpi.py`（`--chi-f`，chunk 存
+- 分支 `z2_spin_lake`。改動現位於：`csrc/cpu/sse_core.hpp`、
+  `csrc/cpu/detail/sse_core.cpp`（`bond_dlnW_` 表＋`measure_chi_f_terms`）、
+  `csrc/cpu/module/bindings_sse.cpp`（run() 加 `measure_chi_f`）、`src/mpi/sse_mpi.py`（`--chi-f`，chunk 存
   `chi_gl/chi_gr/chi_glgr` bin means）、`plots/plot_sse/plot_chi_f.py`（jackknife 組裝＋δ-scan 圖）
 - 估計子：χ_F = ½(⟨G_L G_R⟩−⟨G_L⟩⟨G_R⟩)，G = Σ_p ∂δ ln W_p over 半條 string。
   δ 折在 bond 權重裡（raw1/raw2/raw3 與 cij 都依賴 δ）→ 每 (bond, spin-state) 的
