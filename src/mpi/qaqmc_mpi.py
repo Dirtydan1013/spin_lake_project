@@ -388,7 +388,7 @@ def _make_tqdm_callback(total, desc):
 def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             pos=None, epsilon=0.01, seed=42, n_equil=5000, n_samples=10000,
             measure_every=1, filepath='data/qaqmc_mpi.h5', neighbor_cutoff=None,
-            delta_groups=600, omp_threads=0,
+            delta_groups=600, omp_threads=0, bond_event_storage='packed64',
             compression='gzip', compression_opts=4,
             checkpoint_every=0, verbose=True):
     """
@@ -447,6 +447,7 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         pos=pos, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
         neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
+        bond_event_storage=bond_event_storage,
     )
 
     M2 = engine.M_total
@@ -542,6 +543,7 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             pg.attrs['n_samples'] = n_samples
             pg.attrs['measure_every'] = measure_every
             pg.attrs['n_ranks'] = n_ranks
+            pg.attrs['bond_event_storage'] = bond_event_storage
             pg.attrs['timestamp'] = datetime.datetime.utcnow().isoformat()
 
             if neighbor_cutoff is not None:
@@ -595,6 +597,7 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                      pos=None, epsilon=0.01, seed=42, n_equil=5000, n_samples=10000,
                      measure_every=1, filepath='data/qaqmc_onthefly.h5',
                      neighbor_cutoff=None, delta_groups=600, omp_threads=0,
+                     bond_event_storage='packed64',
                      nx=6, ny=6,
                      loop_sizes=None, string_sizes=None,
                      lattice='kagome_bond', verbose=True):
@@ -644,6 +647,7 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         pos=pos, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
         neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
+        bond_event_storage=bond_event_storage,
     )
 
     if engine._cpp_engine is None:
@@ -790,6 +794,7 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             pg.attrs['n_ranks']      = n_ranks
             pg.attrs['nx']           = nx
             pg.attrs['ny']           = ny
+            pg.attrs['bond_event_storage'] = bond_event_storage
             pg.attrs['timestamp']    = datetime.datetime.utcnow().isoformat()
             if neighbor_cutoff is not None:
                 pg.attrs['neighbor_cutoff'] = neighbor_cutoff
@@ -890,6 +895,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                     neighbor_cutoff=None,
                     loop_sizes=None, string_sizes=None,
                     delta_groups=600, omp_threads=0, nx=6, ny=6,
+                    bond_event_storage='packed64',
                     sf_q_points=None, sf_delta_points=None,
                     snapshot_deltas=None, n_snapshots=0, snapshot_sweep='forward',
                     occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
@@ -987,6 +993,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         pos=pos_engine, epsilon=epsilon, seed=rank_seed,
         verbose=False, use_cpp=True, omp_threads=omp_threads,
         neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
+        bond_event_storage=bond_event_storage,
         box_vectors=box_vectors,
     )
 
@@ -1529,6 +1536,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             pg.attrs['n_ranks']      = n_ranks
             pg.attrs['nx']           = nx
             pg.attrs['ny']           = ny
+            pg.attrs['bond_event_storage'] = bond_event_storage
             pg.attrs['timestamp']    = datetime.datetime.utcnow().isoformat()
             if neighbor_cutoff is not None:
                 pg.attrs['neighbor_cutoff'] = neighbor_cutoff
@@ -1750,6 +1758,12 @@ def main():
     parser.add_argument('--neighbor_cutoff', type=int, default=None)
     parser.add_argument('--delta_groups', type=int, default=600,
                         help='Number of delta groups for shared alias tables (must be > 0).')
+    parser.add_argument('--bond_event_storage',
+                        choices=['packed64', 'p_bond16', 'p_only32'],
+                        default='packed64',
+                        help='CPU cluster event representation: packed64 is faster; '
+                             'p_bond16 is a 6-byte compromise; p_only32 halves '
+                             'endpoint-event memory.')
     parser.add_argument('--omp_threads', type=int, default=1)
     parser.add_argument('--filepath', type=str, default='data/qaqmc_mpi.h5')
     parser.add_argument('--lattice', type=str, default='kagome_bond',
@@ -1917,6 +1931,7 @@ def main():
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),
             delta_groups=config.get('delta_groups', 600),
+            bond_event_storage=config.get('bond_event_storage', 'packed64'),
             omp_threads=config.get('omp_threads', 1),
             nx=config.get('nx', 1), ny=config.get('ny', 1),
             sf_q_points=sf_q_points,
@@ -1946,6 +1961,7 @@ def main():
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),
             delta_groups=config.get('delta_groups', 600),
+            bond_event_storage=config.get('bond_event_storage', 'packed64'),
             omp_threads=config.get('omp_threads', 1),
             nx=config.get('nx', 1), ny=config.get('ny', 1),
             lattice=config.get('lattice', 'kagome_bond'),
@@ -1961,6 +1977,7 @@ def main():
             filepath=config['filepath'],
             neighbor_cutoff=config.get('neighbor_cutoff'),
             delta_groups=config.get('delta_groups', 600),
+            bond_event_storage=config.get('bond_event_storage', 'packed64'),
             omp_threads=config.get('omp_threads', 1),
         )
 

@@ -7,6 +7,7 @@
 #include <map>
 #include <limits>
 #include <numeric>
+#include <memory>
 #include <string>
 
 #ifdef QAQMC_USE_OPENMP
@@ -57,6 +58,45 @@ struct RydbergVij {
     std::vector<int> coord_number;    // z_eff[i]: # active bonds touching site i
     std::vector<double> inv_coord;    // 1/z_eff[i] (0 if z_eff[i] == 0)
     int n_bonds;
+};
+
+// Immutable grouped proposal tables. These arrays depend on the Hamiltonian
+// and ramp, not on a chain's RNG or operator string.
+struct QAQMCGroupedAlias {
+    int n_groups{0};
+    int max_alias{0};
+    int n_bonds_pad{0};
+    std::vector<double> bond_W_rmax_all;
+    std::vector<int> n_alias_all;
+    std::vector<double> alias_prob;
+    std::vector<uint16_t> alias_idx16;
+    std::vector<uint32_t> alias_idx32;
+    bool alias_u16{false};
+
+    inline int alias_at(size_t idx) const {
+        return alias_u16 ? static_cast<int>(alias_idx16[idx])
+                         : static_cast<int>(alias_idx32[idx]);
+    }
+};
+
+// Read-only data shared by independent chains in one process. Observable,
+// RNG, operator-string, event-scratch and checkpoint state stays per engine.
+struct QAQMCModelData {
+    int N{0};
+    int M{0};
+    int M_total{0};
+    double Omega{0.0};
+    double Rb{0.0};
+    double delta_min{0.0};
+    double delta_max{0.0};
+    double epsilon{0.0};
+    int delta_groups{0};
+    RydbergVij vij;
+    std::vector<double> pos_flat;
+    int pos_dim{0};
+    QAQMCGroupedAlias grp_alias;
+
+    uint64_t logical_bytes() const;
 };
 
 // box: optional periodic supercell vectors (n_box vectors × pos_dim, row-major).
@@ -114,6 +154,9 @@ public:
                 int neighbor_cutoff = -1, int delta_groups = 600,
                 const double* box = nullptr, int n_box = 0);
 
+    explicit QAQMCEngine(std::shared_ptr<QAQMCModelData> model_data,
+                         uint64_t seed);
+
     void mc_step();
 
     // Fused mc_step + asymmetric-profile measurement: the profile capture
@@ -133,14 +176,29 @@ public:
     int get_op_site(int p) const { return op_site_at(p); }
     void export_op_types(int32_t* out, int len) const;
     void export_op_sites(int32_t* out, int len) const;
-    const std::vector<int>& get_bond_sites_flat() const { return vij_.bond_sites_flat; }
+    const std::vector<int>& get_bond_sites_flat() const {
+        return model_->vij.bond_sites_flat;
+    }
     std::vector<double> get_delta_schedule() const;
     bool uses_compact_op_sites() const { return op_sites_u16_; }
-    bool uses_compact_alias_indices() const { return grp_alias_.alias_u16; }
+    bool uses_compact_alias_indices() const {
+        return model_->grp_alias.alias_u16;
+    }
+    std::shared_ptr<QAQMCModelData> get_model_data() const { return model_; }
+    uint64_t get_model_memory_bytes() const { return model_->logical_bytes(); }
+    long get_model_use_count() const { return model_.use_count(); }
 
     // Logical/capacity bytes for the dominant standard-engine allocations.
     // Exposed for reproducible RSS accounting; values exclude Python/MPI/HDF5.
     std::map<std::string, uint64_t> get_memory_breakdown() const;
+
+    // Optional memory-first cluster representations. "packed64" stores
+    // (p,bond,endpoint) and is the balanced default; "p_bond16" uses a
+    // 4-byte position plus 2-byte bond on models with <= 65535 bonds;
+    // "p_only32" stores only p and reconstructs bond/endpoint from the
+    // operator string in the hot loop, halving endpoint-event memory.
+    void set_bond_event_storage(const std::string& mode);
+    std::string get_bond_event_storage() const;
 
     // delta at slice p. The materialized O(M) schedule was removed; callers
     // that need the complete public schedule receive an on-demand export.
@@ -389,32 +447,7 @@ private:
 
     std::mt19937_64 rng_;
 
-    RydbergVij vij_;
-    // Site coordinates stored row-major (N × pos_dim) for downstream use
-    // (e.g. dimer structure factor q·r_i phases).
-    std::vector<double> pos_flat_;
-    int pos_dim_{0};
-
-    // ── Grouped alias tables for O(G) diagonal update ─────────────────────
-    // (slice -> group is computed incrementally during the diagonal sweep;
-    //  no per-slice map is stored.)
-    struct GroupedAlias {
-        int n_groups;
-        int max_alias;
-        int n_bonds_pad;
-        std::vector<double>  bond_W_rmax_all; // [n_groups * n_bonds_pad] 1/W_max (0 if W_max <= 0)
-        std::vector<int>     n_alias_all;     // [n_groups]
-        std::vector<double>  alias_prob;       // [n_groups * max_alias]
-        std::vector<uint16_t> alias_idx16;     // used when max_alias <= 65536
-        std::vector<uint32_t> alias_idx32;     // general fallback
-        bool alias_u16{false};
-
-        inline int alias_at(size_t idx) const {
-            return alias_u16 ? static_cast<int>(alias_idx16[idx])
-                             : static_cast<int>(alias_idx32[idx]);
-        }
-    };
-    GroupedAlias grp_alias_;
+    std::shared_ptr<QAQMCModelData> model_;
 
     std::vector<OpType> op_types_;
     // N=216/full-bond fits in uint16. Larger systems automatically use the
@@ -500,6 +533,10 @@ private:
     // directly.  Carrying b avoids the dependent op_sites_[p] load in the
     // segment-Metropolis hot loop.
     std::vector<int64_t> site_bond_list_;
+    enum class BondEventStorage { Packed64, PositionBond16, Position32 };
+    BondEventStorage bond_event_storage_{BondEventStorage::Packed64};
+    std::vector<uint32_t> site_bond_p_list_;
+    std::vector<uint16_t> site_bond_b16_list_;
     static inline int64_t pack_bond_entry(int p, int b, int endpoint) {
         return (static_cast<int64_t>(p) << 32)
              | (static_cast<int64_t>(static_cast<uint32_t>(b)) << 1)

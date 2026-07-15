@@ -167,14 +167,15 @@ class QAQMC_Rydberg:
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
                  use_cpp: bool = True, omp_threads: int = 0,
                  neighbor_cutoff: int = None, delta_groups: int = 600,
-                 box_vectors: np.ndarray = None):
+                 box_vectors: np.ndarray = None, model_data=None,
+                 bond_event_storage: str = "packed64"):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
             'verbose': False, 'n_jobs': 1, 'backend': "thread",
             'use_cpp': use_cpp, 'omp_threads': omp_threads,
             'neighbor_cutoff': neighbor_cutoff, 'delta_groups': delta_groups,
-            'box_vectors': box_vectors,
+            'box_vectors': box_vectors, 'bond_event_storage': bond_event_storage,
         }
         
         # Set OpenMP threads environment variable before C++ engine usage
@@ -204,10 +205,18 @@ class QAQMC_Rydberg:
                if box_vectors is not None else None)
         if use_cpp and HAS_CPP:
             pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
-            self._cpp_engine = qaqmc_cpp.QAQMCEngine(
-                N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
-                neighbor_cutoff=nc, delta_groups=delta_groups, box_vectors=box
-            )
+            if model_data is None:
+                self._cpp_engine = qaqmc_cpp.QAQMCEngine(
+                    N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
+                    neighbor_cutoff=nc, delta_groups=delta_groups,
+                    box_vectors=box,
+                )
+            else:
+                if int(model_data.N) != int(N) or int(model_data.M) != int(M):
+                    raise ValueError(
+                        "model_data N/M do not match the requested chain")
+                self._cpp_engine = qaqmc_cpp.QAQMCEngine(model_data, seed)
+            self._cpp_engine.bond_event_storage = bond_event_storage
             # Bond geometry is small.  Do NOT retain full int32 mirrors of the
             # C++ operator string: that would recreate 8L bytes per rank and
             # defeat the compact engine.  op_types/op_sites below are lazy

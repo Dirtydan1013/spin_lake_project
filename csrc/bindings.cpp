@@ -43,6 +43,22 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def_readonly("terminal_p", &QAQMCEngine::HalfLineProposal::terminal_p)
         .def_readonly("log_physical_ratio", &QAQMCEngine::HalfLineProposal::log_physical_ratio);
 
+    py::class_<QAQMCModelData, std::shared_ptr<QAQMCModelData>>(
+        m, "QAQMCModelData")
+        .def_property_readonly("N", [](const QAQMCModelData& self) {
+            return self.N;
+        })
+        .def_property_readonly("M", [](const QAQMCModelData& self) {
+            return self.M;
+        })
+        .def_property_readonly("M_total", [](const QAQMCModelData& self) {
+            return self.M_total;
+        })
+        .def_property_readonly("n_bonds", [](const QAQMCModelData& self) {
+            return self.vij.n_bonds;
+        })
+        .def_property_readonly("logical_bytes", &QAQMCModelData::logical_bytes);
+
     py::class_<QAQMCEngine>(m, "QAQMCEngine")
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
                          double Rb, int M, double epsilon, uint64_t seed,
@@ -64,7 +80,11 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         py::arg("pos"), py::arg("neighbor_cutoff") = -1,
         py::arg("delta_groups") = 600, py::arg("box_vectors") = py::none())
 
+        .def(py::init<std::shared_ptr<QAQMCModelData>, uint64_t>(),
+             py::arg("model_data"), py::arg("seed"))
+
         .def("mc_step", &QAQMCEngine::mc_step,
+             py::call_guard<py::gil_scoped_release>(),
              "Run one diagonal update + cluster update")
 
         .def("run", [](QAQMCEngine& self, int n_equil, int n_samples,
@@ -76,7 +96,10 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
             // Equilibration
             for (int i = 0; i < n_equil; ++i) {
-                self.mc_step();
+                {
+                    py::gil_scoped_release release;
+                    self.mc_step();
+                }
                 if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_equil))
                     progress_callback(i + 1, n_equil, "equil");
             }
@@ -146,6 +169,12 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
         .def_property_readonly("memory_breakdown", &QAQMCEngine::get_memory_breakdown)
         .def_property_readonly("compact_op_sites", &QAQMCEngine::uses_compact_op_sites)
         .def_property_readonly("compact_alias_indices", &QAQMCEngine::uses_compact_alias_indices)
+        .def_property_readonly("model_data", &QAQMCEngine::get_model_data)
+        .def_property_readonly("model_memory_bytes", &QAQMCEngine::get_model_memory_bytes)
+        .def_property_readonly("model_use_count", &QAQMCEngine::get_model_use_count)
+        .def_property("bond_event_storage",
+                      &QAQMCEngine::get_bond_event_storage,
+                      &QAQMCEngine::set_bond_event_storage)
 
         // Checkpoint support
         .def("get_rng_state", &QAQMCEngine::get_rng_state)
@@ -336,7 +365,10 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
 
             // Equilibration
             for (int i = 0; i < n_equil; ++i) {
-                self.mc_step();
+                {
+                    py::gil_scoped_release release;
+                    self.mc_step();
+                }
                 if (has_cb && (((i + 1) % progress_every) == 0 || (i + 1) == n_equil))
                     progress_callback(i + 1, n_equil, "equil");
             }
@@ -504,8 +536,10 @@ PYBIND11_MODULE(qaqmc_cpp, m) {
                 // saves a full O(M) measurement sweep per sample.
                 QAQMCEngine::ProfileObservables prof;
                 if (need_any) {
+                    py::gil_scoped_release release;
                     prof = self.mc_step_profiled(profile_step);
                 } else {
+                    py::gil_scoped_release release;
                     self.mc_step();
                 }
 

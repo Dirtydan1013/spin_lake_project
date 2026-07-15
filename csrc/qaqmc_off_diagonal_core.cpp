@@ -105,7 +105,7 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
         return out;
     }
     const int site = string_sites_[local_index];
-    const int* bond_sites = eng.vij_.bond_sites_flat.data();
+    const int* bond_sites = eng.model_->vij.bond_sites_flat.data();
 
     // local_state tracks state_before(p) for whichever p is currently being
     // examined (see derivation in the doc / spec): it starts at the known
@@ -133,10 +133,10 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
         int sj = bond_sites[b * 2 + 1];
         if (si != site && sj != site) return true;
         double delta = eng.delta_at(p);
-        double di = delta * eng.vij_.inv_coord[si];
-        double dj = delta * eng.vij_.inv_coord[sj];
+        double di = delta * eng.model_->vij.inv_coord[si];
+        double dj = delta * eng.model_->vij.inv_coord[sj];
         double W[4], wmax;
-        QAQMCEngine::compute_bond_W_inline(di, dj, eng.vij_.vij_list[b], eng.epsilon_, W, wmax);
+        QAQMCEngine::compute_bond_W_inline(di, dj, eng.model_->vij.vij_list[b], eng.epsilon_, W, wmax);
         int ni = local_state[si], nj = local_state[sj];
         double w_old = W[ni * 2 + nj];
         double w_new = (si == site) ? W[(1 - ni) * 2 + nj] : W[ni * 2 + (1 - nj)];
