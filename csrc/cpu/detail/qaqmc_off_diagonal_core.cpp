@@ -1,4 +1,4 @@
-#include "qaqmc_core.hpp"
+#include "../qaqmc_core.hpp"
 #include <cstring>
 #include <stdexcept>
 
