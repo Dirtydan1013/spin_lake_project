@@ -2,6 +2,9 @@
 
 部署與執行說明。環境完全由 conda-forge 在 user space 提供（含 MPI、OpenMP、編譯器），目標機器**只需要 miniconda，不需要 root、不需要系統 MPI**。
 
+> 設計文件、引擎規格、實驗日誌集中在 [`docs/`](docs/INDEX.md)
+> （design / specs / progress 三類，入口是 `docs/INDEX.md`）。
+
 ## 部署到新 server
 
 ```bash
@@ -83,7 +86,7 @@ raw API 預設 event layout 是 `packed64`。目前 N=216 production 建議設�
 （4 bytes/event、慢約 30%）。MPI CLI 同樣接受
 `--bond_event_storage`，並把選擇寫進 HDF5 params attributes。
 
-設計、公式與 A/B gates 見 `CPU_MEMORY.md`。
+設計、公式與 A/B gates 見 `docs/design/cpu_memory.md`。
 
 ## CUDA QAQMC backend（gpu_version）
 

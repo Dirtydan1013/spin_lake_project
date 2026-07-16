@@ -56,13 +56,10 @@ paper/
 
 CLAUDE.md
 
-docs/
 
-specs/
 
 tex/
 
-specs/csrc
 
 build_asan/
 
@@ -71,3 +68,4 @@ main_scripts/common/site.conf
 build_staging/
 figures/
 plots/*.png
+

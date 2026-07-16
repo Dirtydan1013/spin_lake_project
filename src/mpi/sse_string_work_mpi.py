@@ -9,7 +9,7 @@ SSEEngine with a periodic-tau seam, csrc/cpu/detail/sse_off_diagonal_core.hpp). 
 rank runs independent trajectories; log_J samples are aggregated with
 log-sum-exp on rank 0.  A classical (diagonal) ensemble has O_C == 0
 identically, so a resolved non-zero closed X-loop is a direct coherence
-witness (cf. progress/E14).
+witness (cf. docs/progress/E14).
 
 Example::
 

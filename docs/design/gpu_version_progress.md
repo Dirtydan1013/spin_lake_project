@@ -86,7 +86,7 @@ login node 無 GPU，非失敗）。最新 CUDA build 的 real-GPU gate 仍由 S
 
 - [x] 從 `z2_spin_lake` 建立 `gpu_version` branch。
 - [x] 記錄 CPU QAQMC update flow、資料相依與 GPU 可行性。
-- [x] 建立 [GPU_QAQMC_ACCELERATION_PROPOSAL.md](GPU_QAQMC_ACCELERATION_PROPOSAL.md)。
+- [x] 建立 [gpu_acceleration_proposal.md](gpu_acceleration_proposal.md)。
 - [x] 確認 `gpunode02` 硬體：1× A100 PCIe 40 GiB、2× V100 PCIe 32 GiB。
 - [x] CUDA build 同時支援 `sm_70` 與 `sm_80`。
 - [x] 保留 CPU engine 作為 deterministic/statistical reference。
@@ -201,7 +201,7 @@ V100、`N=216`、`M=2,760,000` 實測：
 | Rényi-work | 23.25 | 34.81 | 1.497x | 4784.7 MiB |
 
 設計、API、記憶體公式與完整 `B=1/2/4/8` 數字見
-[GPU_BATCH_CHAINS.md](GPU_BATCH_CHAINS.md)。
+[gpu_batch_chains.md](gpu_batch_chains.md)。
 
 ### Batch go/no-go gate
 
