@@ -11,18 +11,37 @@ find_package(pybind11 REQUIRED)
 # ── Find OpenMP ──────────────────────────────────────────────────────────────
 find_package(OpenMP)
 
-# ── Build the Python extension module ────────────────────────────────────────
-pybind11_add_module(qaqmc_cpp
-    csrc/qaqmc_core.cpp
-    csrc/qaqmc_off_diagonal_core.cpp
-    csrc/qaqmc_renyi_core.cpp
-    csrc/qaqmc_renyi_work_core.cpp
-    csrc/sse_core.cpp
-    csrc/sse_off_diagonal_core.cpp
-    csrc/bindings.cpp
+# ── CPU backend and Python extension module ──────────────────────────────────
+# Keep the CPU source tree parallel to csrc/cuda so both backends can coexist
+# cleanly after branch integration. Public C++ headers live in csrc/cpu;
+# implementation details and pybind registration units are isolated below it.
+set(QAQMC_CPU_ENGINE_SOURCES
+    csrc/cpu/detail/qaqmc_core.cpp
+    csrc/cpu/detail/qaqmc_off_diagonal_core.cpp
+    csrc/cpu/detail/qaqmc_renyi_core.cpp
+    csrc/cpu/detail/qaqmc_renyi_work_core.cpp
+    csrc/cpu/detail/sse_core.cpp
+    csrc/cpu/detail/sse_off_diagonal_core.cpp
 )
 
-target_include_directories(qaqmc_cpp PRIVATE csrc)
+set(QAQMC_CPU_MODULE_SOURCES
+    csrc/cpu/module/module.cpp
+    csrc/cpu/module/compatibility_headers.cpp
+    csrc/cpu/module/bindings_qaqmc.cpp
+    csrc/cpu/module/bindings_renyi.cpp
+    csrc/cpu/module/bindings_sse.cpp
+    csrc/cpu/module/bindings_renyi_work.cpp
+)
+
+pybind11_add_module(qaqmc_cpp
+    ${QAQMC_CPU_ENGINE_SOURCES}
+    ${QAQMC_CPU_MODULE_SOURCES}
+)
+
+target_include_directories(qaqmc_cpp PRIVATE
+    csrc
+    csrc/cpu
+)
 
 # ── Optimization flags ───────────────────────────────────────────────────────
 # Target microarchitecture is a cache variable so the same tree deploys to any

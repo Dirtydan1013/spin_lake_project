@@ -47,6 +47,40 @@ def _split_work(n_total, n_jobs):
     rem = n_total % n_jobs
     return [base + (1 if i < rem else 0) for i in range(n_jobs)]
 
+
+def _qaqmc_delta_values(p_indices, M, delta_min, delta_max):
+    """Vectorized delta(p) with the same two-ramp expression as the C++ core."""
+    p = np.asarray(p_indices, dtype=np.int64)
+    delta = np.empty(p.shape, dtype=np.float64)
+    forward = p < M
+    span = delta_max - delta_min
+    delta[forward] = delta_min + span * (
+        p[forward].astype(np.float64) / M)
+    delta[~forward] = delta_max - span * (
+        (p[~forward] - M).astype(np.float64) / M)
+    return delta
+
+
+def _write_qaqmc_delta_schedule(group, M, delta_min, delta_max,
+                                 name="delta_schedule", chunk_slots=1 << 20):
+    """Write the backward-compatible 2M schedule without an O(M) temporary.
+
+    The on-disk dataset name, shape, and dtype remain unchanged.  At most one
+    ``chunk_slots`` float64 work buffer is live while HDF5 is populated.
+    """
+    total = 2 * int(M)
+    if total <= 0:
+        return group.create_dataset(name, shape=(0,), dtype=np.float64)
+    chunk_slots = max(1, min(int(chunk_slots), total))
+    dataset = group.create_dataset(
+        name, shape=(total,), dtype=np.float64, chunks=(chunk_slots,))
+    for start in range(0, total, chunk_slots):
+        stop = min(start + chunk_slots, total)
+        p = np.arange(start, stop, dtype=np.int64)
+        dataset[start:stop] = _qaqmc_delta_values(
+            p, M, delta_min, delta_max)
+    return dataset
+
 def _get_executor_class(backend):
     if backend == "thread":
         return concurrent.futures.ThreadPoolExecutor
@@ -133,14 +167,15 @@ class QAQMC_Rydberg:
                  verbose: bool = True, n_jobs: int = 1, backend: str = "process",
                  use_cpp: bool = True, omp_threads: int = 0,
                  neighbor_cutoff: int = None, delta_groups: int = 600,
-                 box_vectors: np.ndarray = None):
+                 box_vectors: np.ndarray = None, model_data=None,
+                 bond_event_storage: str = "packed64"):
         self.init_kwargs = {
             'N': N, 'Omega': Omega, 'delta_min': delta_min, 'delta_max': delta_max,
             'Rb': Rb, 'M': M, 'epsilon': epsilon, 'seed': seed, 'pos': pos,
             'verbose': False, 'n_jobs': 1, 'backend': "thread",
             'use_cpp': use_cpp, 'omp_threads': omp_threads,
             'neighbor_cutoff': neighbor_cutoff, 'delta_groups': delta_groups,
-            'box_vectors': box_vectors,
+            'box_vectors': box_vectors, 'bond_event_storage': bond_event_storage,
         }
         
         # Set OpenMP threads environment variable before C++ engine usage
@@ -170,14 +205,23 @@ class QAQMC_Rydberg:
                if box_vectors is not None else None)
         if use_cpp and HAS_CPP:
             pos_arr = np.ascontiguousarray(self.pos, dtype=np.float64)
-            self._cpp_engine = qaqmc_cpp.QAQMCEngine(
-                N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
-                neighbor_cutoff=nc, delta_groups=delta_groups, box_vectors=box
-            )
-            # Mirror key attributes for compatibility
+            if model_data is None:
+                self._cpp_engine = qaqmc_cpp.QAQMCEngine(
+                    N, Omega, delta_min, delta_max, Rb, M, epsilon, seed, pos_arr,
+                    neighbor_cutoff=nc, delta_groups=delta_groups,
+                    box_vectors=box,
+                )
+            else:
+                if int(model_data.N) != int(N) or int(model_data.M) != int(M):
+                    raise ValueError(
+                        "model_data N/M do not match the requested chain")
+                self._cpp_engine = qaqmc_cpp.QAQMCEngine(model_data, seed)
+            self._cpp_engine.bond_event_storage = bond_event_storage
+            # Bond geometry is small.  Do NOT retain full int32 mirrors of the
+            # C++ operator string: that would recreate 8L bytes per rank and
+            # defeat the compact engine.  op_types/op_sites below are lazy
+            # compatibility properties that export only when requested.
             self.bond_sites = np.array(self._cpp_engine.bond_sites, dtype=np.int32)
-            self.op_types = np.array(self._cpp_engine.op_types, dtype=np.int32)
-            self.op_sites = np.array(self._cpp_engine.op_sites, dtype=np.int32)
             if verbose:
                 n_bonds = len(self.bond_sites)
                 print(f"[QAQMC] Using C++ backend (N={N}, M={M}, bonds={n_bonds}, "
@@ -218,16 +262,25 @@ class QAQMC_Rydberg:
         self.site_W = Omega / 2.0
         self.site_W_max = Omega / 2.0
         
-        self.op_types = np.ones(self.M_total, dtype=np.int32) 
-        self.op_sites = np.zeros(self.M_total, dtype=np.int32)
+        self._op_types = np.ones(self.M_total, dtype=np.int32)
+        self._op_sites = np.zeros(self.M_total, dtype=np.int32)
         self.state = np.zeros(N, dtype=np.int32)
+
+    @property
+    def op_types(self):
+        if self._cpp_engine is not None:
+            return np.asarray(self._cpp_engine.op_types, dtype=np.int32)
+        return self._op_types
+
+    @property
+    def op_sites(self):
+        if self._cpp_engine is not None:
+            return np.asarray(self._cpp_engine.op_sites, dtype=np.int32)
+        return self._op_sites
 
     def mc_step(self):
         if self._cpp_engine is not None:
             self._cpp_engine.mc_step()
-            # Sync numpy views
-            self.op_types = np.array(self._cpp_engine.op_types, dtype=np.int32)
-            self.op_sites = np.array(self._cpp_engine.op_sites, dtype=np.int32)
             return
 
         # Fallback: Python/Numba path
@@ -351,14 +404,8 @@ class QAQMC_Rydberg:
 
                 # ── δ schedule ────────────────────────────────────────────
                 sg = f.create_group('schedule')
-                delta_sched = np.empty(M2, dtype=np.float64)
-                for p in range(self.M):
-                    delta_sched[p] = (self.delta_min
-                                      + (self.delta_max - self.delta_min) * (p / self.M))
-                for p in range(self.M, M2):
-                    delta_sched[p] = (self.delta_max
-                                      - (self.delta_max - self.delta_min) * ((p - self.M) / self.M))
-                sg.create_dataset('delta_schedule', data=delta_sched)
+                _write_qaqmc_delta_schedule(
+                    sg, self.M, self.delta_min, self.delta_max)
 
                 # ── sample datasets ───────────────────────────────────────
                 smg = f.create_group('samples')

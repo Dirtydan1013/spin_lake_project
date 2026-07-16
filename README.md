@@ -37,6 +37,52 @@ python -c "import qaqmc_cpp; print('C++ extension OK')"
 - 換 `-march` 會改變浮點捨入（FMA contraction），同 seed 的軌跡在不同
   build 間不會 bit-identical（統計上等價）。
 
+## Standard QAQMC CPU 記憶體
+
+CPU native backend 已集中在 `csrc/cpu/`，公開 headers、detail implementation
+與 pybind module registrations 分層；舊 `csrc/*.hpp` include path 仍相容。
+目錄責任與 CPU/CUDA merge contract 見 [`csrc/cpu/README.md`](csrc/cpu/README.md)。
+
+`QAQMCEngine` 對 `N=216` full-bond production 會自動使用 lossless 16-bit
+alias/operator indices、`int8` operator types、按需 delta schedule，以及有界
+event-scratch capacity。系統超過 16-bit index 範圍時會自動 fallback 到 32-bit，
+不會截斷 bond/site index。Python wrapper 不再常駐一份完整 int32 operator mirror；
+`engine.op_types`／`engine.op_sites` 仍可使用，但會在存 checkpoint 等真正需要時
+才匯出。
+
+可用 fresh process 量 init/steady-state RSS、vector capacity 與 phase timing：
+
+```bash
+cd /tmp
+PYTHONPATH=/path/to/spin_lake_project/build:/path/to/spin_lake_project \
+python /path/to/spin_lake_project/main_scripts/python_scripts/probe_qaqmc_cpu_memory.py \
+    --M 2760000 --warmup-steps 2 --timed-steps 5
+```
+
+`--export-checksum` 會額外建立相容的 int32 operator arrays，因此 memory gate
+預設在 export 前取樣。寫 HDF5 時原有 `delta_schedule` schema 保持不變，
+但改用有界 chunk 產生，不會在寫檔前突然重建完整 `2M` array。
+
+同一個 Hamiltonian 的多條 chains 可使用 process-local shared model，避免每個
+rank 重複約 241 MiB proposal/geometry tables：
+
+```python
+from src.engines.qaqmc_cpu_batch import QAQMCSharedModelBatch
+
+with QAQMCSharedModelBatch(batch_size=8, seed=42, **engine_kwargs) as batch:
+    batch.run_steps(100)
+```
+
+C++ transition 會釋放 GIL，batch 內一個 worker 對應一條獨立 chain。多 socket
+production 建議每個 NUMA socket 一個 MPI rank，再於 rank 內建立多條 chains。
+raw API 預設 event layout 是 `packed64`。目前 N=216 production 建議設定
+`bond_event_storage="p_bond16"`（6 bytes/event，最多 65,535 bonds）；實測大 M
+省 15–18% RSS且速度持平。只有 RAM 仍不足時才用 `"p_only32"`
+（4 bytes/event、慢約 30%）。MPI CLI 同樣接受
+`--bond_event_storage`，並把選擇寫進 HDF5 params attributes。
+
+設計、公式與 A/B gates 見 `CPU_MEMORY.md`。
+
 ## 提交 / 執行腳本
 
 production 腳本在 `main_scripts/slurm_scripts/`，同一份腳本在有無 SLURM 的

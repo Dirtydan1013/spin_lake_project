@@ -5,7 +5,7 @@ Measures  O_C(beta) = Tr[X_C e^{-beta H}] / Tr[e^{-beta H}],
 X_C = prod_{i in C} sigma_i^x, on the equilibrium ensemble — the thermal
 counterpart of src.mpi.qaqmc_string_work_mpi (same lambda-interpolation /
 Jarzynski protocol, same CLI shape; the engine is the finite-temperature
-SSEEngine with a periodic-tau seam, csrc/sse_off_diagonal_core.hpp).  Every
+SSEEngine with a periodic-tau seam, csrc/cpu/detail/sse_off_diagonal_core.hpp). Every
 rank runs independent trajectories; log_J samples are aggregated with
 log-sum-exp on rank 0.  A classical (diagonal) ensemble has O_C == 0
 identically, so a resolved non-zero closed X-loop is a direct coherence
