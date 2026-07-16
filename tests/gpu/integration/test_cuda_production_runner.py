@@ -19,7 +19,7 @@ if not qaqmc_cuda.is_available():
 
 def test_rank_local_profile_output_and_checkpoint_resume(tmp_path):
     root = Path(__file__).resolve().parents[3]
-    script = root / "main_scripts/python_scripts/run_qaqmc_cuda.py"
+    script = root / "scripts/run/run_qaqmc_cuda.py"
     run_dir = tmp_path / "run"
     base = [
         sys.executable, str(script),

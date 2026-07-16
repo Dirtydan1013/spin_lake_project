@@ -41,8 +41,6 @@ old_code/
 
 logs/
 
-scripts/*
-!scripts/experiments/
 
 task/
 
@@ -64,7 +62,7 @@ tex/
 build_asan/
 
 build_dbg/
-main_scripts/common/site.conf
+scripts/common/site.conf
 build_staging/
 figures/
 plots/*.png

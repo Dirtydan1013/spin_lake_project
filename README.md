@@ -60,7 +60,7 @@ event-scratch capacity。系統超過 16-bit index 範圍時會自動 fallback �
 ```bash
 cd /tmp
 PYTHONPATH=/path/to/spin_lake_project/build:/path/to/spin_lake_project \
-python /path/to/spin_lake_project/main_scripts/python_scripts/probe_qaqmc_cpu_memory.py \
+python /path/to/spin_lake_project/scripts/bench/probe_qaqmc_cpu_memory.py \
     --M 2760000 --warmup-steps 2 --timed-steps 5
 ```
 
@@ -122,12 +122,12 @@ srun --partition=gpu --nodelist=gpunode02 --gres=gpu:1 --cpus-per-task=2 \
 單 GPU production job：
 
 ```bash
-sbatch main_scripts/slurm_scripts/run_kagome_qaqmc_cuda.sh
+sbatch scripts/run/run_kagome_qaqmc_cuda.sh
 
 # 多條獨立 chain 可用 job array；給所有 task 同一個絕對 RUN_DIR，
 # SLURM_ARRAY_TASK_ID 會成為 rank/seed offset。
 RUN_DIR=$PWD/data/qaqmc_cuda_ensemble \
-  sbatch --array=0-2 main_scripts/slurm_scripts/run_kagome_qaqmc_cuda.sh
+  sbatch --array=0-2 scripts/run/run_kagome_qaqmc_cuda.sh
 ```
 
 CUDA runner 目前輸出 rank-local batched profile：density、`Z_l`、`C_m_l`、
@@ -139,29 +139,29 @@ single-replica QAQMC 已 GPU 化；Rényi/work 與 off-diagonal seam/string 仍�
 
 ## 提交 / 執行腳本
 
-production 腳本在 `main_scripts/slurm_scripts/`，同一份腳本在有無 SLURM 的
+production 腳本在 `scripts/run/`，同一份腳本在有無 SLURM 的
 機器上都能跑（`#SBATCH` 標頭在直接執行時只是註解）：
 
 ```bash
 # 統一入口：有 sbatch 就提交 job，沒有就 nohup 背景執行（log 寫到 logs/）
-./main_scripts/submit.sh main_scripts/slurm_scripts/run_kagome_sse.sh
+./scripts/submit.sh scripts/run/run_kagome_sse.sh
 
 # 額外參數會透傳給 sbatch（覆寫 #SBATCH 標頭）
-./main_scripts/submit.sh main_scripts/slurm_scripts/run_kagome_otf.sh --nodelist=cpunode02
+./scripts/submit.sh scripts/run/run_kagome_otf.sh --nodelist=cpunode02
 
 # 也可以照舊直接用
-sbatch main_scripts/slurm_scripts/run_kagome_otf.sh       # SLURM cluster
-bash   main_scripts/slurm_scripts/run_kagome_otf.sh       # 一般 server（前景）
+sbatch scripts/run/run_kagome_otf.sh       # SLURM cluster
+bash   scripts/run/run_kagome_otf.sh       # 一般 server（前景）
 ```
 
 所有腳本參數都用環境變數覆寫，例如：
 
 ```bash
 NX=8 NY=8 M=200000 N_TRAJ=8000 \
-    ./main_scripts/submit.sh main_scripts/slurm_scripts/run_kagome_renyi_work.sh
+    ./scripts/submit.sh scripts/run/run_kagome_renyi_work.sh
 ```
 
-資源與綁核（由 `main_scripts/common/env.sh` 統一處理）：
+資源與綁核（由 `scripts/common/env.sh` 統一處理）：
 
 - **SLURM job 內**：ranks / cores-per-rank 自動取自 `SLURM_NTASKS` /
   `SLURM_CPUS_PER_TASK`。
@@ -170,7 +170,7 @@ NX=8 NY=8 M=200000 N_TRAJ=8000 \
 - launcher 兩種情況都是 `mpiexec`（conda 的 Open MPI 沒有 SLURM/PMIx 整合，
   不要用 srun）。
 - **site 專屬設定**（綁核策略、conda 路徑等）：
-  `cp main_scripts/common/site.conf.example main_scripts/common/site.conf`
+  `cp scripts/common/site.conf.example scripts/common/site.conf`
   後編輯（此檔已 gitignore）。例如 AMD EPYC 建議
   `BIND_FLAGS="--map-by numa:PE=$CPT --bind-to core"`；container 內
   `BIND_FLAGS="--bind-to none"`。
