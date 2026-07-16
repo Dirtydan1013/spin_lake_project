@@ -11,6 +11,19 @@
 #SBATCH --output=logs/probe_work_cuda_%j.out
 #SBATCH --error=logs/probe_work_cuda_%j.err
 
+# ─── Runtime probe: CUDA work engines (string / Renyi) vs CPU ────────────────
+#
+# Times full step + topology sweep of the selected CUDA work engine at
+# production geometry and compares against the CPU reference, reporting
+# timings, speedup and VRAM as JSON to stdout.
+# Instrument: python -m src.probes.qaqmc_work_cuda (also reused by the
+# test/ gates and bench/ production benchmark with different parameters).
+#
+# Output: JSON in the job log only (no data/ files).
+# Knobs (env): ENGINE=renyi|string, M, GPU_STEPS / CPU_STEPS.
+# Usage:  sbatch scripts/probe/probe_qaqmc_work_cuda.sh
+#         ENGINE=string M=100000 sbatch scripts/probe/probe_qaqmc_work_cuda.sh
+
 set -euo pipefail
 
 ROOT=${ROOT:-$PWD}

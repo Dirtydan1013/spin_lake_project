@@ -14,6 +14,9 @@
 # real batch at the production geometry/beta/K (a few trajectories per rank),
 # extrapolated to the production budget.  Mirrors run_kagome_offdiagonal.sh
 # defaults; sibling of probe_string_work_runtime.sh (QAQMC version).
+#
+# Output: timing/extrapolation report in the job log only (no data/ files).
+# Usage:  sbatch scripts/probe/probe_sse_offdiagonal_runtime.sh
 
 set -euo pipefail
 

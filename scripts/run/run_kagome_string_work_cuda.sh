@@ -11,12 +11,21 @@
 #SBATCH --output=logs/string_work_cuda_%j.out
 #SBATCH --error=logs/string_work_cuda_%j.err
 
-# One MPI rank per allocated GPU.  The Python driver maps node-local ranks to
-# visible devices, and also handles Slurm installations that expose only one
-# CUDA device to each task.
-# Resume example (reuse the original job's tag/path):
-#   sbatch --export=ALL,RESUME=1,RUN_TAG=<original_job_id> \
-#     scripts/run/run_kagome_string_work_cuda.sh
+# ─── CUDA string-work production run (X_C Jarzynski, GPU backend) ────────────
+#
+# GPU sibling of run_kagome_string_work.sh: same driver
+# (src.mpi.qaqmc_string_work_mpi) with --backend cuda — one MPI rank per
+# allocated GPU (the driver maps node-local ranks to visible devices, and
+# handles Slurm installs that expose only one CUDA device per task).
+# Adds EXACT trajectory resume from the last committed chunk (operator
+# checkpoint + Philox counters, RESUME=1).
+#
+# Output: data/string_work_cuda_..._<RUN_TAG>.h5 (+ _chunks/K{K}/rank{r}.h5).
+# Usage:  sbatch scripts/run/run_kagome_string_work_cuda.sh
+#         # resume, reusing the original job's tag/paths:
+#         sbatch --export=ALL,RESUME=1,RUN_TAG=<original_job_id> \
+#           scripts/run/run_kagome_string_work_cuda.sh
+# Key knobs (env): STRING_SITES / STRING_SIZE, K_VALUES, N_TRAJ, DECORR, M.
 
 set -euo pipefail
 

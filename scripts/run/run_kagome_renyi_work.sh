@@ -32,6 +32,10 @@
 # Performance note: ~32 ranks × 4 OMP threads matches cpunode02's topology.
 # OMP only speeds up the per-step alias-table refresh and cluster builder;
 # sampling itself is single-threaded per rank.
+#
+# Output: data/renyi_work_... .h5 (+ _chunks/K{K}/rank{r}.h5, configs/).
+# Usage:  ./scripts/submit.sh scripts/run/run_kagome_renyi_work.sh
+#         KP_START=A KP_END=AB KP_M=2 K_VALUES=400 ./scripts/submit.sh scripts/run/run_kagome_renyi_work.sh
 
 set -euo pipefail
 

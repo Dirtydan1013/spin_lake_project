@@ -23,6 +23,10 @@
 # incremental checkpointing per CKPT_TRAJ trajectories, warm start via
 # CONFIG_IN (must match N/beta/delta/boundary — SSE configs are
 # temperature-specific), n_eff / zero_frac convergence diagnostics in the log.
+#
+# Output: data/sse_string_work_... .h5 (+ _chunks/K{K}/rank{r}.h5).
+# Usage:  ./scripts/submit.sh scripts/run/run_kagome_offdiagonal.sh
+#         BETA=40 STRING_SIZE=3 ./scripts/submit.sh scripts/run/run_kagome_offdiagonal.sh
 
 set -euo pipefail
 

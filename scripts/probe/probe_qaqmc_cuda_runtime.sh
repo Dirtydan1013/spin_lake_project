@@ -11,6 +11,18 @@
 #SBATCH --output=logs/probe_qaqmc_cuda_%j.out
 #SBATCH --error=logs/probe_qaqmc_cuda_%j.err
 
+# ─── Runtime probe: CUDA standard QAQMC vs CPU reference ────────────────────
+#
+# Times the device-resident diagonal+cluster full step at production geometry
+# (6x6 kagome_bond, N=216) and compares against the CPU engine on the same
+# node, reporting per-phase timings, speedup and VRAM as JSON to stdout.
+# Instrument: python -m src.probes.runtime_qaqmc_cuda (src/probes/README.md).
+#
+# Output: JSON in the job log only (no data/ files).
+# Knobs (env): M (slices/half-ramp), GPU_STEPS / CPU_STEPS / FULL_STEPS.
+# Usage:  sbatch scripts/probe/probe_qaqmc_cuda_runtime.sh
+#         M=27600000 sbatch scripts/probe/probe_qaqmc_cuda_runtime.sh
+
 set -euo pipefail
 
 ROOT=${ROOT:-$PWD}

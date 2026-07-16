@@ -14,6 +14,9 @@
 # a handful of mc_steps at the PRODUCTION geometry (after M has grown to its
 # steady state) and extrapolates to the full equil + sample budget.  Mirrors
 # run_kagome_sse.sh defaults (triangle lattice) so the estimate is realistic.
+#
+# Output: timing/extrapolation report in the job log only (no data/ files).
+# Usage:  sbatch scripts/probe/probe_sse_runtime.sh
 
 set -euo pipefail
 

@@ -11,9 +11,22 @@
 #SBATCH --output=logs/renyi_work_cuda_%j.out
 #SBATCH --error=logs/renyi_work_cuda_%j.err
 
-# Resume example (reuse the original job's tag/path):
-#   sbatch --export=ALL,RESUME=1,RUN_TAG=<original_job_id> \
-#     scripts/run/run_kagome_renyi_work_cuda.sh
+# ─── CUDA Renyi work-engine production run (KP ΔS₂, GPU backend) ────────────
+#
+# GPU sibling of run_kagome_renyi_work.sh: same driver
+# (src.mpi.qaqmc_renyi_work_mpi) with --backend cuda — one MPI rank per
+# allocated GPU (the driver maps node-local ranks to visible devices).
+# Adds EXACT trajectory resume: each committed chunk carries the rolling
+# operator checkpoint + Philox counters, so an interrupted run continues
+# bit-identically (RESUME=1).
+#
+# Output: data/renyi_work_cuda_..._<RUN_TAG>.h5 (+ _chunks/K{K}/rank{r}.h5).
+# Usage:  sbatch scripts/run/run_kagome_renyi_work_cuda.sh
+#         # resume, reusing the original job's tag/paths:
+#         sbatch --export=ALL,RESUME=1,RUN_TAG=<original_job_id> \
+#           scripts/run/run_kagome_renyi_work_cuda.sh
+# Key knobs (env): KP_START/KP_END/KP_M (region pair), K_VALUES, N_TRAJ,
+#         DECORR, M, NX/NY; defaults target the 6x6 KP TEE campaign.
 
 set -euo pipefail
 

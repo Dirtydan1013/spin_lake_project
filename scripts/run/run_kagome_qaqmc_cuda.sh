@@ -11,10 +11,25 @@
 #SBATCH --output=logs/qaqmc_cuda_%j.out
 #SBATCH --error=logs/qaqmc_cuda_%j.err
 
+# ─── CUDA QAQMC diagonal-profile production run (single-replica engine) ─────
+#
+# GPU sibling of run_kagome_otf.sh: device-resident standard QAQMC producing
+# rank-local batched profiles (density/Z_l/C_m_l/A_v/VBS/SS + occ-SF at
+# selected deltas) with exact Philox checkpoint/resume.
+# Runner: python -m src.runners.qaqmc_cuda (needs build_cuda/qaqmc_cuda).
+#
 # One job owns one GPU and runs one independent chain.  Submit multiple jobs
-# for multiple chains; Slurm selects an idle A100/V100 and masks it as device 0.
-# The process starts outside the repository so a stale root-level native
-# qaqmc_cpp*.so cannot shadow build_cuda via Python's empty import path.
+# (or a job array with a shared absolute RUN_DIR) for multiple chains; Slurm
+# selects an idle A100/V100 and masks it as device 0.
+#
+# Output: $RUN_DIR/rank{r}.h5 (chunked, resumable).
+# Usage:  sbatch scripts/run/run_kagome_qaqmc_cuda.sh
+#         RUN_DIR=$PWD/data/qaqmc_cuda_ensemble \
+#           sbatch --array=0-2 scripts/run/run_kagome_qaqmc_cuda.sh
+#
+# NOTE: the process starts outside the repository (cd $SLURM_TMPDIR) so a
+# stale root-level native qaqmc_cpp*.so cannot shadow build_cuda via
+# Python's empty import path ("Illegal instruction" trap — see README).
 
 set -euo pipefail
 

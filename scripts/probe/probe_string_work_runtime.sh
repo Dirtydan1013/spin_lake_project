@@ -14,6 +14,9 @@
 # batch at the production geometry/M/K (a few trajectories per rank) and
 # extrapolates elapsed-per-trajectory to the production budget.  Mirrors
 # run_kagome_string_work.sh defaults.
+#
+# Output: timing/extrapolation report in the job log only (no data/ files).
+# Usage:  sbatch scripts/probe/probe_string_work_runtime.sh
 
 set -euo pipefail
 

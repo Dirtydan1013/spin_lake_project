@@ -25,6 +25,10 @@
 # Convergence diagnostics to watch in the log: n_eff/n_traj (Jarzynski
 # effective sample size) and zero_frac (trajectories ending with J=0 —
 # refine the λ schedule / raise K if it is large).
+#
+# Output: data/string_work_... .h5 (+ _chunks/K{K}/rank{r}.h5, configs/).
+# Usage:  ./scripts/submit.sh scripts/run/run_kagome_string_work.sh
+#         STRING_SIZE=2 K_VALUES=200,400 ./scripts/submit.sh scripts/run/run_kagome_string_work.sh
 
 set -euo pipefail
 
