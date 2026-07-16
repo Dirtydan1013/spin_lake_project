@@ -1,12 +1,16 @@
 # QAQMC CPU Memory Optimization：均衡版實作與後續計畫
 
-最後更新：2026-07-15
+最後更新：2026-07-16
 分支：`cpu_memory_optimization`  
 基準分支：`z2_spin_lake` (`31d6c5c`)  
 第一階段範圍：standard single-replica `QAQMCEngine`，`N=216`、full bonds、超長 operator string 與 64-chain CPU production。
-當前狀態：**均衡版、process-local shared model、多 chain threaded runner 與
-三種 event layouts 均已實作；單 socket 與 `M=100M` fit gate 已完成。
-`cpunode02` 的 64-rank/4-socket NUMA jobs 已提交，等待既有 production job 釋放 node。**
+當前狀態：**全部 production gates 完成。** 均衡版、process-local shared model、
+多 chain threaded runner 與三種 event layouts 均已實作；單 socket 與 `M=100M`
+fit gate 已完成。`cpunode02` 的 64-rank A/B 與 4-socket NUMA gate 已於
+2026-07-16 通過（jobs `26784`/`26785`，M=2.76M；production-M 確認
+`26786`/`26787`，M=27.6M）——結果見 §1.4。原 jobs `26731`/`26732` 因
+排隊期間共用 working tree 被切回 `z2_spin_lake` 而失敗（probe scripts
+不在該分支）；重跑改從 dedicated worktree 提交，job 引用的 checkout 不可變。
 
 CPU native source 已集中到 `csrc/cpu/{detail,module}`，`qaqmc_cpp` public API、
 Python/MPI imports 與舊 C++ include paths保持相容，方便後續與 `csrc/cuda` 合併。
@@ -60,8 +64,83 @@ bonds、`G=600`、seed 42。RSS 在 warmup 後、operator export 前量測。
 不但沒有速度回歸，在這兩個大 `M` 上還快 11–18%。
 
 `cpunode02` 當時正在執行本帳號的 64-core production job，因此沒有搶佔
-該 node 做 64-rank A/B。這是目前唯一尚未執行的 balanced production gate，
-不影響已完成的單-chain 實作與 correctness gates。
+該 node 做 64-rank A/B。該 gate 已於 2026-07-16 補齊，結果見 §1.4——
+64-rank 下均衡版不但沒有 regression，反而比 baseline 快 21%，RSS 省 39%。
+
+### 1.4 cpunode02 64-rank / 4-socket NUMA gate（2026-07-16）
+
+執行環境：`cpunode02`（4 sockets、64 physical cores / 128 HT、256 GB）、
+exclusive node、portable x86-64 Release build（worktree `build_gate`，branch
+head `eea6e75`，28 個 focused tests 先通過）。baseline = `31d6c5c` 舊引擎。
+
+**64 獨立 MPI ranks A/B（job `26784`，`M=2.76M`，`--bind-to core`）：**
+
+| variant | median s/step | slowest s/step | node steps/s | rank RSS (max) | node RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline packed64 | 1.0296 | 1.2113 | 62.16 | 650.2 MiB | 40.61 GiB |
+| optimized packed64 | 0.8496 | 0.9825 | 75.33 (**+21.2%**) | 396.4 MiB (**−39.0%**) | 24.71 GiB (**−39.2%**) |
+| optimized `p_bond16` | 0.8457 | 0.9568 | 75.68 (**+21.8%**) | 374.8 MiB (**−42.4%**) | 23.39 GiB |
+| optimized `p_only32` | 1.4252 | 1.6426 | 44.91 (−27.7%) | 354.7 MiB | 22.08 GiB |
+
+- balanced acceptance「64-rank chain-steps/s regression ≤5%」**通過**（實際 +21%）；
+  RSS/rank 節省 39–42%，與單核 A/B 一致。
+- `p_only32` 在 64-rank 競爭下 slowdown 放大到 −28%（單核只 −10%）——
+  dependent random load 在記憶體頻寬飽和時代價加倍，**確認只作 RAM 硬上限
+  的最後手段**，不進 production 預設。
+
+**4 ranks × socket、shared-model threaded batch（job `26785`，`M=2.76M`，
+`--map-by ppr:1:socket:PE=16`）：**
+
+| storage | chains/rank | total | node chain-steps/s | node RSS |
+| --- | ---: | ---: | ---: | ---: |
+| packed64 | 1 | 4 | 8.19 | 1.88 GiB |
+| packed64 | 4 | 16 | 34.82 | 3.14 GiB |
+| packed64 | 8 | 32 | 54.15 | 4.80 GiB |
+| packed64 | 16 | 64 | 74.23 | 8.15 GiB |
+| `p_bond16` | 16 | 64 | **76.61** | **6.80 GiB** |
+| `p_only32` | 16 | 64 | 42.19 | 5.48 GiB |
+
+- 等量 64 chains 比較：shared-model `p_bond16` 76.61 steps/s @ 6.80 GiB，
+  vs 64 獨立 optimized ranks 75.33 @ 24.71 GiB，vs 64 獨立 baseline ranks
+  62.16 @ 40.61 GiB —— **throughput 持平偏快（+1.7%），node RSS 再省 72%**；
+  對 baseline 是 +23% throughput、**RSS 1/6**。shared-model acceptance
+  「throughput 至少持平」通過。
+- marginal RSS ≈ 85–107 MiB/chain（`p_bond16`/packed64），確認 immutable
+  model pages 沒有隨 chain 數線性複製。
+**Production-M 確認（`M=27.6M`，jobs `26786`/`26787`）：**
+
+64 獨立 MPI ranks A/B（job `26786`）：
+
+| variant | median s/step | node steps/s | rank RSS (max) | node RSS |
+| --- | ---: | ---: | ---: | ---: |
+| baseline packed64 | 9.4752 | 6.755 | 2213.9 MiB | 138.26 GiB |
+| optimized packed64 | 8.2026 | 7.802 (**+15.5%**) | 1344.7 MiB (**−39.3%**) | 83.94 GiB |
+| optimized `p_bond16` | 8.0911 | 7.910 (**+17.1%**) | 1135.0 MiB (**−48.7%**) | 70.87 GiB |
+| optimized `p_only32` | 13.5229 | 4.733 (−29.9%) | 923.9 MiB | 57.65 GiB |
+
+→ balanced acceptance「`M>=27.6M` memory/rank ≥38% 節省」與「64-rank steps/s
+regression ≤5%」皆通過（實際 −39.3% RSS、**+15.5%** steps/s）。
+
+64-chain shared-model（job `26787`，4 ranks × 16 chains，warmup 1 / steps 3）：
+
+| storage | node chain-steps/s | rank RSS (max) | node RSS | model/socket |
+| --- | ---: | ---: | ---: | ---: |
+| packed64 | 6.884 | 17.26 GiB | **67.40 GiB** | 240.93 MiB |
+| `p_bond16` | 7.076 | 13.92 GiB | **54.34 GiB** | 240.93 MiB |
+
+→ shared-model acceptance「64 chains、`M=27.6M` engine core < 70 GiB/node」
+**通過**（packed64 全 process RSS 67.4 GiB 已含 4 份 Python runtime；
+`p_bond16` 54.3 GiB 且餘裕充足）。
+
+**誠實註記（throughput nuance）**：在 `M=2.76M` 時 shared-model 與 64 獨立
+ranks throughput 持平（76.6 vs 75.7 steps/s）；但在 production `M=27.6M`
+shared-model 比 64 獨立 optimized ranks 慢 ~10–12%（7.08 vs 7.91 steps/s，
+`p_bond16`），只比 64 獨立 **baseline** ranks 快 +4.7%。大 M 下 working set
+遠超 LLC，per-socket 16 threads 的頻寬競爭抵銷了 shared-table reuse。
+結論：**`M≈27.6M` 在 256 GB node 上 production 首選仍是 64 獨立 optimized
+`p_bond16` ranks（70.9 GiB、最快）**；shared-model 的定位是 RAM-bound regime
+（`M≳100M`，64 獨立 ranks ≈213 GiB 放不下，shared-model 可以），
+用 ~10% throughput 換 chains 能不能開得起來。
 
 ### 1.3 Shared-model 與大 M 實測結論
 
@@ -328,8 +407,9 @@ CLI 完全保留，可逐批遷移。
 上述表格是設計期保守估值；實作後應以 probe 的
 `shared_model_bytes + sum(per_chain_capacity_bytes)` 與 process RSS 為準。
 `cpunode01` 的 1/2/4/8/16-chain scaling 已完成；`cpunode02` 的 4 ranks ×
-1/2/4/8/16 chains job `26732` 已提交但仍等候 node；獨立 64-rank A/B 是
-job `26731`。
+1/2/4/8/16 chains 與獨立 64-rank A/B 已由 jobs `26785`/`26784` 完成
+（原 `26731`/`26732` 因 shared-tree branch switch 失敗後重跑），
+結果見 §1.4。
 
 ## 5. Optional aggressive memory mode
 
@@ -402,7 +482,7 @@ trajectory exact。`p_bond16` 在 `M=2.76M/27.6M/100M` 分別省
 - [x] 移除 materialized `delta_sched_`，完成所有 standard-engine call-site migration。
 - [x] 通過 standard、profile、off-diagonal seam/string 與 ED regression tests。
 - [x] 在 `cpunode01` 完成單核 production-scale memory/performance A/B。
-- [ ] `cpunode02` 空出後補 64-rank node-throughput A/B。
+- [x] `cpunode02` 64-rank node-throughput A/B（job `26784`，§1.4：+21% steps/s、−39% RSS）。
 
 ### Phase 3：immutable model sharing
 
@@ -495,9 +575,14 @@ trajectory exact。`p_bond16` 在 `M=2.76M/27.6M/100M` 分別省
 ### Shared-model acceptance
 
 - 同 Hamiltonian 的 node-local table physical pages不得隨 chain count線性增加。
+  ✅（§1.4：marginal ≈85–107 MiB/chain @2.76M，model 每 socket 一份 240.9 MiB）
 - 64 chains、M=27.6M engine core目標低於 70 GiB/node。
-- shared-table synchronization與mapping不能成為每-step overhead。
+  ✅（§1.4 job `26787`：packed64 67.4 GiB、`p_bond16` 54.3 GiB 全 process RSS）
+- shared-table synchronization與mapping不能成為每-step overhead。✅
 - node throughput至少持平，理想目標提高 10–30%（來自 LLC/NUMA reuse）。
+  ⚠️ 部分達成：`M=2.76M` 持平（+1.7% vs 獨立 optimized ranks）；`M=27.6M`
+  −10–12% vs 獨立 optimized ranks（+4.7% vs 獨立 baseline）。LLC reuse 紅利
+  在大 M 被 socket 頻寬競爭抵銷——見 §1.4 誠實註記與 production 建議。
 
 ### Aggressive-mode acceptance
 
@@ -530,8 +615,8 @@ trajectory exact。`p_bond16` 在 `M=2.76M/27.6M/100M` 分別省
 - [x] optional aggressive event representations（Phase 4）。
 - [x] CPU public/detail/pybind source tree 模組化與 legacy header compatibility gate。
 - [x] 1/2/4/8/16-chain single-socket scaling benchmark。
-- [ ] `cpunode02` 64-rank與64-chain NUMA/core-binding benchmark
-  （jobs `26731`/`26732` pending）。
+- [x] `cpunode02` 64-rank與64-chain NUMA/core-binding benchmark
+  （jobs `26784`/`26785` @ M=2.76M、`26786`/`26787` @ M=27.6M；§1.4）。
 
 balanced compact representation維持 default；shared model是 opt-in batch API，
 aggressive events是 runtime option，三者都有獨立 rollback surface。
