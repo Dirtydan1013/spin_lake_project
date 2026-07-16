@@ -19,6 +19,24 @@ model fingerprint、collective multi-K resume、compact theorem 與 MPI affinity
 login node 無 GPU，非失敗）。最新 CUDA build 的 real-GPU gate 仍由 Slurm jobs
 負責。
 
+## Post-merge 驗證（2026-07-16，merge commit `f641113` 進 `z2_spin_lake`）
+
+- 本分支與 `cpu_memory_optimization` 均已 merge 進 `z2_spin_lake`；衝突照
+  `csrc/cpu/README.md` merge contract 解決（monolithic `bindings.cpp` 保持刪除、
+  CUDA model export 走 `qaqmc_cuda_bridge.inc`）。
+  `tests/mpi/integration/test_cuda_work_resume.py` 改名 `*_mpi.py`（與
+  `tests/gpu/integration/` 同名檔在單次 pytest 收集時衝突）。
+- Merge 後 login-node gate：`qaqmc_cpp` + `qaqmc_cuda`（sm_70;80）build clean；
+  engines/mpi unit `127 passed`、mpi integration `6 passed`、engines
+  integration `4 passed`。注意 login node（beehive）有一張 Quadro P400
+  （sm_61）：GPU tests 在該機是 "no kernel image" **failure** 而非 skip，
+  本地跑請設 `CUDA_VISIBLE_DEVICES=""`。
+- **Real-GPU gate（job `26789`，V100 sm_70）**：merge 後 build_cuda 上
+  `tests/gpu` **108 passed**（19.67s），string/Rényi work probes 正常，
+  stderr 為空。三卡架構 gate（A100 + 2×V100）job `26788` 因
+  `--gres=gpu:3` 觸發 `ReqNodeNotAvail` 仍在佇列（單卡 `gpu:1` 可立即
+  allocation —— 同 2026-07-15 的 Slurm blocker 模式）；跑成後補記於此。
+
 ## CUDA source modularization
 
 - [x] 原本約 3,843 行的 `qaqmc_cuda_scan.cu` 拆成 runtime、standard/off-diagonal
