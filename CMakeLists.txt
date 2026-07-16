@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Optional CUDA backend.  Keep this OFF by default so CPU-only deployments and
+# the existing qaqmc_cpp module retain exactly the same build requirements.
+option(QAQMC_ENABLE_CUDA "Build the optional qaqmc_cuda backend" OFF)
+set(QAQMC_CUDA_ARCHITECTURES "70;80" CACHE STRING
+    "CUDA architectures for qaqmc_cuda (gpunode02: V100=70, A100=80)")
+
 # ── Find pybind11 (installed via pip) ────────────────────────────────────────
 find_package(pybind11 REQUIRED)
 
@@ -123,4 +129,44 @@ if(MINGW)
         LINK_FLAGS_RELEASE ""
     )
     set(CMAKE_STRIP "" CACHE FILEPATH "" FORCE)
+endif()
+
+# ── Optional CUDA extension ──────────────────────────────────────────────────
+if(QAQMC_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    pybind11_add_module(qaqmc_cuda
+        csrc/cuda/bindings_cuda.cpp
+        csrc/cuda/bindings_cuda_runtime.cpp
+        csrc/cuda/bindings_cuda_diagonal.cpp
+        csrc/cuda/bindings_cuda_renyi.cpp
+        csrc/cuda/bindings_cuda_batch_diagonal.cpp
+        csrc/cuda/bindings_cuda_batch_renyi.cpp
+        csrc/cuda/qaqmc_cuda_scan.cu
+        csrc/cuda/qaqmc_cuda_diagonal.cu
+        csrc/cuda/qaqmc_cuda_renyi.cu
+        csrc/cuda/qaqmc_cuda_batch_diagonal.cu
+        csrc/cuda/qaqmc_cuda_batch_renyi.cu
+    )
+    target_include_directories(qaqmc_cuda PRIVATE csrc/cuda)
+    target_link_libraries(qaqmc_cuda PRIVATE CUDA::cudart)
+    set_target_properties(qaqmc_cuda PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES "${QAQMC_CUDA_ARCHITECTURES}"
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+    target_compile_options(qaqmc_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        # Batch engines launch independent chains from separate host threads.
+        # Per-thread default streams let those kernels overlap without changing
+        # the established single-chain launch signatures.
+        $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
+    )
 endif()

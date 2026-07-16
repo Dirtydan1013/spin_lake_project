@@ -32,3 +32,11 @@ if _BUILD_DIR.exists():
             raise RuntimeError(
                 f"QAQMC_TEST_BUILD_DIR selected {_BUILD_DIR}, but pytest loaded "
                 f"qaqmc_cpp from {_loaded_dir}")
+
+# Optional CUDA build is kept separate so CPU-only configure/build remains
+# untouched.  GPU tests import qaqmc_cuda from here when the module has been
+# built.  Appended AFTER the selected CPU build so a qaqmc_cpp compiled inside
+# build_cuda can never shadow the explicitly pinned CPU extension above.
+_CUDA_BUILD_DIR = _REPO_ROOT / "build_cuda"
+if _CUDA_BUILD_DIR.exists() and str(_CUDA_BUILD_DIR) not in sys.path:
+    sys.path.append(str(_CUDA_BUILD_DIR))
