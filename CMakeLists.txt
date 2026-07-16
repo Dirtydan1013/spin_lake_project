@@ -32,7 +32,6 @@ set(QAQMC_CPU_ENGINE_SOURCES
 
 set(QAQMC_CPU_MODULE_SOURCES
     csrc/cpu/module/module.cpp
-    csrc/cpu/module/compatibility_headers.cpp
     csrc/cpu/module/bindings_qaqmc.cpp
     csrc/cpu/module/bindings_renyi.cpp
     csrc/cpu/module/bindings_sse.cpp
