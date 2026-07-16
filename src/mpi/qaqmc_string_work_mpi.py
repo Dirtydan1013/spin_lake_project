@@ -42,8 +42,13 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from src.engines.qaqmc_string_work import QAQMCStringWorkRydberg, cosine_schedule
-from src.mpi.chunk_io import RankChunkWriter
+from src.mpi.chunk_io import (
+    RankChunkWriter,
+    array_fingerprint,
+    collective_resume_decision,
+    compact_operator_checkpoint,
+    load_checkpointed_rank_chunks,
+)
 from src.mpi.equil_progress import run_equil_with_progress
 from src.mpi.site_permutation import (permute_rows, resolve_site_permutation,
                                       to_engine)
@@ -51,6 +56,97 @@ from src.rydberg.lattices import (
     generate_1d_chain,
     generate_kagome_bond_lattice,
 )
+
+
+def _engine_type_and_schedule_for_backend(backend: str):
+    """Resolve only the selected backend, preserving CPU import semantics."""
+    if backend == "cuda":
+        # Load the CUDA facade first so qaqmc_cpp comes from build_cuda; its
+        # CPU base import then reuses that already-loaded portable module.
+        from src.engines.qaqmc_string_work_cuda import QAQMCStringWorkRydbergCUDA
+        from src.engines.qaqmc_string_work import cosine_schedule
+
+        return QAQMCStringWorkRydbergCUDA, cosine_schedule
+    if backend == "cpu":
+        from src.engines.qaqmc_string_work import (
+            QAQMCStringWorkRydberg,
+            cosine_schedule,
+        )
+
+        return QAQMCStringWorkRydberg, cosine_schedule
+    raise ValueError("backend must be 'cpu' or 'cuda'")
+
+
+_STRING_CHUNK_DATASETS = ("log_j_samples",)
+
+
+def _permutation_checkpoint(site_perm, n_sites: int) -> np.ndarray:
+    return np.asarray(
+        np.arange(n_sites, dtype=np.int32) if site_perm is None else site_perm,
+        dtype=np.int32,
+    )
+
+
+def _string_cuda_checkpoint(eng, site_perm, n_sites: int) -> tuple[dict, dict]:
+    """Export the rolling start-sector checkpoint plus Philox counters."""
+    if not eng._eng.has_checkpoint:
+        raise RuntimeError("string CUDA engine has no rolling checkpoint")
+    eng._eng.restore_device_checkpoint()
+    types, sites = eng._eng.get_operator_string()
+    types, sites = compact_operator_checkpoint(types, sites)
+    return (
+        dict(
+            op_types=types,
+            op_sites=sites,
+            site_perm=_permutation_checkpoint(site_perm, n_sites),
+        ),
+        dict(
+            sweep_id=int(eng._eng.sweep_id),
+            topology_id=int(eng._eng.topology_id),
+            checkpoint_mask=int(eng._checkpoint_mask),
+        ),
+    )
+
+
+def _restore_string_cuda_checkpoint(eng, checkpoint: dict, site_perm,
+                                    n_sites: int, direction: str) -> None:
+    datasets = checkpoint["datasets"]
+    attrs = checkpoint["attrs"]
+    expected_perm = _permutation_checkpoint(site_perm, n_sites)
+    if "site_perm" not in datasets:
+        raise ValueError("string CUDA continuation checkpoint lacks site_perm")
+    if not np.array_equal(np.asarray(datasets["site_perm"]), expected_perm):
+        raise ValueError("string CUDA continuation checkpoint site permutation changed")
+    expected_mask = 0 if direction == "forward" else eng._full_mask()
+    if int(attrs["checkpoint_mask"]) != expected_mask:
+        raise ValueError("string CUDA continuation checkpoint has wrong start sector")
+    eng._eng.set_op_string(
+        np.ascontiguousarray(datasets["op_types"], dtype=np.int32),
+        np.ascontiguousarray(datasets["op_sites"], dtype=np.int32),
+    )
+    eng.thermalize(0, direction=direction)
+    eng._eng.sweep_id = int(attrs["sweep_id"])
+    eng._eng.topology_id = int(attrs["topology_id"])
+
+
+def _cuda_device_for_rank(comm) -> int:
+    """Map a node-local MPI rank to a visible CUDA device.
+
+    Slurm ``--gpus-per-task=1`` exposes one device per process, in which case
+    its local index is always zero.  Plain ``mpiexec`` commonly exposes every
+    allocated device, so use the shared-memory communicator rank there.
+    """
+    import qaqmc_cuda
+
+    visible = len(qaqmc_cuda.device_info())
+    if visible <= 0:
+        raise RuntimeError("CUDA backend selected but no GPU is visible")
+    local = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    try:
+        local_rank = local.Get_rank()
+    finally:
+        local.Free()
+    return 0 if visible == 1 else int(local_rank % visible)
 
 
 def _rank_seed(seed: int, rank: int) -> int:
@@ -98,22 +194,44 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         config_out: str | None = None,
                         equil_progress_every: int = 500,
                         permute_site_labels: bool = True,
+                        backend: str = "cpu",
+                        resume: bool = False,
                         verbose: bool = True) -> dict | None:
     """config_in: warm-start directory of rank{r}.h5 final configurations from
     a previous run with the same (N, M, Hamiltonian); when given, per-K
     thermalization is skipped (the loaded op string is already equilibrated —
     the configuration is K-independent).  config_out: where each rank saves
-    its final configuration (default <filepath minus .h5>_configs)."""
+    its final configuration (default <filepath minus .h5>_configs).
+    ``resume=True`` is CUDA-only and restores the exact rolling operator
+    checkpoint and Philox counters committed with the last sample chunk."""
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
+    if backend not in {"cpu", "cuda"}:
+        raise ValueError("backend must be 'cpu' or 'cuda'")
+    if checkpoint_every_trajectories < 0:
+        raise ValueError("checkpoint_every_trajectories must be non-negative")
+    if n_trajectories <= 0:
+        raise ValueError("n_trajectories must be positive")
+    if n_thermalize < 0 or decorrelation_steps < 0:
+        raise ValueError("thermalization/decorrelation counts must be non-negative")
+    if n_topology_sweeps_per_lambda < 0 or n_qaqmc_sweeps_per_lambda < 0:
+        raise ValueError("per-lambda sweep counts must be non-negative")
+    if not K_values or any(int(K) < 1 for K in K_values):
+        raise ValueError("K_values must contain positive integers")
+    if resume and backend != "cuda":
+        raise ValueError("exact trajectory resume is supported only by backend='cuda'")
+    if resume and (checkpoint_every_trajectories <= 0 or not checkpoint_dir):
+        raise ValueError("resume requires checkpoint_every_trajectories and checkpoint_dir")
+    engine_type, cosine_schedule = _engine_type_and_schedule_for_backend(backend)
 
     base = n_trajectories // n_ranks
     rem = n_trajectories % n_ranks
     my_n = base + (1 if rank < rem else 0)
+    rank_seed = _rank_seed(seed, rank)
 
     if rank == 0 and verbose:
-        print(f"[MPI-STRWORK] N={N}, M={M}, ranks={n_ranks}, "
+        print(f"[MPI-STRWORK] backend={backend}, N={N}, M={M}, ranks={n_ranks}, "
               f"total_trajectories={n_trajectories}, per-rank≈{base}, "
               f"string_sites={list(string_sites)}, K_values={K_values}, "
               f"schedule={schedule}, direction={direction}", flush=True)
@@ -134,30 +252,101 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                       boundary=("periodic" if box_vectors is not None else "open")),
             f"string-work rank {rank}")
     site_perm, inv_perm = resolve_site_permutation(
-        N, _rank_seed(seed, rank), permute_site_labels, cfg=cfg,
+        N, rank_seed, permute_site_labels, cfg=cfg,
         label="MPI-STRWORK")
     pos_engine = permute_rows(pos, site_perm)
     string_sites_eng = [int(s) for s in to_engine(list(string_sites), inv_perm)]
 
     results: dict[int, dict] = {}
+    saw_committed_resume = False
     for K in K_values:
         comm.Barrier()
         t0 = time.perf_counter()
+        ckpt = int(checkpoint_every_trajectories) if checkpoint_dir else 0
+        k_dir = os.path.join(checkpoint_dir, f"K{K}") if ckpt > 0 else None
+        run_attrs = dict(
+            checkpoint_schema=1,
+            K=int(K),
+            seed=rank_seed,
+            n_ranks=int(n_ranks),
+            direction=str(direction),
+            schedule=str(schedule),
+            my_n_trajectories=int(my_n),
+            backend=str(backend),
+            N=int(N),
+            M_total=int(2 * M),
+            Omega=float(Omega),
+            Rb=float(Rb),
+            delta_min=float(delta_min),
+            delta_max=float(delta_max),
+            epsilon=float(epsilon),
+            neighbor_cutoff=int(-1 if neighbor_cutoff is None else neighbor_cutoff),
+            delta_groups=int(delta_groups),
+            decorrelation_steps=int(decorrelation_steps),
+            positions_sha256=array_fingerprint(
+                np.asarray(pos, dtype=np.float64)),
+            box_vectors_sha256=array_fingerprint(
+                None if box_vectors is None else
+                np.asarray(box_vectors, dtype=np.float64)),
+            site_perm=_permutation_checkpoint(site_perm, N),
+            m_star=int(M if m_star is None else m_star),
+            string_sites=np.asarray(list(string_sites), dtype=np.int32),
+            n_topology_sweeps=int(n_topology_sweeps_per_lambda),
+            n_qaqmc_sweeps=int(n_qaqmc_sweeps_per_lambda),
+        )
+        resumed = (
+            load_checkpointed_rank_chunks(
+                k_dir, rank, _STRING_CHUNK_DATASETS,
+                expected_run_attrs=run_attrs,
+            )
+            if resume and my_n > 0 else None
+        )
+        resume_this_k = False
+        if resume:
+            resume_this_k = collective_resume_decision(
+                comm,
+                rank=rank,
+                active=my_n > 0,
+                completed=(0 if resumed is None else resumed["completed"]),
+                allow_all_missing=saw_committed_resume,
+                label=f"string K={K}",
+            )
+            if resume_this_k:
+                saw_committed_resume = True
+            else:
+                resumed = None
+        if resumed is not None and resumed["completed"] > my_n:
+            raise ValueError(
+                f"checkpoint has {resumed['completed']} trajectories, "
+                f"but this rank requests only {my_n}")
 
-        eng = QAQMCStringWorkRydberg(
+        extra = ({"device": _cuda_device_for_rank(comm),
+                  "verbose": rank == 0 and verbose}
+                 if backend == "cuda" else {})
+        eng = engine_type(
             N=N, M=M, Omega=Omega, Rb=Rb,
             delta_min=delta_min, delta_max=delta_max,
-            epsilon=epsilon, seed=_rank_seed(seed, rank),
+            epsilon=epsilon, seed=rank_seed,
             pos=pos_engine,
             neighbor_cutoff=(None if neighbor_cutoff < 0 else neighbor_cutoff),
-            delta_groups=delta_groups, box_vectors=box_vectors,
+            delta_groups=delta_groups, box_vectors=box_vectors, **extra,
         )
         eng.set_string_sites(string_sites_eng, m_star)
         if schedule == "cosine":
             eng.set_lambda_schedule(cosine_schedule(int(K)))
         else:
             eng.set_lambda_schedule(np.linspace(0.0, 1.0, int(K) + 1))
-        if cfg is not None:
+        if resumed is not None and resumed["completed"] > 0:
+            _restore_string_cuda_checkpoint(
+                eng, resumed["checkpoint"], site_perm, N, direction
+            )
+            if rank == 0 and verbose:
+                print(
+                    f"[MPI-STRWORK] K={K} exact CUDA resume at "
+                    f"{resumed['completed']}/{my_n} trajectories",
+                    flush=True,
+                )
+        elif cfg is not None:
             eng._eng.set_op_string(
                 np.ascontiguousarray(cfg["op_types"], dtype=np.int32),
                 np.ascontiguousarray(cfg["op_sites"], dtype=np.int32))
@@ -175,21 +364,17 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 n_thermalize, label=f"MPI-STRWORK K={K}",
                 rank=rank, print_every=equil_progress_every, verbose=verbose)
 
-        ckpt = int(checkpoint_every_trajectories) if checkpoint_dir else 0
         if ckpt > 0 and my_n > 0:
             # Chunked sampling: run_trajectories resets the seam sector per
             # trajectory, so repeated calls continue the same chain and are
             # statistically identical to a single long call.  Flat per-rank
-            # layout: checkpoint_dir/K{K}/rank{r}.h5 with one chunk{i} group
-            # per flushed block of `ckpt` trajectories.
-            k_dir = os.path.join(checkpoint_dir, f"K{K}")
-            parts = []
-            done = 0
-            c = 0
-            with RankChunkWriter(k_dir, rank,
-                                 run_attrs=dict(K=int(K), seed=int(seed),
-                                                direction=str(direction),
-                                                my_n_trajectories=int(my_n))) as writer:
+            # layout: checkpoint_dir/K{K}/rank{r}.h5 with atomically published
+            # samples plus the exact state needed by the next block.
+            done = int(resumed["completed"]) if resumed is not None else 0
+            c = int(resumed["next_chunk"]) if resumed is not None else 0
+            with RankChunkWriter(
+                k_dir, rank, run_attrs=run_attrs, resume=resume
+            ) as writer:
                 while done < my_n:
                     n_chunk = min(ckpt, my_n - done)
                     part = eng.run_trajectories(
@@ -197,21 +382,34 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         n_topology_sweeps_per_lambda=n_topology_sweeps_per_lambda,
                         n_qaqmc_sweeps_per_lambda=n_qaqmc_sweeps_per_lambda,
                         direction=direction)
-                    parts.append(part.log_j_samples)
                     done += n_chunk
+                    state_data, state_attrs = _string_cuda_checkpoint(
+                        eng, site_perm, N
+                    ) if backend == "cuda" else ({}, {})
                     writer.write_chunk(
                         c,
                         datasets=dict(log_j_samples=part.log_j_samples),
                         attrs=dict(K=int(K), n_trajectories=int(n_chunk),
                                    trajectories_cumulative=int(done),
                                    direction=str(direction)),
+                        checkpoint_datasets=state_data,
+                        checkpoint_attrs=state_attrs,
+                        prune_previous_checkpoints=(backend == "cuda"),
                     )
                     c += 1
                     if rank == 0 and verbose:
                         print(f"[MPI-STRWORK] K={K} rank0 chunk {c} written "
                               f"({done}/{my_n} trajectories)", flush=True)
-            local_log_j = (np.concatenate(parts) if parts
-                           else np.empty(0, dtype=np.float64))
+            stored = load_checkpointed_rank_chunks(
+                k_dir, rank, _STRING_CHUNK_DATASETS,
+                expected_run_attrs=run_attrs,
+            )
+            if stored["completed"] != my_n:
+                raise RuntimeError(
+                    f"checkpoint reload found {stored['completed']}/{my_n} trajectories")
+            local_log_j = np.asarray(
+                stored["datasets"]["log_j_samples"], dtype=np.float64
+            )
         else:
             local = eng.run_trajectories(
                 my_n, decorrelation_steps,
@@ -228,6 +426,12 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 base = str(filepath)
                 out_dir = (base[:-3] if base.endswith(".h5") else base) + "_configs"
             if out_dir:
+                # CUDA keeps the rolling equilibrated start-sector state in a
+                # D2D checkpoint while the live arrays end in the final
+                # nonequilibrium trajectory sector.  Export the checkpoint,
+                # not that endpoint.  Sampling is already finished here.
+                if backend == "cuda" and eng._eng.has_checkpoint:
+                    eng._eng.restore_device_checkpoint()
                 cfg_datasets = dict(
                     op_types=np.asarray(eng._eng.op_types, dtype=np.int32),
                     op_sites=np.asarray(eng._eng.op_sites, dtype=np.int32))
@@ -270,6 +474,13 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             neighbor_cutoff=neighbor_cutoff, delta_groups=delta_groups,
             seed=seed, n_ranks=n_ranks, n_trajectories=n_trajectories,
             n_thermalize=n_thermalize, decorrelation_steps=decorrelation_steps,
+            backend=backend, resumed=bool(resume),
+            checkpoint_every_trajectories=checkpoint_every_trajectories,
+            positions_sha256=array_fingerprint(
+                np.asarray(pos, dtype=np.float64)),
+            box_vectors_sha256=array_fingerprint(
+                None if box_vectors is None else
+                np.asarray(box_vectors, dtype=np.float64)),
             string_sites=np.asarray(list(string_sites), dtype=np.int32),
             m_star=(-1 if m_star is None else int(m_star)),
             schedule=str(schedule), direction=str(direction),
@@ -291,7 +502,9 @@ def _save_hdf5(path: str, payload: dict) -> None:
         for k in ("N", "M", "Omega", "Rb", "delta_min", "delta_max", "epsilon",
                   "neighbor_cutoff", "delta_groups", "seed", "n_ranks",
                   "n_trajectories", "n_thermalize", "decorrelation_steps",
-                  "m_star", "schedule", "direction"):
+                  "m_star", "schedule", "direction", "backend", "resumed",
+                  "checkpoint_every_trajectories", "positions_sha256",
+                  "box_vectors_sha256"):
             pg.attrs[k] = payload[k]
         pg.attrs["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         pg.create_dataset("string_sites", data=payload["string_sites"])
@@ -333,6 +546,8 @@ def main():
                         help="spatial lattice boundary: open (finite patch) or "
                              "periodic (torus; not valid for kagome_bond_triangle)")
     parser.add_argument("--delta-groups", type=int, default=600)
+    parser.add_argument("--backend", choices=["cpu", "cuda"], default="cpu",
+                        help="transition backend; CUDA expects one Slurm GPU per MPI rank")
     parser.add_argument("--string-sites", type=str, required=True,
                         help="comma-separated site indices of the string C")
     parser.add_argument("--m-star", type=int, default=-1,
@@ -362,6 +577,11 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None,
                         help="checkpoint run directory (default: <filepath minus .h5>"
                              "_chunks when checkpointing is enabled)")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="CUDA only: append an existing checkpoint run and restore the exact "
+             "operator state plus Philox counters from its last committed chunk",
+    )
     parser.add_argument("--config-in", type=str, default=None,
                         help="warm-start directory of rank{r}.h5 final configurations; "
                              "when given, thermalization is skipped")
@@ -435,6 +655,8 @@ def main():
         config_out=args.config_out,
         equil_progress_every=args.equil_progress_every,
         permute_site_labels=args.permute_site_labels,
+        backend=args.backend,
+        resume=args.resume,
     )
 
 

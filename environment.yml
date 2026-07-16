@@ -10,7 +10,7 @@
 #
 # Notes:
 #   - conda-forge openmpi has no SLURM/PMIx integration: launch with mpiexec,
-#     not srun (main_scripts/common/env.sh handles this uniformly).
+#     not srun (scripts/common/env.sh handles this uniformly).
 #   - single-node runs only; multi-node over InfiniBand needs a system MPI.
 #   - requirements.txt lists just the Python-level subset (for Docker/pip).
 name: qaqmc

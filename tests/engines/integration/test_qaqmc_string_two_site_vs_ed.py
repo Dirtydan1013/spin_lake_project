@@ -49,30 +49,33 @@ def _test_two_site_string_matches_ed_at_slow_quench():
     assert result.n_eff > 0.05 * result.n_trajectories
 
 
-def _test_slower_quench_improves_agreement():
-    # Document Phase D: compare ED against different quench speeds. A 2-site
-    # string must fully join (both bits set) by lambda=1 for a nonzero
-    # trajectory, which is a harder combinatorial target than L_C=1, so this
-    # is also where a too-fast quench shows up most clearly.
+def _test_estimator_unbiased_at_every_quench_speed():
+    # Jarzynski/AIS is exact in expectation at ANY schedule length K provided
+    # each lambda-kernel has the correct invariant measure -- quench speed
+    # trades variance (n_eff), never bias. So the sharp check is that every K
+    # agrees with ED within its statistical resolution, while n_eff grows
+    # with K. (A systematic K-trend in O_C is the fingerprint of a biased
+    # topology kernel: the pre-2026-07-12 seam-cache/worldline-closure bugs
+    # showed up exactly that way, as a fake "finite-K convergence" that a
+    # monotonicity assert here then rewarded.)
     expected = _ed_o_c()
-    errs = {}
+    n_effs = {}
     for K in (50, 150, 400):
         result = _run(K=K, n_traj=4000)
         rel_err = abs(result.o_c - expected) / abs(expected)
-        errs[K] = rel_err
+        n_effs[K] = result.n_eff
         print(f"  K={K}: O_C={result.o_c:.4f}  ED={expected:.4f}  rel_err={rel_err:.3f}  "
-              f"zero_weight_frac={result.zero_weight_fraction:.3f}")
-    # Don't demand strict monotonicity (these are noisy MC estimates at fixed
-    # trajectory count) -- just that the slowest quench tested is clearly
-    # better than the fastest, which is the qualitative claim being checked.
-    assert errs[400] < errs[50], errs
+              f"n_eff={result.n_eff:.0f}  zero_weight_frac={result.zero_weight_fraction:.3f}")
+        # ~4-sigma gate at the worst n_eff seen at K=50 (sigma ~ O_C/sqrt(n_eff))
+        assert rel_err < 0.05, (K, result.o_c, expected, rel_err)
+    assert n_effs[400] > n_effs[50], n_effs
 
 
 def main():
     print("Two-site string O_C vs ED at a slow quench (K=400):")
     _test_two_site_string_matches_ed_at_slow_quench()
     print("Two-site string: quench-speed scan (K=50,150,400) vs ED:")
-    _test_slower_quench_improves_agreement()
+    _test_estimator_unbiased_at_every_quench_speed()
     print("Phase D two-site string vs ED checks passed")
 
 

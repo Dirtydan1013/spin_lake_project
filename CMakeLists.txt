@@ -5,23 +5,47 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Optional CUDA backend.  Keep this OFF by default so CPU-only deployments and
+# the existing qaqmc_cpp module retain exactly the same build requirements.
+option(QAQMC_ENABLE_CUDA "Build the optional qaqmc_cuda backend" OFF)
+set(QAQMC_CUDA_ARCHITECTURES "70;80" CACHE STRING
+    "CUDA architectures for qaqmc_cuda (gpunode02: V100=70, A100=80)")
+
 # ── Find pybind11 (installed via pip) ────────────────────────────────────────
 find_package(pybind11 REQUIRED)
 
 # ── Find OpenMP ──────────────────────────────────────────────────────────────
 find_package(OpenMP)
 
-# ── Build the Python extension module ────────────────────────────────────────
-pybind11_add_module(qaqmc_cpp
-    csrc/qaqmc_core.cpp
-    csrc/qaqmc_off_diagonal_core.cpp
-    csrc/qaqmc_renyi_core.cpp
-    csrc/qaqmc_renyi_work_core.cpp
-    csrc/sse_core.cpp
-    csrc/bindings.cpp
+# ── CPU backend and Python extension module ──────────────────────────────────
+# Keep the CPU source tree parallel to csrc/cuda so both backends can coexist
+# cleanly after branch integration. Public C++ headers live in csrc/cpu;
+# implementation details and pybind registration units are isolated below it.
+set(QAQMC_CPU_ENGINE_SOURCES
+    csrc/cpu/detail/qaqmc_core.cpp
+    csrc/cpu/detail/qaqmc_off_diagonal_core.cpp
+    csrc/cpu/detail/qaqmc_renyi_core.cpp
+    csrc/cpu/detail/qaqmc_renyi_work_core.cpp
+    csrc/cpu/detail/sse_core.cpp
+    csrc/cpu/detail/sse_off_diagonal_core.cpp
 )
 
-target_include_directories(qaqmc_cpp PRIVATE csrc)
+set(QAQMC_CPU_MODULE_SOURCES
+    csrc/cpu/bindings/module.cpp
+    csrc/cpu/bindings/bindings_qaqmc.cpp
+    csrc/cpu/bindings/bindings_renyi.cpp
+    csrc/cpu/bindings/bindings_sse.cpp
+    csrc/cpu/bindings/bindings_renyi_work.cpp
+)
+
+pybind11_add_module(qaqmc_cpp
+    ${QAQMC_CPU_ENGINE_SOURCES}
+    ${QAQMC_CPU_MODULE_SOURCES}
+)
+
+target_include_directories(qaqmc_cpp PRIVATE
+    csrc/cpu
+)
 
 # ── Optimization flags ───────────────────────────────────────────────────────
 # Target microarchitecture is a cache variable so the same tree deploys to any
@@ -103,4 +127,44 @@ if(MINGW)
         LINK_FLAGS_RELEASE ""
     )
     set(CMAKE_STRIP "" CACHE FILEPATH "" FORCE)
+endif()
+
+# ── Optional CUDA extension ──────────────────────────────────────────────────
+if(QAQMC_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    pybind11_add_module(qaqmc_cuda
+        csrc/cuda/bindings/module.cpp
+        csrc/cuda/bindings/bindings_runtime.cpp
+        csrc/cuda/bindings/bindings_diagonal.cpp
+        csrc/cuda/bindings/bindings_renyi.cpp
+        csrc/cuda/bindings/bindings_batch_diagonal.cpp
+        csrc/cuda/bindings/bindings_batch_renyi.cpp
+        csrc/cuda/src/scan.cu
+        csrc/cuda/src/diagonal.cu
+        csrc/cuda/src/renyi.cu
+        csrc/cuda/src/batch_diagonal.cu
+        csrc/cuda/src/batch_renyi.cu
+    )
+    target_include_directories(qaqmc_cuda PRIVATE csrc/cuda)
+    target_link_libraries(qaqmc_cuda PRIVATE CUDA::cudart)
+    set_target_properties(qaqmc_cuda PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES "${QAQMC_CUDA_ARCHITECTURES}"
+        CUDA_SEPARABLE_COMPILATION OFF
+    )
+    target_compile_options(qaqmc_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        # Batch engines launch independent chains from separate host threads.
+        # Per-thread default streams let those kernels overlap without changing
+        # the established single-chain launch signatures.
+        $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
+    )
 endif()

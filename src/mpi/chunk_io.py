@@ -22,6 +22,7 @@ configuration now live together in one file per rank.
 from __future__ import annotations
 
 import glob
+import hashlib
 import re
 from pathlib import Path
 
@@ -52,30 +53,121 @@ def config_dir(run_dir) -> Path:
     return Path(run_dir) / "configs"
 
 
+def _attr_values_equal(have, want) -> bool:
+    """Compare scalar/array HDF5 attributes without ambiguous NumPy truth."""
+    try:
+        return bool(np.array_equal(np.asarray(have), np.asarray(want)))
+    except (TypeError, ValueError):
+        return have == want
+
+
+def array_fingerprint(value) -> str:
+    """Stable SHA-256 identity for a numeric model array (or ``None``).
+
+    Shape and dtype are included so equal raw bytes with different geometry
+    cannot be mistaken for the same checkpoint model.
+    """
+    if value is None:
+        return "none"
+    arr = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(arr.dtype.str.encode("ascii"))
+    digest.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+    digest.update(arr.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def compact_operator_checkpoint(types, sites) -> tuple[np.ndarray, np.ndarray]:
+    """Losslessly narrow QAQMC operator arrays for continuation storage."""
+    type_values = np.asarray(types)
+    site_values = np.asarray(sites)
+    if type_values.shape != site_values.shape:
+        raise ValueError("operator type/site checkpoint shapes differ")
+    if type_values.size:
+        type_min = int(type_values.min())
+        type_max = int(type_values.max())
+        site_min = int(site_values.min())
+        site_max = int(site_values.max())
+    else:
+        type_min = type_max = site_min = site_max = 0
+    if type_min < np.iinfo(np.int8).min or type_max > np.iinfo(np.int8).max:
+        raise ValueError("operator type checkpoint does not fit int8")
+    if site_min < 0 or site_max > np.iinfo(np.uint32).max:
+        raise ValueError("operator site checkpoint must fit uint32")
+    if site_max <= np.iinfo(np.uint8).max:
+        site_dtype = np.uint8
+    elif site_max <= np.iinfo(np.uint16).max:
+        site_dtype = np.uint16
+    else:
+        site_dtype = np.uint32
+    return (
+        np.ascontiguousarray(type_values, dtype=np.int8),
+        np.ascontiguousarray(site_values, dtype=site_dtype),
+    )
+
+
 class RankChunkWriter:
     """Owns one ``<run_dir>/rank{r}.h5`` and appends chunk / final-config groups.
 
-    A fresh file is created per run (mode ``'w'``).  Use as a context manager or
-    call :meth:`close` explicitly.
+    A fresh file is created per run by default.  ``resume=True`` opens an
+    existing file in append mode, validates immutable run attributes and
+    removes only uncommitted ``_pending_chunk*`` transactions.
     """
 
-    def __init__(self, run_dir, rank: int, run_attrs: dict | None = None):
+    def __init__(self, run_dir, rank: int, run_attrs: dict | None = None,
+                 resume: bool = False):
         import h5py
 
         d = Path(run_dir)
         d.mkdir(parents=True, exist_ok=True)
         self.path = rank_file(run_dir, rank)
         self.rank = int(rank)
-        self._h5 = h5py.File(self.path, "w")
-        self._h5.attrs["rank"] = int(rank)
-        for key, value in (run_attrs or {}).items():
-            self._h5.attrs[key] = value
+        existed = self.path.exists()
+        self._h5 = h5py.File(self.path, "a" if resume else "w")
+        if resume and existed:
+            saved_rank = int(self._h5.attrs.get("rank", rank))
+            if saved_rank != int(rank):
+                self._h5.close()
+                raise ValueError(
+                    f"checkpoint rank mismatch: file has rank={saved_rank}, "
+                    f"requested rank={rank}")
+            for name in list(self._h5.keys()):
+                if name.startswith("_pending_chunk"):
+                    del self._h5[name]
+            for key, value in (run_attrs or {}).items():
+                if key in self._h5.attrs and not _attr_values_equal(
+                        self._h5.attrs[key], value):
+                    have = self._h5.attrs[key]
+                    self._h5.close()
+                    raise ValueError(
+                        f"checkpoint attribute mismatch for {key}: "
+                        f"saved={have!r}, requested={value!r}")
+                self._h5.attrs[key] = value
+        else:
+            self._h5.attrs["rank"] = int(rank)
+            for key, value in (run_attrs or {}).items():
+                self._h5.attrs[key] = value
         self._h5.flush()
 
     def write_chunk(self, idx: int, datasets: dict,
-                    attrs: dict | None = None) -> None:
-        """Append one bin/block as group ``chunk{idx}`` and flush to disk."""
-        g = self._h5.create_group(f"chunk{int(idx)}")
+                    attrs: dict | None = None,
+                    checkpoint_datasets: dict | None = None,
+                    checkpoint_attrs: dict | None = None,
+                    prune_previous_checkpoints: bool = False) -> None:
+        """Atomically commit samples and the state needed by the next chunk.
+
+        Data are first flushed under ``_pending_chunk{idx}``; one HDF5 move
+        publishes the completed transaction as ``chunk{idx}``.  A process
+        killed before that move leaves a group ignored by readers and cleaned
+        on the next ``resume=True`` open.
+        """
+        final_name = f"chunk{int(idx)}"
+        pending_name = f"_pending_chunk{int(idx)}"
+        if final_name in self._h5:
+            raise ValueError(f"checkpoint already contains {final_name}")
+        if pending_name in self._h5:
+            del self._h5[pending_name]
+        g = self._h5.create_group(pending_name)
         for key, value in datasets.items():
             arr = np.ascontiguousarray(value)
             if arr.nbytes > _COMPRESS_MIN_BYTES:
@@ -86,7 +178,27 @@ class RankChunkWriter:
         g.attrs["chunk"] = int(idx)
         for key, value in (attrs or {}).items():
             g.attrs[key] = value
+        if checkpoint_datasets is not None or checkpoint_attrs is not None:
+            state = g.create_group("checkpoint")
+            for key, value in (checkpoint_datasets or {}).items():
+                arr = np.ascontiguousarray(value)
+                if arr.ndim >= 1 and arr.nbytes > _CONFIG_COMPRESS_MIN_BYTES:
+                    state.create_dataset(key, data=arr, compression="gzip",
+                                         compression_opts=4)
+                else:
+                    state.create_dataset(key, data=arr)
+            for key, value in (checkpoint_attrs or {}).items():
+                state.attrs[key] = value
         self._h5.flush()
+        self._h5.move(pending_name, final_name)
+        self._h5.flush()
+        if prune_previous_checkpoints:
+            for name in list(self._h5.keys()):
+                match = re.fullmatch(r"chunk(\d+)", name)
+                if (match and name != final_name
+                        and "checkpoint" in self._h5[name]):
+                    del self._h5[name]["checkpoint"]
+            self._h5.flush()
 
     def write_final_config(self, datasets: dict,
                            attrs: dict | None = None) -> None:
@@ -217,3 +329,137 @@ def iter_rank_chunks(run_dir, burn_in_fraction: float = 0.0):
                 idxs = idxs[int(len(idxs) * burn_in_fraction):]
             for i in idxs:
                 yield r, i, f[f"chunk{i}"]
+
+
+def load_checkpointed_rank_chunks(run_dir, rank: int, dataset_names,
+                                  expected_run_attrs: dict | None = None) -> dict:
+    """Load committed raw chunks and the exact continuation checkpoint.
+
+    Returns ``completed``, ``next_chunk``, concatenated datasets (``None``
+    when no chunk exists), immutable file attributes and the nested checkpoint
+    attached to the last committed chunk.  Chunk indices must be contiguous
+    from zero and every dataset's leading dimension must match that chunk's
+    ``n_trajectories`` attribute.
+    """
+    import h5py
+
+    path = rank_file(run_dir, rank)
+    empty = dict(
+        completed=0,
+        next_chunk=0,
+        datasets={str(name): None for name in dataset_names},
+        run_attrs={},
+        checkpoint=None,
+    )
+    if not path.exists():
+        return empty
+
+    pieces = {str(name): [] for name in dataset_names}
+    with h5py.File(path, "r") as f:
+        for key, want in (expected_run_attrs or {}).items():
+            if key not in f.attrs or not _attr_values_equal(f.attrs[key], want):
+                have = f.attrs.get(key, None)
+                raise ValueError(
+                    f"checkpoint attribute mismatch for {key}: "
+                    f"saved={have!r}, requested={want!r}")
+        indices = sorted(
+            int(match.group(1))
+            for name in f.keys()
+            for match in [re.fullmatch(r"chunk(\d+)", name)]
+            if match
+        )
+        if indices != list(range(len(indices))):
+            raise ValueError(
+                f"non-contiguous committed chunks in {path}: {indices}")
+        completed = 0
+        for index in indices:
+            group = f[f"chunk{index}"]
+            count = int(group.attrs.get("n_trajectories", -1))
+            if count < 0:
+                raise ValueError(f"chunk{index} lacks n_trajectories")
+            for name in pieces:
+                if name not in group:
+                    raise ValueError(f"chunk{index} lacks dataset {name!r}")
+                value = np.asarray(group[name][:])
+                if value.ndim == 0 or len(value) != count:
+                    raise ValueError(
+                        f"chunk{index}/{name} length does not match "
+                        f"n_trajectories={count}")
+                pieces[name].append(value)
+            completed += count
+
+        checkpoint = None
+        if indices:
+            last = f[f"chunk{indices[-1]}"]
+            if "checkpoint" not in last:
+                raise ValueError(
+                    f"last committed chunk in {path} has no continuation checkpoint")
+            state = last["checkpoint"]
+            checkpoint = {
+                "datasets": {key: np.asarray(state[key][:]) for key in state.keys()},
+                "attrs": dict(state.attrs),
+            }
+        merged = {
+            name: (np.concatenate(values) if values else None)
+            for name, values in pieces.items()
+        }
+        return dict(
+            completed=completed,
+            next_chunk=len(indices),
+            datasets=merged,
+            run_attrs=dict(f.attrs),
+            checkpoint=checkpoint,
+        )
+
+
+def checkpoint_tree_has_committed_chunks(run_dir) -> bool:
+    """Whether any rank file below ``run_dir`` contains a published chunk."""
+    import h5py
+
+    root = Path(run_dir)
+    if not root.exists():
+        return False
+    for path in root.rglob("rank*.h5"):
+        with h5py.File(path, "r") as handle:
+            if any(re.fullmatch(r"chunk\d+", name) for name in handle.keys()):
+                return True
+    return False
+
+
+def collective_resume_decision(comm, *, rank: int, active: bool,
+                               completed: int, allow_all_missing: bool,
+                               label: str) -> bool:
+    """Agree whether every active MPI rank resumes or every rank starts fresh.
+
+    A mixture is unsafe: the ranks would contribute samples from different
+    points in their chains while rank 0 still labels them as one protocol.
+    """
+    local = None if not active else bool(int(completed) > 0)
+    states = comm.gather(local, root=0)
+    if int(rank) == 0:
+        active_states = [state for state in states if state is not None]
+        any_saved = any(active_states)
+        all_saved = all(active_states)
+        if any_saved and not all_saved:
+            decision = (
+                "error",
+                f"{label}: partial MPI checkpoint (some active ranks have "
+                "committed chunks and others do not)",
+            )
+        elif all_saved:
+            decision = ("resume", "")
+        elif allow_all_missing:
+            decision = ("fresh", "")
+        else:
+            decision = (
+                "error",
+                f"{label}: --resume found no committed CUDA checkpoint",
+            )
+    else:
+        decision = None
+    mode, message = comm.bcast(decision, root=0)
+    if mode == "error":
+        if "partial MPI checkpoint" in message:
+            raise RuntimeError(message)
+        raise FileNotFoundError(message)
+    return mode == "resume"

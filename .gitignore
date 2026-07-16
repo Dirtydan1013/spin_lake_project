@@ -41,8 +41,6 @@ old_code/
 
 logs/
 
-scripts/*
-!scripts/experiments/
 
 task/
 
@@ -56,18 +54,17 @@ paper/
 
 CLAUDE.md
 
-docs/
 
-specs/
 
 tex/
 
-specs/csrc
 
 build_asan/
 
 build_dbg/
-main_scripts/common/site.conf
+scripts/common/site.conf
 build_staging/
 figures/
 plots/*.png
+
+docs/
