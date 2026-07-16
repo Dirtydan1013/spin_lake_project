@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../qaqmc_cuda_diagonal.cuh"
-#include "qaqmc_cuda_diagonal_kernels.cuh"
-#include "qaqmc_cuda_offdiagonal_kernels.cuh"
+#include "../include/diagonal.cuh"
+#include "diagonal_kernels.cuh"
+#include "offdiagonal_kernels.cuh"
 
 namespace qaqmc_cuda {
 using namespace detail;

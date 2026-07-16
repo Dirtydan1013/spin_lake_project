@@ -1,4 +1,4 @@
-#include "../sse_core.hpp"
+#include "../include/sse_core.hpp"
 #include <numeric>
 #include <stdexcept>
 #include <cmath>

@@ -39,9 +39,11 @@ python -c "import qaqmc_cpp; print('C++ extension OK')"
 
 ## Standard QAQMC CPU 記憶體
 
-CPU native backend 已集中在 `csrc/cpu/`，公開 headers、detail implementation
-與 pybind module registrations 分層；舊 `csrc/*.hpp` include path 仍相容。
-目錄責任與 CPU/CUDA merge contract 見 [`csrc/cpu/README.md`](csrc/cpu/README.md)。
+CPU native backend 已集中在 `csrc/cpu/{include,detail,bindings}`，CUDA backend
+在 `csrc/cuda/{include,src,detail,bindings}`；兩個 backend 用同一套三層慣例
+（public headers / 實作 / pybind registrations）。舊 `csrc/*.hpp` root shims
+已在 backend merge 完成後移除。目錄責任與 CPU/CUDA merge contract 見
+[`csrc/cpu/README.md`](csrc/cpu/README.md)、[`csrc/cuda/README.md`](csrc/cuda/README.md)。
 
 `QAQMCEngine` 對 `N=216` full-bond production 會自動使用 lossless 16-bit
 alias/operator indices、`int8` operator types、按需 delta schedule，以及有界

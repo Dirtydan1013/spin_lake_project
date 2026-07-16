@@ -1,5 +1,5 @@
 #include "bindings.hpp"
-#include "cpu/qaqmc_core.hpp"
+#include "include/qaqmc_core.hpp"
 
 #include <cstring>
 

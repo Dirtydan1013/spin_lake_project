@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qaqmc_cuda_api.cuh"
+#include "api.cuh"
 
 #include <memory>
 

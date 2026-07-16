@@ -9,23 +9,24 @@ MPI drivers, checkpoints, and Slurm scripts do not need import changes.
 
 | Path | Responsibility |
 | --- | --- |
-| `qaqmc_core.hpp` | Public standard QAQMC model, chain, and off-diagonal API |
-| `qaqmc_renyi_core.hpp` | Public two-replica Rényi API |
-| `qaqmc_renyi_work_core.hpp` | Public nonequilibrium Rényi-work API |
-| `sse_core.hpp` | Public finite-temperature SSE API |
+| `include/qaqmc_core.hpp` | Public standard QAQMC model, chain, and off-diagonal API |
+| `include/qaqmc_renyi_core.hpp` | Public two-replica Rényi API |
+| `include/qaqmc_renyi_work_core.hpp` | Public nonequilibrium Rényi-work API |
+| `include/sse_core.hpp` | Public finite-temperature SSE API |
 | `detail/qaqmc_core.cpp` | Standard diagonal, event, cluster, profile implementation |
 | `detail/qaqmc_off_diagonal_core.*` | String seam and half-line transitions |
 | `detail/qaqmc_renyi_core.cpp` | Replica/channel transitions and topology updates |
 | `detail/qaqmc_renyi_work_core.cpp` | Rényi-work protocol implementation |
 | `detail/sse_core.cpp` | SSE diagonal and cluster implementation |
 | `detail/sse_off_diagonal_core.*` | SSE string-work transition implementation |
-| `module/module.cpp` | Minimal `qaqmc_cpp` module entry point |
-| `module/bindings_*.cpp` | One pybind registration unit per public engine |
-| `module/fragments/qaqmc_*.inc` | Standard-engine bindings grouped by observable domain |
+| `bindings/module.cpp` | Minimal `qaqmc_cpp` module entry point |
+| `bindings/bindings_*.cpp` | One pybind registration unit per public engine |
+| `bindings/fragments/qaqmc_*.inc` | Standard-engine bindings grouped by observable domain |
 
-The headers left directly under `csrc/` are compatibility includes. New C++
-code should include `cpu/qaqmc_core.hpp`, `cpu/qaqmc_renyi_core.hpp`,
-`cpu/qaqmc_renyi_work_core.hpp`, or `cpu/sse_core.hpp`.
+Public headers live in `include/` (compiled with `csrc/cpu` as the include
+root, so C++ code includes them as `include/qaqmc_core.hpp` etc.).  The old
+root-level `csrc/*.hpp` compatibility shims were removed after the backend
+merges; nothing may include through `csrc/` root any more.
 
 ## Dependency direction
 
@@ -36,7 +37,7 @@ Python engines / MPI / scripts
          qaqmc_cpp module
               |
               v
-       module/bindings_*.cpp
+      bindings/bindings_*.cpp
               |
               v
         public CPU headers
@@ -74,10 +75,10 @@ When merging the current `gpu_version` branch:
 1. Keep `QAQMC_CPU_ENGINE_SOURCES` and `QAQMC_CPU_MODULE_SOURCES` from this
    branch, then append the GPU branch's optional `QAQMC_ENABLE_CUDA` target.
 2. Do not restore the old monolithic `csrc/bindings.cpp`. Its GPU model-export
-   additions now live in `module/fragments/qaqmc_cuda_bridge.inc` and support
+   additions now live in `bindings/fragments/qaqmc_cuda_bridge.inc` and support
    the compact CPU alias representation.
 3. Do not reapply the GPU branch's old `csrc/qaqmc_core.hpp` accessors. The
-   maintained public implementation is `csrc/cpu/qaqmc_core.hpp`; the root
+   maintained public implementation is `csrc/cpu/include/qaqmc_core.hpp`; the root
    header is only a compatibility include.
 4. Combine both `tests/conftest.py` requirements: pin an explicitly selected
    CPU build and also expose `build_cuda` for GPU tests.

@@ -1,5 +1,5 @@
-#include "bindings_cuda.cuh"
-#include "qaqmc_cuda_diagonal.cuh"
+#include "bindings.cuh"
+#include "include/diagonal.cuh"
 
 #include <pybind11/numpy.h>
 

@@ -1,4 +1,4 @@
-#include "bindings_cuda.cuh"
+#include "bindings.cuh"
 
 #include <pybind11/pybind11.h>
 

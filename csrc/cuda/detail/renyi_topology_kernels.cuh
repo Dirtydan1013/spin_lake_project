@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qaqmc_cuda_scan_primitives.cuh"
+#include "scan_primitives.cuh"
 
 namespace qaqmc_cuda::detail {
 namespace {

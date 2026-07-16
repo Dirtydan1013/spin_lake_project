@@ -1,5 +1,5 @@
 #include "bindings.hpp"
-#include "cpu/sse_core.hpp"
+#include "include/sse_core.hpp"
 
 void bind_sse(py::module_& m) {
     // ── SSEEngine ─────────────────────────────────────────────────────────────

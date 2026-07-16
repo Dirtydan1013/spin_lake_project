@@ -1,4 +1,4 @@
-#include "../qaqmc_renyi_work_core.hpp"
+#include "../include/qaqmc_renyi_work_core.hpp"
 
 #include <algorithm>
 #include <cmath>

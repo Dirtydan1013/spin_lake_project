@@ -1,4 +1,4 @@
-#include "../qaqmc_core.hpp"
+#include "../include/qaqmc_core.hpp"
 #include <cstring>
 #include <cassert>
 #include <sstream>

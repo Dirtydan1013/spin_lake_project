@@ -9,32 +9,31 @@ details.
 
 | Module | Responsibility |
 | --- | --- |
-| `qaqmc_cuda_api.cuh` / `qaqmc_cuda_scan.cu` | Runtime discovery and the public packed-prefix primitive |
-| `qaqmc_cuda_diagonal.cuh` / `.cu` | Standard QAQMC engine and off-diagonal string extension |
-| `qaqmc_cuda_renyi.cuh` / `.cu` | Two-replica Rényi-work engine |
-| `qaqmc_cuda_batch_diagonal.cu` | Multi-chain standard/string host orchestration |
-| `qaqmc_cuda_batch_renyi.cu` | Multi-chain two-replica host orchestration |
-| `qaqmc_cuda_scan.cuh` | Compatibility umbrella for callers that need all public APIs |
-| `bindings_cuda.cpp` | Minimal Python module entry point |
-| `bindings_cuda_runtime.cpp` | Runtime and prefix-scan Python bindings |
-| `bindings_cuda_diagonal.cpp` | `DiagonalEngine` Python bindings |
-| `bindings_cuda_renyi.cpp` | `RenyiEngine` Python bindings |
-| `bindings_cuda_batch_diagonal.cpp` | `BatchedDiagonalEngine` Python bindings |
-| `bindings_cuda_batch_renyi.cpp` | `BatchedRenyiEngine` Python bindings |
+| `include/api.cuh` / `src/scan.cu` | Runtime discovery and the public packed-prefix primitive |
+| `include/diagonal.cuh` / `src/diagonal.cu` | Standard QAQMC engine and off-diagonal string extension |
+| `include/renyi.cuh` / `src/renyi.cu` | Two-replica Rényi-work engine |
+| `src/batch_diagonal.cu` | Multi-chain standard/string host orchestration |
+| `src/batch_renyi.cu` | Multi-chain two-replica host orchestration |
+| `bindings/module.cpp` | Minimal Python module entry point |
+| `bindings/bindings_runtime.cpp` | Runtime and prefix-scan Python bindings |
+| `bindings/bindings_diagonal.cpp` | `DiagonalEngine` Python bindings |
+| `bindings/bindings_renyi.cpp` | `RenyiEngine` Python bindings |
+| `bindings/bindings_batch_diagonal.cpp` | `BatchedDiagonalEngine` Python bindings |
+| `bindings/bindings_batch_renyi.cpp` | `BatchedRenyiEngine` Python bindings |
 
 The implementation-only headers are narrower:
 
 | Detail module | Responsibility |
 | --- | --- |
-| `qaqmc_cuda_common.cuh` | Error handling, device buffers, RNG, and shared scalar helpers |
-| `qaqmc_cuda_scan_primitives.cuh` | Packed-state prefix scan and propagation primitives |
-| `qaqmc_cuda_diagonal_kernels.cuh` | Diagonal update, event construction, and cluster kernels |
-| `qaqmc_cuda_offdiagonal_kernels.cuh` | String-seam and half-line topology kernels |
-| `qaqmc_cuda_renyi_transition_kernels.cuh` | Two-replica propagation and Rényi transition kernels |
-| `qaqmc_cuda_renyi_topology_kernels.cuh` | Rényi mask/topology proposal kernels |
-| `qaqmc_cuda_prefix_kernels.cuh` | Standalone public prefix-XOR launch kernels |
-| `qaqmc_cuda_diagonal_state.cuh` | Private `DiagonalEngine::Impl` device state |
-| `qaqmc_cuda_renyi_state.cuh` | Private `RenyiEngine::Impl` device state |
+| `common.cuh` | Error handling, device buffers, RNG, and shared scalar helpers |
+| `scan_primitives.cuh` | Packed-state prefix scan and propagation primitives |
+| `diagonal_kernels.cuh` | Diagonal update, event construction, and cluster kernels |
+| `offdiagonal_kernels.cuh` | String-seam and half-line topology kernels |
+| `renyi_transition_kernels.cuh` | Two-replica propagation and Rényi transition kernels |
+| `renyi_topology_kernels.cuh` | Rényi mask/topology proposal kernels |
+| `prefix_kernels.cuh` | Standalone public prefix-XOR launch kernels |
+| `diagonal_state.cuh` | Private `DiagonalEngine::Impl` device state |
+| `renyi_state.cuh` | Private `RenyiEngine::Impl` device state |
 
 ## Dependency direction
 

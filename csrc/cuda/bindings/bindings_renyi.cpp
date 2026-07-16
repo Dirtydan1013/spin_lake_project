@@ -1,5 +1,5 @@
-#include "bindings_cuda.cuh"
-#include "qaqmc_cuda_renyi.cuh"
+#include "bindings.cuh"
+#include "include/renyi.cuh"
 
 #include <pybind11/numpy.h>
 

@@ -12,8 +12,8 @@ fit gate 已完成。`cpunode02` 的 64-rank A/B 與 4-socket NUMA gate 已於
 排隊期間共用 working tree 被切回 `z2_spin_lake` 而失敗（probe scripts
 不在該分支）；重跑改從 dedicated worktree 提交，job 引用的 checkout 不可變。
 
-CPU native source 已集中到 `csrc/cpu/{detail,module}`，`qaqmc_cpp` public API、
-Python/MPI imports 與舊 C++ include paths保持相容，方便後續與 `csrc/cuda` 合併。
+CPU native source 已集中到 `csrc/cpu/{include,detail,bindings}`（2026-07-16
+目錄整併後的佈局；`qaqmc_cpp` public API 與 Python/MPI imports 不變）。
 
 ## 1. 目標與原則
 

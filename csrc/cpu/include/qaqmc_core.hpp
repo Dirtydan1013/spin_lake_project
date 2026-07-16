@@ -46,7 +46,7 @@ static inline int randint(std::mt19937_64& rng, int n) {
     return (int)(uint64_t)(m >> 64);
 }
 
-#include "detail/qaqmc_off_diagonal_core.hpp"
+#include "../detail/qaqmc_off_diagonal_core.hpp"
 
 // ─── V_ij builder ────────────────────────────────────────────────────────────
 

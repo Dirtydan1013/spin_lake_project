@@ -1,5 +1,5 @@
-#include "qaqmc_cuda_api.cuh"
-#include "detail/qaqmc_cuda_prefix_kernels.cuh"
+#include "include/api.cuh"
+#include "detail/prefix_kernels.cuh"
 
 #include <cuda_runtime.h>
 

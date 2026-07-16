@@ -1,5 +1,5 @@
-#include "qaqmc_cuda_renyi.cuh"
-#include "detail/qaqmc_cuda_renyi_state.cuh"
+#include "include/renyi.cuh"
+#include "detail/renyi_state.cuh"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>

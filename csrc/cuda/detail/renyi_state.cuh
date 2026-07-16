@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../qaqmc_cuda_renyi.cuh"
-#include "qaqmc_cuda_renyi_topology_kernels.cuh"
-#include "qaqmc_cuda_renyi_transition_kernels.cuh"
+#include "../include/renyi.cuh"
+#include "renyi_topology_kernels.cuh"
+#include "renyi_transition_kernels.cuh"
 
 namespace qaqmc_cuda {
 using namespace detail;

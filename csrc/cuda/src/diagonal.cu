@@ -1,5 +1,5 @@
-#include "qaqmc_cuda_diagonal.cuh"
-#include "detail/qaqmc_cuda_diagonal_state.cuh"
+#include "include/diagonal.cuh"
+#include "detail/diagonal_state.cuh"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>

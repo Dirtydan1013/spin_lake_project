@@ -1,7 +1,7 @@
 #pragma once
 #include "qaqmc_core.hpp"  // RydbergVij, build_rydberg_vij, AliasEntry, RNG helpers
-#include "detail/diagonal_observables.hpp"
-#include "detail/sse_off_diagonal_core.hpp"
+#include "../detail/diagonal_observables.hpp"
+#include "../detail/sse_off_diagonal_core.hpp"
 #include <string>
 #include <cstdint>
 

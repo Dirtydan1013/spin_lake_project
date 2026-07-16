@@ -1,5 +1,5 @@
 #include "bindings.hpp"
-#include "cpu/qaqmc_renyi_core.hpp"
+#include "include/qaqmc_renyi_core.hpp"
 
 void bind_qaqmc_renyi(py::module_& m) {
     // ── QAQMCRenyiEngine ─────────────────────────────────────────────────────

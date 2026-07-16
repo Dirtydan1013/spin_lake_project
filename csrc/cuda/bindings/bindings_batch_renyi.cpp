@@ -1,5 +1,5 @@
-#include "bindings_cuda.cuh"
-#include "qaqmc_cuda_diagonal.cuh"
+#include "bindings.cuh"
+#include "include/renyi.cuh"
 
 #include <pybind11/numpy.h>
 
@@ -11,7 +11,7 @@ namespace py = pybind11;
 namespace qaqmc_cuda::bindings {
 namespace {
 
-py::dict diagonal_stats_dict(const DiagonalStats& stats) {
+py::dict renyi_diagonal_stats_dict(const DiagonalStats& stats) {
     py::dict out;
     out["updated_slots"] = stats.updated_slots;
     out["proposal_attempts"] = stats.proposal_attempts;
@@ -22,7 +22,7 @@ py::dict diagonal_stats_dict(const DiagonalStats& stats) {
     return out;
 }
 
-py::dict cluster_stats_dict(const ClusterStats& stats) {
+py::dict renyi_cluster_stats_dict(const ClusterStats& stats) {
     py::dict out;
     out["proposed_segments"] = stats.proposed_segments;
     out["accepted_segments"] = stats.accepted_segments;
@@ -32,7 +32,7 @@ py::dict cluster_stats_dict(const ClusterStats& stats) {
     return out;
 }
 
-py::dict topology_stats_dict(const TopologyStats& stats) {
+py::dict renyi_topology_stats_dict(const TopologyStats& stats) {
     py::dict out;
     out["attempts"] = stats.attempts;
     out["accepts"] = stats.accepts;
@@ -42,7 +42,7 @@ py::dict topology_stats_dict(const TopologyStats& stats) {
     return out;
 }
 
-void validate_rng_arrays(
+void validate_renyi_rng_arrays(
     const py::buffer_info& seeds,
     const py::buffer_info& sweeps,
     int batch_size) {
@@ -54,8 +54,8 @@ void validate_rng_arrays(
 
 }  // namespace
 
-void bind_batched_diagonal_engine(py::module_& m) {
-    py::class_<BatchedDiagonalEngine>(m, "BatchedDiagonalEngine")
+void bind_batched_renyi_engine(py::module_& m) {
+    py::class_<BatchedRenyiEngine>(m, "BatchedRenyiEngine")
         .def(py::init([](
                  int batch_size, int n_sites, int half_length,
                  double delta_min, double delta_max, double epsilon,
@@ -99,12 +99,13 @@ void bind_batched_diagonal_engine(py::module_& m) {
                 throw std::invalid_argument(
                     "bond_rmax must have shape (n_groups, n_bonds)");
             const py::ssize_t length = static_cast<py::ssize_t>(2) * half_length;
-            if (ot.ndim != 2 || os.ndim != 2
+            if (ot.ndim != 3 || os.ndim != 3
                 || ot.shape[0] != batch_size || os.shape[0] != batch_size
-                || ot.shape[1] != length || os.shape[1] != length)
+                || ot.shape[1] != 2 || os.shape[1] != 2
+                || ot.shape[2] != length || os.shape[2] != length)
                 throw std::invalid_argument(
-                    "operator arrays must have shape (batch_size, 2*half_length)");
-            return new BatchedDiagonalEngine(
+                    "operator arrays must have shape (batch_size, 2, 2*half_length)");
+            return new BatchedRenyiEngine(
                 batch_size, n_sites, half_length, delta_min, delta_max, epsilon,
                 n_groups, max_alias, n_bonds,
                 static_cast<const int32_t*>(bs.ptr), static_cast<const double*>(bv.ptr),
@@ -119,13 +120,34 @@ void bind_batched_diagonal_engine(py::module_& m) {
         py::arg("alias_prob"), py::arg("alias_index"), py::arg("alias_loc_kind"),
         py::arg("bond_rmax"), py::arg("op_types"), py::arg("op_sites"),
         py::arg("device") = 0)
+        .def("set_cut", &BatchedRenyiEngine::set_cut, py::arg("cut"))
+        .def("set_masks", [](
+                 BatchedRenyiEngine& self,
+                 py::array_t<uint8_t, py::array::c_style | py::array::forcecast> masks) {
+            const auto data = masks.request();
+            if (data.ndim != 2 || data.shape[0] != self.batch_size()
+                || data.shape[1] != self.n_sites())
+                throw std::invalid_argument(
+                    "masks must have shape (batch_size, n_sites)");
+            py::gil_scoped_release release;
+            self.set_masks(static_cast<const uint8_t*>(data.ptr));
+        }, py::arg("masks"))
+        .def("get_masks", [](const BatchedRenyiEngine& self) {
+            py::array_t<uint8_t> masks({static_cast<py::ssize_t>(self.batch_size()),
+                                        static_cast<py::ssize_t>(self.n_sites())});
+            {
+                py::gil_scoped_release release;
+                self.get_masks(masks.mutable_data());
+            }
+            return masks;
+        })
         .def("diagonal_update", [](
-                 BatchedDiagonalEngine& self,
+                 BatchedRenyiEngine& self,
                  py::array_t<uint64_t, py::array::c_style | py::array::forcecast> seeds,
                  py::array_t<uint64_t, py::array::c_style | py::array::forcecast> sweeps) {
             const auto seed_data = seeds.request();
             const auto sweep_data = sweeps.request();
-            validate_rng_arrays(seed_data, sweep_data, self.batch_size());
+            validate_renyi_rng_arrays(seed_data, sweep_data, self.batch_size());
             std::vector<DiagonalStats> stats;
             {
                 py::gil_scoped_release release;
@@ -134,16 +156,16 @@ void bind_batched_diagonal_engine(py::module_& m) {
                     static_cast<const uint64_t*>(sweep_data.ptr));
             }
             py::list out;
-            for (const auto& item : stats) out.append(diagonal_stats_dict(item));
+            for (const auto& item : stats) out.append(renyi_diagonal_stats_dict(item));
             return out;
         }, py::arg("seeds"), py::arg("sweep_ids"))
         .def("cluster_update", [](
-                 BatchedDiagonalEngine& self,
+                 BatchedRenyiEngine& self,
                  py::array_t<uint64_t, py::array::c_style | py::array::forcecast> seeds,
                  py::array_t<uint64_t, py::array::c_style | py::array::forcecast> sweeps) {
             const auto seed_data = seeds.request();
             const auto sweep_data = sweeps.request();
-            validate_rng_arrays(seed_data, sweep_data, self.batch_size());
+            validate_renyi_rng_arrays(seed_data, sweep_data, self.batch_size());
             std::vector<ClusterStats> stats;
             {
                 py::gil_scoped_release release;
@@ -152,53 +174,44 @@ void bind_batched_diagonal_engine(py::module_& m) {
                     static_cast<const uint64_t*>(sweep_data.ptr));
             }
             py::list out;
-            for (const auto& item : stats) out.append(cluster_stats_dict(item));
+            for (const auto& item : stats) out.append(renyi_cluster_stats_dict(item));
             return out;
         }, py::arg("seeds"), py::arg("sweep_ids"))
-        .def("set_string_sites", [](
-                 BatchedDiagonalEngine& self,
-                 py::array_t<int32_t, py::array::c_style | py::array::forcecast> sites,
-                 int m_star) {
-            const auto data = sites.request();
-            if (data.ndim != 1)
-                throw std::invalid_argument("string_sites must be one-dimensional");
-            self.set_string_sites(static_cast<const int32_t*>(data.ptr),
-                                  static_cast<int>(data.shape[0]), m_star);
-        }, py::arg("string_sites"), py::arg("m_star"))
-        .def("set_seam_masks_consistent", [](
-                 BatchedDiagonalEngine& self,
-                 py::array_t<uint64_t, py::array::c_style | py::array::forcecast> masks) {
-            const auto data = masks.request();
-            if (data.ndim != 1 || data.shape[0] != self.batch_size())
-                throw std::invalid_argument("masks must have shape (batch_size,)");
-            py::gil_scoped_release release;
-            self.set_seam_masks_consistent(static_cast<const uint64_t*>(data.ptr));
-        }, py::arg("masks"))
         .def("topology_sweep", [](
-                 BatchedDiagonalEngine& self, double lambda,
+                 BatchedRenyiEngine& self,
+                 py::array_t<int32_t, py::array::c_style | py::array::forcecast> sites,
+                 double lambda,
                  py::array_t<uint64_t, py::array::c_style | py::array::forcecast> seeds,
                  py::array_t<uint64_t, py::array::c_style | py::array::forcecast> sweeps) {
+            const auto site_data = sites.request();
             const auto seed_data = seeds.request();
             const auto sweep_data = sweeps.request();
-            validate_rng_arrays(seed_data, sweep_data, self.batch_size());
+            if (site_data.ndim != 1)
+                throw std::invalid_argument("topology_sites must be one-dimensional");
+            validate_renyi_rng_arrays(seed_data, sweep_data, self.batch_size());
             std::vector<TopologyStats> stats;
             {
                 py::gil_scoped_release release;
                 stats = self.topology_sweep(
-                    lambda, static_cast<const uint64_t*>(seed_data.ptr),
+                    static_cast<const int32_t*>(site_data.ptr),
+                    static_cast<int>(site_data.shape[0]), lambda,
+                    static_cast<const uint64_t*>(seed_data.ptr),
                     static_cast<const uint64_t*>(sweep_data.ptr));
             }
             py::list out;
-            for (const auto& item : stats) out.append(topology_stats_dict(item));
+            for (const auto& item : stats) out.append(renyi_topology_stats_dict(item));
             return out;
-        }, py::arg("lambda_"), py::arg("seeds"), py::arg("sweep_ids"))
-        .def("save_checkpoint", &BatchedDiagonalEngine::save_checkpoint)
-        .def("restore_checkpoint", &BatchedDiagonalEngine::restore_checkpoint)
-        .def_property_readonly("has_checkpoint", &BatchedDiagonalEngine::has_checkpoint)
-        .def("get_operator_strings", [](const BatchedDiagonalEngine& self) {
+        }, py::arg("topology_sites"), py::arg("lambda_"),
+        py::arg("seeds"), py::arg("sweep_ids"))
+        .def("save_checkpoint", &BatchedRenyiEngine::save_checkpoint)
+        .def("restore_checkpoint", &BatchedRenyiEngine::restore_checkpoint)
+        .def_property_readonly("has_checkpoint", &BatchedRenyiEngine::has_checkpoint)
+        .def("get_operator_strings", [](const BatchedRenyiEngine& self) {
             py::array_t<int32_t> types({static_cast<py::ssize_t>(self.batch_size()),
+                                        static_cast<py::ssize_t>(2),
                                         static_cast<py::ssize_t>(self.length())});
             py::array_t<int32_t> sites({static_cast<py::ssize_t>(self.batch_size()),
+                                        static_cast<py::ssize_t>(2),
                                         static_cast<py::ssize_t>(self.length())});
             {
                 py::gil_scoped_release release;
@@ -207,49 +220,28 @@ void bind_batched_diagonal_engine(py::module_& m) {
             return py::make_tuple(types, sites);
         })
         .def("set_operator_strings", [](
-                 BatchedDiagonalEngine& self,
+                 BatchedRenyiEngine& self,
                  py::array_t<int32_t, py::array::c_style | py::array::forcecast> types,
                  py::array_t<int32_t, py::array::c_style | py::array::forcecast> sites) {
             const auto t = types.request();
             const auto s = sites.request();
-            if (t.ndim != 2 || s.ndim != 2
+            if (t.ndim != 3 || s.ndim != 3
                 || t.shape[0] != self.batch_size() || s.shape[0] != self.batch_size()
-                || static_cast<std::size_t>(t.shape[1]) != self.length()
-                || static_cast<std::size_t>(s.shape[1]) != self.length())
+                || t.shape[1] != 2 || s.shape[1] != 2
+                || static_cast<std::size_t>(t.shape[2]) != self.length()
+                || static_cast<std::size_t>(s.shape[2]) != self.length())
                 throw std::invalid_argument(
-                    "operator arrays must have shape (batch_size, length)");
+                    "operator arrays must have shape (batch_size, 2, length)");
             py::gil_scoped_release release;
             self.set_operator_strings(static_cast<const int32_t*>(t.ptr),
                                       static_cast<const int32_t*>(s.ptr));
         })
-        .def("profile_states", [](const BatchedDiagonalEngine& self,
-                                    int profile_step) {
-            if (profile_step <= 0
-                || static_cast<std::size_t>(profile_step) > self.length())
-                throw std::invalid_argument(
-                    "profile_step must be in [1, operator length]");
-            const auto points = static_cast<py::ssize_t>(
-                self.length() / static_cast<std::size_t>(profile_step));
-            const auto words = static_cast<py::ssize_t>((self.n_sites() + 63) / 64);
-            py::array_t<uint64_t> output({
-                static_cast<py::ssize_t>(self.batch_size()), points, words});
-            {
-                py::gil_scoped_release release;
-                self.get_profile_states(profile_step, output.mutable_data());
-            }
-            return output;
-        }, py::arg("profile_step"))
-        .def("get_seam_masks", [](const BatchedDiagonalEngine& self) {
-            py::array_t<uint64_t> masks(self.batch_size());
-            self.get_seam_masks(masks.mutable_data());
-            return masks;
-        })
-        .def_property_readonly("batch_size", &BatchedDiagonalEngine::batch_size)
-        .def_property_readonly("n_sites", &BatchedDiagonalEngine::n_sites)
-        .def_property_readonly("length", &BatchedDiagonalEngine::length)
+        .def_property_readonly("batch_size", &BatchedRenyiEngine::batch_size)
+        .def_property_readonly("n_sites", &BatchedRenyiEngine::n_sites)
+        .def_property_readonly("length", &BatchedRenyiEngine::length)
         .def_property_readonly("shared_model_bytes",
-                               &BatchedDiagonalEngine::shared_model_bytes)
-        .def_property_readonly("device_bytes", &BatchedDiagonalEngine::device_bytes);
+                               &BatchedRenyiEngine::shared_model_bytes)
+        .def_property_readonly("device_bytes", &BatchedRenyiEngine::device_bytes);
 }
 
 }  // namespace qaqmc_cuda::bindings

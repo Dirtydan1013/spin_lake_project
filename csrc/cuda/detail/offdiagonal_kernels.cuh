@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qaqmc_cuda_common.cuh"
+#include "common.cuh"
 
 #include <cub/cub.cuh>
 #include <climits>
