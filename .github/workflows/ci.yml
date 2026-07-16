@@ -1,0 +1,82 @@
+# CPU test gate — runs on GitHub-hosted runners.
+#
+# Scope: build the portable CPU extension and run the fast suites
+# (engines/mpi unit + mpi integration, ~130 tests).  The heavy vs-ED
+# integration suite runs as a separate job on pull requests and manual
+# dispatch only.  GPU (tests/gpu) and multi-rank MPI production gates
+# cannot run here — they stay on the Slurm cluster
+# (scripts/test/, scripts/bench/).
+name: ci
+
+on:
+  push:
+    branches: [main, z2_spin_lake]
+    paths-ignore:
+      - 'paper/**'
+      - '**.md'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+
+      - name: Build CPU extension (portable x86-64)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DQAQMC_ARCH=x86-64 -DPYTHON_EXECUTABLE=$(which python)
+          cmake --build build -j
+          python -c "import sys; sys.path.insert(0, 'build'); import qaqmc_cpp; print('extension OK')"
+
+      - name: Unit + integration suites (CPU)
+        env:
+          QAQMC_TEST_BUILD_DIR: ${{ github.workspace }}/build
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "1"
+        run: |
+          python -m pytest tests/engines/unit tests/mpi/unit tests/mpi/integration -q
+
+  # Heavy vs-ED gates (several minutes each) — PRs and manual runs only.
+  ed-integration:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+
+      - name: Build CPU extension (portable x86-64)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DQAQMC_ARCH=x86-64 -DPYTHON_EXECUTABLE=$(which python)
+          cmake --build build -j
+
+      - name: vs-ED integration suite
+        env:
+          QAQMC_TEST_BUILD_DIR: ${{ github.workspace }}/build
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "2"
+        run: |
+          python -m pytest tests/engines/integration -q
