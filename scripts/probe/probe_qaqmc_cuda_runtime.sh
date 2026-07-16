@@ -28,7 +28,7 @@ GPU_STEPS=${GPU_STEPS:-5}
 FULL_STEPS=${FULL_STEPS:-3}
 
 cd "${SLURM_TMPDIR:-/tmp}"
-python "$ROOT/scripts/probe/probe_runtime_qaqmc_cuda.py" \
+python -m src.probes.runtime_qaqmc_cuda \
     --M "$M" --cpu-steps "$CPU_STEPS" --gpu-steps "$GPU_STEPS" \
     --full-steps "$FULL_STEPS" --gpu-warmup 1 --event-builds 1
 

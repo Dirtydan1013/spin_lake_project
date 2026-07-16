@@ -49,7 +49,7 @@ RANK=${RANK:-${SLURM_ARRAY_TASK_ID:-0}}
 RUN_DIR=${RUN_DIR:-$ROOT/data/qaqmc_cuda_${NX}x${NY}_M${M}_${SLURM_JOB_ID:-manual}}
 
 cd "${SLURM_TMPDIR:-/tmp}"
-python "$ROOT/scripts/run/run_qaqmc_cuda.py" \
+python -m src.runners.qaqmc_cuda \
     --lattice "$LATTICE" --boundary "$BOUNDARY" \
     --nx "$NX" --ny "$NY" --a "$A_LAT" \
     --M "$M" --Omega 1.0 --Rb "$RB" \

@@ -60,7 +60,7 @@ event-scratch capacity。系統超過 16-bit index 範圍時會自動 fallback �
 ```bash
 cd /tmp
 PYTHONPATH=/path/to/spin_lake_project/build:/path/to/spin_lake_project \
-python /path/to/spin_lake_project/scripts/bench/probe_qaqmc_cpu_memory.py \
+python /path/to/spin_lake_project/-m src.probes.qaqmc_cpu_memory \
     --M 2760000 --warmup-steps 2 --timed-steps 5
 ```
 

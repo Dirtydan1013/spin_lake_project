@@ -28,7 +28,7 @@ cd "${SLURM_TMPDIR:-/tmp}"
 for storage in ${EVENT_STORAGES:-packed64 p_bond16 p_only32}; do
     for batch in ${BATCH_SIZES:-1 2 4 8 16}; do
         echo "[CPU-SHARED] storage=$storage B=$batch"
-        python "$ROOT/scripts/bench/probe_qaqmc_cpu_shared_batch.py" \
+        python -m src.probes.qaqmc_shared_batch \
             --batch-size "$batch" --event-storage "$storage" \
             --M "${M:-2760000}" --warmup "${WARMUP:-2}" \
             --steps "${STEPS:-5}"

@@ -34,7 +34,7 @@ for variant in baseline optimized; do
     fi
     echo "[CPU-MEM64] variant=$variant build=$build"
     PYTHONPATH="$build:$ROOT" mpiexec -n 64 --bind-to core --map-by core \
-        python "$ROOT/scripts/bench/probe_qaqmc_cpu_memory_mpi.py" \
+        python -m src.probes.qaqmc_cpu_memory_mpi \
         --label "$variant" --M "${M:-2760000}" \
         --warmup "${WARMUP:-1}" --steps "${STEPS:-3}" \
         --event-storage packed64
@@ -43,14 +43,14 @@ done
 echo "[CPU-MEM64] optimized aggressive event mode"
 PYTHONPATH="${QAQMC_BUILD:-$ROOT/build_cpu_shared}:$ROOT" \
     mpiexec -n 64 --bind-to core --map-by core \
-    python "$ROOT/scripts/bench/probe_qaqmc_cpu_memory_mpi.py" \
+    python -m src.probes.qaqmc_cpu_memory_mpi \
     --label optimized_p_bond16 --M "${M:-2760000}" \
     --warmup "${WARMUP:-1}" --steps "${STEPS:-3}" \
     --event-storage p_bond16
 
 PYTHONPATH="${QAQMC_BUILD:-$ROOT/build_cpu_shared}:$ROOT" \
     mpiexec -n 64 --bind-to core --map-by core \
-    python "$ROOT/scripts/bench/probe_qaqmc_cpu_memory_mpi.py" \
+    python -m src.probes.qaqmc_cpu_memory_mpi \
     --label optimized_p_only32 --M "${M:-2760000}" \
     --warmup "${WARMUP:-1}" --steps "${STEPS:-3}" \
     --event-storage p_only32

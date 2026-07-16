@@ -72,7 +72,7 @@ echo "            decorr=${TARGET_DECORR}, n_regions=${TARGET_N_REGIONS}"
 echo
 
 # $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
-$MPIEXEC python -u scripts/probe/probe_runtime_renyi_work.py \
+$MPIEXEC python -u -m src.probes.runtime_renyi_work \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --a "$A_LAT" \
     --M "$M" \

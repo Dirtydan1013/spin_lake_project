@@ -51,7 +51,7 @@ echo "Estimating: equil=${TARGET_EQUIL}, samples=${TARGET_SAMPLES} (per rank)"
 echo
 
 # $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
-$MPIEXEC python -u scripts/probe/probe_runtime_sse.py \
+$MPIEXEC python -u -m src.probes.runtime_sse \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --a "$A_LAT" \
     --Omega "$OMEGA" --delta "$DELTA" --Rb "$RB" --beta "$BETA" \

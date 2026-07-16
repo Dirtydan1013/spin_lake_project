@@ -19,10 +19,9 @@ if not qaqmc_cuda.is_available():
 
 def test_rank_local_profile_output_and_checkpoint_resume(tmp_path):
     root = Path(__file__).resolve().parents[3]
-    script = root / "scripts/run/run_qaqmc_cuda.py"
     run_dir = tmp_path / "run"
     base = [
-        sys.executable, str(script),
+        sys.executable, "-m", "src.runners.qaqmc_cuda",
         "--lattice", "kagome_bond", "--boundary", "periodic",
         "--nx", "4", "--ny", "4", "--a", "4.0",
         "--M", "200", "--Rb", "2.4",
@@ -34,6 +33,9 @@ def test_rank_local_profile_output_and_checkpoint_resume(tmp_path):
         "--run-dir", str(run_dir),
     ]
     environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(root)] + [p for p in environment.get("PYTHONPATH", "").split(os.pathsep) if p]
+    )
     subprocess.run(base + ["--n-samples", "3"], cwd=tmp_path,
                    env=environment, check=True, timeout=120)
     subprocess.run(base + ["--n-samples", "4"], cwd=tmp_path,

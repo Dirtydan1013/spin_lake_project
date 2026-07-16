@@ -33,7 +33,7 @@ TARGET_SAMPLES=${TARGET_SAMPLES:-100000}
 echo "Probing QAQMC ${NX}x${NY} ${LATTICE} profile runtime (M=${M})"
 
 # $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
-$MPIEXEC python -u scripts/probe/probe_runtime_qaqmc_otf.py \
+$MPIEXEC python -u -m src.probes.runtime_qaqmc_otf \
     --lattice "$LATTICE" \
     --nx "$NX" --ny "$NY" --M "$M" --delta-groups 600 \
     --delta-min -2.0 --delta-max 6.0 \

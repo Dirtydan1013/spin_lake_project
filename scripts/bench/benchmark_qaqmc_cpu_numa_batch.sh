@@ -31,7 +31,7 @@ for storage in ${EVENT_STORAGES:-packed64 p_bond16 p_only32}; do
     for chains in ${CHAINS_PER_RANK:-1 2 4 8 16}; do
         echo "[CPU-NUMA] storage=$storage mpi=4 chains/rank=$chains"
         mpiexec -n 4 --bind-to core --map-by ppr:1:socket:PE=16 \
-            python "$ROOT/scripts/bench/probe_qaqmc_cpu_shared_batch_mpi.py" \
+            python -m src.probes.qaqmc_shared_batch_mpi \
             --chains-per-rank "$chains" --event-storage "$storage" \
             --M "${M:-2760000}" --warmup "${WARMUP:-2}" \
             --steps "${STEPS:-5}"

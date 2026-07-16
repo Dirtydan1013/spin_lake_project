@@ -30,7 +30,7 @@ cd "${SLURM_TMPDIR:-/tmp}"
 for device in 0 1 2; do
     echo "[BATCH-BENCH] physical device ${device}"
     CUDA_VISIBLE_DEVICES=$device python \
-        "$ROOT/scripts/bench/probe_qaqmc_batch_cuda.py" \
+        -m src.probes.qaqmc_batch_cuda \
         --engines "${ENGINES:-standard,string,renyi}" \
         --batch-sizes "${BATCH_SIZES:-1,2,4,8}" \
         --M "${M:-2760000}" --warmup "${WARMUP:-1}" --steps "${STEPS:-3}"

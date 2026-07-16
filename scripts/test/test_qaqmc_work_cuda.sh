@@ -27,12 +27,12 @@ export MKL_NUM_THREADS=1
 cd "${SLURM_TMPDIR:-/tmp}"
 python -m pytest -q "$ROOT/tests/gpu"
 
-python "$ROOT/scripts/probe/probe_qaqmc_work_cuda.py" \
+python -m src.probes.qaqmc_work_cuda \
     --engine string --lattice 1d_chain --N 8 --M 2000 \
     --neighbor-cutoff 1 --delta-groups 32 --sites 2,4 \
     --warmup 1 --gpu-steps 5 --cpu-steps 1 --topology-sweeps 5
 
-python "$ROOT/scripts/probe/probe_qaqmc_work_cuda.py" \
+python -m src.probes.qaqmc_work_cuda \
     --engine renyi --lattice 1d_chain --N 8 --M 2000 \
     --neighbor-cutoff 1 --delta-groups 32 --sites 2,4 \
     --warmup 1 --gpu-steps 5 --cpu-steps 1 --topology-sweeps 5

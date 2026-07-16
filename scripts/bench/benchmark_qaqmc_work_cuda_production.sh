@@ -33,7 +33,7 @@ cd "${SLURM_TMPDIR:-/tmp}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 for engine in string renyi; do
-    python "$ROOT/scripts/probe/probe_qaqmc_work_cuda.py" \
+    python -m src.probes.qaqmc_work_cuda \
         --engine "$engine" --lattice kagome_bond_triangle \
         --nx 6 --ny 6 --a 4.0 --M "$M" --Rb 2.4 \
         --delta-min -2.0 --delta-max 4.5 \

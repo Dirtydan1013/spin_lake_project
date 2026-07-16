@@ -28,6 +28,6 @@ GPU_STEPS=${GPU_STEPS:-5}
 CPU_STEPS=${CPU_STEPS:-1}
 
 cd "${SLURM_TMPDIR:-/tmp}"
-python "$ROOT/scripts/probe/probe_qaqmc_work_cuda.py" \
+python -m src.probes.qaqmc_work_cuda \
     --engine "$ENGINE" --M "$M" --gpu-steps "$GPU_STEPS" \
     --cpu-steps "$CPU_STEPS" --device 0

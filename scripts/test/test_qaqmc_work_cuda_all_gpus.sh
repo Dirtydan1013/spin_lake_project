@@ -35,12 +35,12 @@ for device in 0 1 2; do
         "import qaqmc_cuda; print(qaqmc_cuda.device_info()[0], flush=True)"
     CUDA_VISIBLE_DEVICES=$device python -m pytest -q "$ROOT/tests/gpu"
     CUDA_VISIBLE_DEVICES=$device python \
-        "$ROOT/scripts/probe/probe_qaqmc_work_cuda.py" \
+        -m src.probes.qaqmc_work_cuda \
         --engine string --lattice 1d_chain --N 8 --M 2000 \
         --neighbor-cutoff 1 --delta-groups 32 --sites 2,4 \
         --warmup 1 --gpu-steps 5 --cpu-steps 1 --topology-sweeps 5
     CUDA_VISIBLE_DEVICES=$device python \
-        "$ROOT/scripts/probe/probe_qaqmc_work_cuda.py" \
+        -m src.probes.qaqmc_work_cuda \
         --engine renyi --lattice 1d_chain --N 8 --M 2000 \
         --neighbor-cutoff 1 --delta-groups 32 --sites 2,4 \
         --warmup 1 --gpu-steps 5 --cpu-steps 1 --topology-sweeps 5

@@ -26,7 +26,7 @@ export MKL_NUM_THREADS=1
 
 cd "${SLURM_TMPDIR:-/tmp}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
-python "$ROOT/scripts/bench/probe_qaqmc_batch_cuda.py" \
+python -m src.probes.qaqmc_batch_cuda \
     --engines "${ENGINES:-standard,string,renyi}" \
     --batch-sizes "${BATCH_SIZES:-1,2,4,8}" \
     --M "${M:-2760000}" --warmup "${WARMUP:-1}" --steps "${STEPS:-5}"
