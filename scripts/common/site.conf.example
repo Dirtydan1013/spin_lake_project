@@ -15,6 +15,12 @@
 #CPT=${CPT:-4}
 #NTASKS=${NTASKS:-8}
 
+# Scheduler targets for THIS site (used by submit.sh; they override the
+# #SBATCH partition/nodelist headers baked into the run scripts, which are
+# the original cluster's defaults).  Leave unset to use the headers as-is.
+#SBATCH_PARTITION=${SBATCH_PARTITION:-cpu}
+#SBATCH_NODELIST=${SBATCH_NODELIST:-cpunode02}
+
 # Core binding (Open MPI / hwloc syntax — vendor-neutral).
 # AMD EPYC (many small NUMA domains): map by NUMA node instead of slot:
 #BIND_FLAGS="--map-by numa:PE=${CPT:-1} --bind-to core"
