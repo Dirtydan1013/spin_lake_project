@@ -23,9 +23,7 @@
 #                        for a K-convergence sweep.
 #   --n-trajectories     Jarzynski sample size (split across ranks).
 #   --decorrelation-steps   QAQMC steps in start sector between trajectories.
-#   --A-end / --A-start  region pair.  Use the "0:5:12" site-list form for
-#                        readability with large N (avoid 216-character bit
-#                        strings).  Omit --A-start for ∅→A_end.
+#   KP_START/KP_END/KP_M/KP_CENTER   nested KP region pair (see below).
 #   --filepath           HDF5 output path; result includes per-K work_samples
 #                        for offline analysis.
 #
@@ -34,8 +32,8 @@
 # sampling itself is single-threaded per rank.
 #
 # Output: data/renyi_work_... .h5 (+ _chunks/K{K}/rank{r}.h5, configs/).
-# Usage:  ./scripts/submit.sh scripts/run/run_kagome_renyi_work.sh
-#         KP_START=A KP_END=AB KP_M=2 K_VALUES=400 ./scripts/submit.sh scripts/run/run_kagome_renyi_work.sh
+# Usage:  ./scripts/submit.sh scripts/run/cpu/run_kagome_renyi_work.sh
+#         KP_START=A KP_END=AB KP_M=2 K_VALUES=400 ./scripts/submit.sh scripts/run/cpu/run_kagome_renyi_work.sh
 
 set -euo pipefail
 
@@ -91,36 +89,16 @@ CONFIG_OUT=${CONFIG_OUT:-""}
 # restores pre-2026-07 fixed-seed trajectories.
 PERMUTE_SITES=${PERMUTE_SITES:-1}
 
-# KP region selection.  Three modes (in priority order):
-#
-#  1) KP_START + KP_END   (nested pair, e.g. A → AB)
-#     ΔS_2 = S_2(KP_END) − S_2(KP_START); a single trajectory batch.
-#     Requires nested: start ⊆ end.
-#     Example:  KP_START=A KP_END=AB
-#
-#  2) KP_REGIONS           (∅ → each, e.g. all 7 for γ calculation)
-#     Loops over each name, returns ΔS_2 = S_2(name); rank 0 prints γ
-#     if the standard 7-set is computed.
-#     Example: KP_REGIONS="A,B,C,AB,BC,CA,ABC"  or  KP_REGIONS=all
-#
-#  3) Custom A_END (with optional A_START) — non-KP mode, see below.
-#
-# Default = all 7 regions (γ run).  Set KP_START/KP_END to switch to pair mode.
-KP_REGIONS=${KP_REGIONS:-all}
+# KP nested pair: ΔS_2 = S_2(KP_END) − S_2(KP_START), start ⊆ end.
+# γ composes from rung pairs (A→AB, AB→ABC, ...).  The whole-region
+# (∅→X, --kp-regions) and custom-mask (--A-end) modes were removed from
+# this launcher — the driver CLI still supports both; call
+# `python -m src.mpi.qaqmc_renyi_work_mpi` directly if you ever need them.
 KP_START=${KP_START:-"A"}
 KP_END=${KP_END:-"AB"}
 KP_M=${KP_M:-2}
 KP_CENTER=${KP_CENTER:-""}    # e.g. "C24"; empty = auto
-
-# If a pair is specified, suppress the regions-loop mode.
-if [ -n "$KP_START" ] || [ -n "$KP_END" ]; then
-    KP_REGIONS=""
-fi
-
-# Custom region pair (only used when KP_REGIONS is unset / empty).
-# Format: bit string "1,0,..." or site-list "0:2:5".
-A_END=${A_END:-""}
-A_START=${A_START:-""}
+[ -n "$KP_START" ] && [ -n "$KP_END" ] || { echo "ERROR: KP_START and KP_END must both be set"; exit 1; }
 
 OUT_NAME=${OUT_NAME:-"renyi_work_${LATTICE}_${NX}x${NY}_M${M}_K${K_VALUES//,/-}_n${N_TRAJ}_${JOB_TAG}.h5"}
 FILEPATH="data/${OUT_NAME}"
@@ -129,29 +107,12 @@ echo "Geometry: $LATTICE nx=$NX, ny=$NY, a=$A_LAT"
 echo "Hamiltonian: Omega=$OMEGA, Rb=$RB, delta=[$DELTA_MIN,$DELTA_MAX]"
 echo "QAQMC: M=$M, delta_groups=$DELTA_GROUPS, neighbor_cutoff=$NEIGHBOR_CUTOFF"
 echo "Protocol: K=$K_VALUES, n_trajectories=$N_TRAJ, thermalize=$N_THERMALIZE, decorrelation=$DECORR"
-if [ -n "$KP_START" ] && [ -n "$KP_END" ]; then
-    echo "KP pair mode: $KP_START → $KP_END, m=$KP_M, center=${KP_CENTER:-auto}"
-elif [ -n "$KP_REGIONS" ]; then
-    echo "KP regions mode: ∅ → {$KP_REGIONS}, m=$KP_M, center=${KP_CENTER:-auto}"
-else
-    echo "Custom region: A_start=\"$A_START\", A_end=\"$A_END\""
-fi
+echo "KP pair: $KP_START → $KP_END, m=$KP_M, center=${KP_CENTER:-auto}"
 echo "Output: $FILEPATH"
 echo
 
-# ─── Build CLI args conditionally ───────────────────────────────────────────
-EXTRA_ARGS=()
-if [ -n "$KP_START" ] && [ -n "$KP_END" ]; then
-    EXTRA_ARGS+=(--kp-start "$KP_START" --kp-end "$KP_END" --kp-m "$KP_M")
-    [ -n "$KP_CENTER" ] && EXTRA_ARGS+=(--kp-preferred-center "$KP_CENTER")
-elif [ -n "$KP_REGIONS" ]; then
-    EXTRA_ARGS+=(--kp-regions "$KP_REGIONS" --kp-m "$KP_M")
-    [ -n "$KP_CENTER" ] && EXTRA_ARGS+=(--kp-preferred-center "$KP_CENTER")
-else
-    [ -z "$A_END" ] && { echo "ERROR: set KP_START+KP_END, KP_REGIONS, or A_END"; exit 1; }
-    EXTRA_ARGS+=(--A-end "$A_END")
-    [ -n "$A_START" ] && EXTRA_ARGS+=(--A-start "$A_START")
-fi
+EXTRA_ARGS=(--kp-start "$KP_START" --kp-end "$KP_END" --kp-m "$KP_M")
+[ -n "$KP_CENTER" ] && EXTRA_ARGS+=(--kp-preferred-center "$KP_CENTER")
 
 # $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
 $MPIEXEC python -u -m src.mpi.qaqmc_renyi_work_mpi \

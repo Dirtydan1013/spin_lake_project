@@ -13,10 +13,22 @@ struct DeviceInfo {
     int compute_major;
     int compute_minor;
     int multiprocessors;
+    // Whether THIS binary can execute on the device: compute capability >=
+    // the lowest architecture compiled into the fatbin (PTX JIT covers newer
+    // devices; older ones fail with "no kernel image").
+    bool supported;
 };
 
-// Return false (rather than throwing) when the CUDA runtime has no usable
-// device.  This lets the Python test suite skip GPU tests on login/CPU nodes.
+// Lowest compute capability this binary supports, as major*100 + minor*10
+// (e.g. 700 for the default '70;80' fatbin).  Derived at compile time from
+// __CUDA_ARCH_LIST__, so rebuilding with different QAQMC_CUDA_ARCHITECTURES
+// updates it automatically.
+int min_supported_compute();
+
+// Return false (rather than throwing) when the CUDA runtime has no device
+// that can execute this binary — both "no GPU at all" (login/CPU nodes) and
+// "only pre-Volta display cards" (e.g. a Quadro P400, sm_61) skip cleanly
+// instead of failing later with "no kernel image is available".
 bool is_available();
 
 std::vector<DeviceInfo> device_info();

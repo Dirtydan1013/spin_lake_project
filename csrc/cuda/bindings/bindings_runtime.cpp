@@ -12,7 +12,12 @@ namespace qaqmc_cuda::bindings {
 
 void bind_runtime(py::module_& m) {
     m.def("is_available", &qaqmc_cuda::is_available,
-          "Return true when the CUDA runtime sees at least one usable GPU.");
+          "Return true when at least one GPU can execute this binary "
+          "(compute capability >= min_supported_compute()/100).");
+
+    m.def("min_supported_compute", &qaqmc_cuda::min_supported_compute,
+          "Lowest supported compute capability as major*100+minor*10, "
+          "derived from the architectures compiled into the fatbin.");
 
     m.def("device_info", []() {
         py::list out;
@@ -24,6 +29,7 @@ void bind_runtime(py::module_& m) {
             item["compute_capability"] = py::make_tuple(info.compute_major,
                                                         info.compute_minor);
             item["multiprocessors"] = info.multiprocessors;
+            item["supported"] = info.supported;
             out.append(std::move(item));
         }
         return out;

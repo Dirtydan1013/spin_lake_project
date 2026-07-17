@@ -17,7 +17,8 @@ git clone <repo-url> spin_lake_project
 cd spin_lake_project
 
 # 2. 建立環境（含 openmpi/mpiexec、mpi4py、g++/OpenMP、cmake/ninja/pybind11）
-conda env create -f environment.yml
+conda env create -f environment.yml          # 一般安裝（最新相容版本）
+# conda env create -f environment.lock.yml   # 或：精確重現通過驗證的環境
 conda activate qaqmc
 
 # 3. 編譯 C++ 核心（預設 -march=native，在哪台跑就在哪台 build）
@@ -39,6 +40,13 @@ python -c "import qaqmc_cpp; print('C++ extension OK')"
   segfault。要部署新版請用 `mv`（atomic rename），或等任務結束。
 - 換 `-march` 會改變浮點捨入（FMA contraction），同 seed 的軌跡在不同
   build 間不會 bit-identical（統計上等價）。
+- **`environment.yml` 沒有鎖版本**（conda-forge 持續更新）。每次成功部署並
+  通過測試後，重新產生 known-good 快照：
+  `conda env export -n qaqmc | grep -v '^prefix:' > environment.lock.yml`
+  （保留檔頭註解）。歷史快照就在這個檔案的 git 歷史裡。
+- ⚠️ **僅支援單節點**：conda-forge 的 Open MPI 沒有 InfiniBand/UCX 與
+  SLURM PMIx 整合 — 跨節點 job 要嘛起不來、要嘛默默走 TCP。多節點需要
+  系統 MPI 並對其重編 mpi4py（目前 out of scope，不要直接嘗試）。
 
 ## Standard QAQMC CPU 記憶體
 
@@ -60,7 +68,7 @@ event-scratch capacity。系統超過 16-bit index 範圍時會自動 fallback �
 ```bash
 cd /tmp
 PYTHONPATH=/path/to/spin_lake_project/build:/path/to/spin_lake_project \
-python /path/to/spin_lake_project/-m src.probes.qaqmc_cpu_memory \
+python -m src.probes.qaqmc_cpu_memory \
     --M 2760000 --warmup-steps 2 --timed-steps 5
 ```
 
@@ -110,6 +118,15 @@ cmake --build build_cuda -j
 再到舊 CPU node 執行，因為 Python 的空 import path 會優先於
 `PYTHONPATH`，可能直接 `Illegal instruction`。
 
+**換機器部署 CUDA 的需求清單**：
+- 系統 CUDA toolkit ≥ 12（不在 conda env 裡）；nvcc 路徑用
+  `-DCMAKE_CUDA_COMPILER=<path>/bin/nvcc` 指定。
+- NVIDIA driver ≥ R525（支援 CUDA 12 runtime）。
+- GPU compute capability ≥ 7.0（Volta）；更新的卡走 PTX JIT 也能跑，
+  更舊的卡 `qaqmc_cuda.is_available()` 會回 False（不會噴 kernel error）。
+- **換機必重編**：`.so` 的 RPATH 烙著 build 機的 CUDA 路徑
+  （`readelf -d build_cuda/qaqmc_cuda*.so | grep RPATH` 可驗）。
+
 GPU 測試必須在 compute allocation 中執行：
 
 ```bash
@@ -122,12 +139,12 @@ srun --partition=gpu --nodelist=gpunode02 --gres=gpu:1 --cpus-per-task=2 \
 單 GPU production job：
 
 ```bash
-sbatch scripts/run/run_kagome_qaqmc_cuda.sh
+sbatch scripts/run/cuda/run_kagome_qaqmc_cuda.sh
 
 # 多條獨立 chain 可用 job array；給所有 task 同一個絕對 RUN_DIR，
 # SLURM_ARRAY_TASK_ID 會成為 rank/seed offset。
 RUN_DIR=$PWD/data/qaqmc_cuda_ensemble \
-  sbatch --array=0-2 scripts/run/run_kagome_qaqmc_cuda.sh
+  sbatch --array=0-2 scripts/run/cuda/run_kagome_qaqmc_cuda.sh
 ```
 
 CUDA runner 目前輸出 rank-local batched profile：density、`Z_l`、`C_m_l`、
@@ -144,21 +161,21 @@ production 腳本在 `scripts/run/`，同一份腳本在有無 SLURM 的
 
 ```bash
 # 統一入口：有 sbatch 就提交 job，沒有就 nohup 背景執行（log 寫到 logs/）
-./scripts/submit.sh scripts/run/run_kagome_sse.sh
+./scripts/submit.sh scripts/run/cpu/run_kagome_sse.sh
 
 # 額外參數會透傳給 sbatch（覆寫 #SBATCH 標頭）
-./scripts/submit.sh scripts/run/run_kagome_otf.sh --nodelist=cpunode02
+./scripts/submit.sh scripts/run/cpu/run_kagome_otf.sh --nodelist=cpunode02
 
 # 也可以照舊直接用
-sbatch scripts/run/run_kagome_otf.sh       # SLURM cluster
-bash   scripts/run/run_kagome_otf.sh       # 一般 server（前景）
+sbatch scripts/run/cpu/run_kagome_otf.sh       # SLURM cluster
+bash   scripts/run/cpu/run_kagome_otf.sh       # 一般 server（前景）
 ```
 
 所有腳本參數都用環境變數覆寫，例如：
 
 ```bash
 NX=8 NY=8 M=200000 N_TRAJ=8000 \
-    ./scripts/submit.sh scripts/run/run_kagome_renyi_work.sh
+    ./scripts/submit.sh scripts/run/cpu/run_kagome_renyi_work.sh
 ```
 
 資源與綁核（由 `scripts/common/env.sh` 統一處理）：
@@ -169,11 +186,15 @@ NX=8 NY=8 M=200000 N_TRAJ=8000 \
   用 `NTASKS=16 CPT=4` 這類環境變數覆寫。
 - launcher 兩種情況都是 `mpiexec`（conda 的 Open MPI 沒有 SLURM/PMIx 整合，
   不要用 srun）。
-- **site 專屬設定**（綁核策略、conda 路徑等）：
+- **site 專屬設定**（綁核策略、conda 路徑、scheduler 目標）：
   `cp scripts/common/site.conf.example scripts/common/site.conf`
   後編輯（此檔已 gitignore）。例如 AMD EPYC 建議
   `BIND_FLAGS="--map-by numa:PE=$CPT --bind-to core"`；container 內
   `BIND_FLAGS="--bind-to none"`。
+- **換 cluster**：run 腳本 `#SBATCH` 標頭裡的 partition/nodelist 是
+  本站預設；在 site.conf（或環境變數）設 `SBATCH_PARTITION` /
+  `SBATCH_NODELIST`，`submit.sh` 會以 sbatch 參數注入覆寫標頭 —
+  不用逐檔改 16 份腳本。
 
 四個 production 腳本（輸出資料夾/檔名都帶引擎標籤）：
 

@@ -7,6 +7,31 @@
 
 namespace qaqmc_cuda {
 using namespace detail;
+namespace {
+// Lowest architecture compiled into this fatbin.  nvcc defines
+// __CUDA_ARCH_LIST__ (e.g. "700,800") for every translation unit it
+// compiles; devices at or above the minimum run natively or via PTX JIT,
+// devices below it fail with "no kernel image is available".
+constexpr int kMinCompiledArch = []() constexpr {
+#ifdef __CUDA_ARCH_LIST__
+    constexpr int archs[] = {__CUDA_ARCH_LIST__};
+    int lowest = archs[0];
+    for (int arch : archs) {
+        if (arch < lowest) lowest = arch;
+    }
+    return lowest;
+#else
+    return 700;  // conservative default: Volta
+#endif
+}();
+
+inline bool prop_supported(const cudaDeviceProp& prop) {
+    return prop.major * 100 + prop.minor * 10 >= kMinCompiledArch;
+}
+}  // namespace
+
+int min_supported_compute() { return kMinCompiledArch; }
+
 bool is_available() {
     int count = 0;
     const cudaError_t status = cudaGetDeviceCount(&count);
@@ -15,7 +40,15 @@ bool is_available() {
         cudaGetLastError();
         return false;
     }
-    return count > 0;
+    for (int index = 0; index < count; ++index) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, index) != cudaSuccess) {
+            cudaGetLastError();
+            continue;
+        }
+        if (prop_supported(prop)) return true;
+    }
+    return false;
 }
 
 std::vector<DeviceInfo> device_info() {
@@ -27,7 +60,8 @@ std::vector<DeviceInfo> device_info() {
         cudaDeviceProp prop{};
         check_cuda(cudaGetDeviceProperties(&prop, index), "cudaGetDeviceProperties");
         result.push_back(DeviceInfo{index, prop.name, prop.totalGlobalMem,
-                                    prop.major, prop.minor, prop.multiProcessorCount});
+                                    prop.major, prop.minor, prop.multiProcessorCount,
+                                    prop_supported(prop)});
     }
     return result;
 }

@@ -29,8 +29,8 @@
 # NEVER `cp` over the live qaqmc_cpp .so while this runs — deploy with `mv`.
 #
 # Submit (from repo root):
-#   ./scripts/submit.sh scripts/run/run_kagome_sse_entropy.sh
-#   EXCLUSIVE=1 ./scripts/submit.sh scripts/run/run_kagome_sse_entropy.sh
+#   ./scripts/submit.sh scripts/run/cpu/run_kagome_sse_entropy.sh
+#   EXCLUSIVE=1 ./scripts/submit.sh scripts/run/cpu/run_kagome_sse_entropy.sh
 # Override any tunable via env, e.g.  N_SAMPLES=2560000 N_BETA=80 DELTA=4.25 ...
 
 set -euo pipefail

@@ -20,8 +20,8 @@
 #
 # Output: JSON in the job log only (no data/ files).
 # Knobs (env): M (slices/half-ramp), GPU_STEPS / CPU_STEPS / FULL_STEPS.
-# Usage:  sbatch scripts/probe/probe_qaqmc_cuda_runtime.sh
-#         M=27600000 sbatch scripts/probe/probe_qaqmc_cuda_runtime.sh
+# Usage:  sbatch scripts/probe/cuda/probe_qaqmc_cuda_runtime.sh
+#         M=27600000 sbatch scripts/probe/cuda/probe_qaqmc_cuda_runtime.sh
 
 set -euo pipefail
 

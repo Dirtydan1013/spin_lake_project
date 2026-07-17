@@ -25,8 +25,8 @@
 # temperature-specific), n_eff / zero_frac convergence diagnostics in the log.
 #
 # Output: data/sse_string_work_... .h5 (+ _chunks/K{K}/rank{r}.h5).
-# Usage:  ./scripts/submit.sh scripts/run/run_kagome_offdiagonal.sh
-#         BETA=40 STRING_SIZE=3 ./scripts/submit.sh scripts/run/run_kagome_offdiagonal.sh
+# Usage:  ./scripts/submit.sh scripts/run/cpu/run_kagome_offdiagonal.sh
+#         BETA=40 STRING_SIZE=3 ./scripts/submit.sh scripts/run/cpu/run_kagome_offdiagonal.sh
 
 set -euo pipefail
 
