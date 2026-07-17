@@ -26,8 +26,7 @@ from src.tee.reweighting import (
 )
 
 
-def _rank_seed(seed: int, rank: int) -> int:
-    return int(seed) + 9973 * int(rank)
+from src.mpi.driver_util import rank_seed as _rank_seed
 
 
 @dataclass

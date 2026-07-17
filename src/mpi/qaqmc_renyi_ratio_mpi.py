@@ -29,8 +29,7 @@ from src.tee.qaqmc_renyi_ratio import (
 )
 
 
-def _rank_seed(seed: int, rank: int) -> int:
-    return int(seed) + 9973 * int(rank)
+from src.mpi.driver_util import rank_seed as _rank_seed
 
 
 def _to_attr_value(value):

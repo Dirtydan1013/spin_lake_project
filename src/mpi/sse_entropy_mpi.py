@@ -39,6 +39,7 @@ import numpy as np
 from mpi4py import MPI
 
 from src.mpi.chunk_io import RankChunkWriter
+from src.mpi.driver_util import rank_seed as _rank_seed
 from src.mpi.sse_mpi import _make_pos
 
 
@@ -111,7 +112,7 @@ def run_ladder(*, lattice, N, nx, ny, a, Omega=1.0, delta=4.25, Rb=2.4,
     base = -(-int(n_samples) // n_ranks)
     n_bins = max(1, -(-base // int(checkpoint)))
     my_n = n_bins * int(checkpoint)
-    rank_seed = seed + rank * 9973
+    rank_seed = _rank_seed(seed, rank)
 
     vij = _min_image_vij(pos, Omega, Rb, box)
     e_inf, var_h = _high_t_anchor(vij, delta, Omega, N)

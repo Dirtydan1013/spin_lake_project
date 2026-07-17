@@ -41,6 +41,7 @@ if _REPO_ROOT not in sys.path:
 
 from src.engines.sse import SSE_Rydberg
 from src.mpi.chunk_io import RankChunkWriter, check_config_compat, load_warm_config
+from src.mpi.driver_util import rank_seed as _rank_seed
 from src.mpi.equil_progress import run_equil_with_progress
 from src.mpi.site_permutation import (permute_rows, resolve_site_permutation,
                                       to_engine, unpermute_last_axis)
@@ -167,7 +168,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
             chi_f=False, verbose=True):
     """MPI-parallel SSE with per-rank chunked output and warm start.
 
-    Each rank runs an independent chain (seed = seed + rank*9973), bins its
+    Each rank runs an independent chain (seed = rank_seed(seed, rank), stride in src/mpi/driver_util.py), bins its
     per-step scalar observables every ``checkpoint`` samples into a chunk, and
     saves its final configuration for warm starting.  ``n_samples`` is the
     total across ranks; each rank gets ``ceil`` its share.  ``boundary`` selects
@@ -197,7 +198,7 @@ def run_mpi(*, lattice, N, nx, ny, a, Omega=1.0, delta=0.0, Rb=1.4, beta=10.0,
               f"{n_bins} bins × {checkpoint} samples = {my_n_samples}/rank "
               f"({n_ranks * my_n_samples} total)", flush=True)
 
-    rank_seed = seed + rank * 9973
+    rank_seed = _rank_seed(seed, rank)
 
     # Warm-start config + per-rank site-label permutation (scan-order
     # decorrelation — see src/mpi/site_permutation.py).  The engine runs on
