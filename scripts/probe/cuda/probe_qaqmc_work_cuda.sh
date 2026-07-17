@@ -21,8 +21,8 @@
 #
 # Output: JSON in the job log only (no data/ files).
 # Knobs (env): ENGINE=renyi|string, M, GPU_STEPS / CPU_STEPS.
-# Usage:  sbatch scripts/probe/probe_qaqmc_work_cuda.sh
-#         ENGINE=string M=100000 sbatch scripts/probe/probe_qaqmc_work_cuda.sh
+# Usage:  sbatch scripts/probe/cuda/probe_qaqmc_work_cuda.sh
+#         ENGINE=string M=100000 sbatch scripts/probe/cuda/probe_qaqmc_work_cuda.sh
 
 set -euo pipefail
 

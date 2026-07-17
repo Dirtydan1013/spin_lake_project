@@ -21,10 +21,10 @@
 # checkpoint + Philox counters, RESUME=1).
 #
 # Output: data/string_work_cuda_..._<RUN_TAG>.h5 (+ _chunks/K{K}/rank{r}.h5).
-# Usage:  sbatch scripts/run/run_kagome_string_work_cuda.sh
+# Usage:  sbatch scripts/run/cuda/run_kagome_string_work_cuda.sh
 #         # resume, reusing the original job's tag/paths:
 #         sbatch --export=ALL,RESUME=1,RUN_TAG=<original_job_id> \
-#           scripts/run/run_kagome_string_work_cuda.sh
+#           scripts/run/cuda/run_kagome_string_work_cuda.sh
 # Key knobs (env): STRING_SITES / STRING_SIZE, K_VALUES, N_TRAJ, DECORR, M.
 
 set -euo pipefail

@@ -18,7 +18,7 @@
 # so the estimate is realistic.
 #
 # Output: timing/extrapolation report in the job log only (no data/ files).
-# Usage:  sbatch scripts/probe/probe_renyi_work_runtime.sh
+# Usage:  sbatch scripts/probe/cpu/probe_renyi_work_runtime.sh
 
 set -euo pipefail
 

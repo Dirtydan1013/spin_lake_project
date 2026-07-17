@@ -4,8 +4,8 @@
 #     source scripts/common/env.sh
 #
 # The same run script then works both ways:
-#     sbatch scripts/run/run_x.sh   # SLURM: resources from the job
-#     bash   scripts/run/run_x.sh   # bare server: env vars / autodetect
+#     sbatch scripts/run/cpu/run_x.sh   # SLURM: resources from the job
+#     bash   scripts/run/cpu/run_x.sh   # bare server: env vars / autodetect
 #
 # The launcher is mpiexec in BOTH cases (conda-forge Open MPI has no
 # SLURM/PMIx integration, hence the PMI unsets below), so behavior is

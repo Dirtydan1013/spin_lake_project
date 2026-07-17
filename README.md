@@ -60,7 +60,7 @@ event-scratch capacity。系統超過 16-bit index 範圍時會自動 fallback �
 ```bash
 cd /tmp
 PYTHONPATH=/path/to/spin_lake_project/build:/path/to/spin_lake_project \
-python /path/to/spin_lake_project/-m src.probes.qaqmc_cpu_memory \
+python -m src.probes.qaqmc_cpu_memory \
     --M 2760000 --warmup-steps 2 --timed-steps 5
 ```
 
@@ -122,12 +122,12 @@ srun --partition=gpu --nodelist=gpunode02 --gres=gpu:1 --cpus-per-task=2 \
 單 GPU production job：
 
 ```bash
-sbatch scripts/run/run_kagome_qaqmc_cuda.sh
+sbatch scripts/run/cuda/run_kagome_qaqmc_cuda.sh
 
 # 多條獨立 chain 可用 job array；給所有 task 同一個絕對 RUN_DIR，
 # SLURM_ARRAY_TASK_ID 會成為 rank/seed offset。
 RUN_DIR=$PWD/data/qaqmc_cuda_ensemble \
-  sbatch --array=0-2 scripts/run/run_kagome_qaqmc_cuda.sh
+  sbatch --array=0-2 scripts/run/cuda/run_kagome_qaqmc_cuda.sh
 ```
 
 CUDA runner 目前輸出 rank-local batched profile：density、`Z_l`、`C_m_l`、
@@ -144,21 +144,21 @@ production 腳本在 `scripts/run/`，同一份腳本在有無 SLURM 的
 
 ```bash
 # 統一入口：有 sbatch 就提交 job，沒有就 nohup 背景執行（log 寫到 logs/）
-./scripts/submit.sh scripts/run/run_kagome_sse.sh
+./scripts/submit.sh scripts/run/cpu/run_kagome_sse.sh
 
 # 額外參數會透傳給 sbatch（覆寫 #SBATCH 標頭）
-./scripts/submit.sh scripts/run/run_kagome_otf.sh --nodelist=cpunode02
+./scripts/submit.sh scripts/run/cpu/run_kagome_otf.sh --nodelist=cpunode02
 
 # 也可以照舊直接用
-sbatch scripts/run/run_kagome_otf.sh       # SLURM cluster
-bash   scripts/run/run_kagome_otf.sh       # 一般 server（前景）
+sbatch scripts/run/cpu/run_kagome_otf.sh       # SLURM cluster
+bash   scripts/run/cpu/run_kagome_otf.sh       # 一般 server（前景）
 ```
 
 所有腳本參數都用環境變數覆寫，例如：
 
 ```bash
 NX=8 NY=8 M=200000 N_TRAJ=8000 \
-    ./scripts/submit.sh scripts/run/run_kagome_renyi_work.sh
+    ./scripts/submit.sh scripts/run/cpu/run_kagome_renyi_work.sh
 ```
 
 資源與綁核（由 `scripts/common/env.sh` 統一處理）：

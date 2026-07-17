@@ -2,8 +2,8 @@
 # Launcher-agnostic submit wrapper: sbatch when SLURM exists, background bash
 # otherwise.  Run from the repo root.
 #
-#     ./scripts/submit.sh scripts/run/run_kagome_sse.sh
-#     ./scripts/submit.sh scripts/run/run_kagome_otf.sh --nodelist=cpunode02
+#     ./scripts/submit.sh scripts/run/cpu/run_kagome_sse.sh
+#     ./scripts/submit.sh scripts/run/cpu/run_kagome_otf.sh --nodelist=cpunode02
 #
 # Extra args go to sbatch (override the #SBATCH headers).  Without SLURM the
 # script runs via nohup with output in logs/<script>_<stamp>.log; tune

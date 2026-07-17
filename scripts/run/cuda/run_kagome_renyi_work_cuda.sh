@@ -21,10 +21,10 @@
 # bit-identically (RESUME=1).
 #
 # Output: data/renyi_work_cuda_..._<RUN_TAG>.h5 (+ _chunks/K{K}/rank{r}.h5).
-# Usage:  sbatch scripts/run/run_kagome_renyi_work_cuda.sh
+# Usage:  sbatch scripts/run/cuda/run_kagome_renyi_work_cuda.sh
 #         # resume, reusing the original job's tag/paths:
 #         sbatch --export=ALL,RESUME=1,RUN_TAG=<original_job_id> \
-#           scripts/run/run_kagome_renyi_work_cuda.sh
+#           scripts/run/cuda/run_kagome_renyi_work_cuda.sh
 # Key knobs (env): KP_START/KP_END/KP_M (region pair), K_VALUES, N_TRAJ,
 #         DECORR, M, NX/NY; defaults target the 6x6 KP TEE campaign.
 
@@ -56,6 +56,7 @@ DELTA_GROUPS=${DELTA_GROUPS:-600}
 KP_START=${KP_START:-A}
 KP_END=${KP_END:-AB}
 KP_M=${KP_M:-2}
+KP_CENTER=${KP_CENTER:-""}    # e.g. "C24"; empty = auto
 K_VALUES=${K_VALUES:-400}
 N_TRAJ=${N_TRAJ:-32000}
 N_THERMALIZE=${N_THERMALIZE:-4000}
@@ -96,6 +97,7 @@ mpiexec --bind-to core -n "$NTASKS" \
     --delta-min "$DELTA_MIN" --delta-max "$DELTA_MAX" \
     --epsilon 0.01 --neighbor-cutoff -1 --delta-groups "$DELTA_GROUPS" \
     --kp-start "$KP_START" --kp-end "$KP_END" --kp-m "$KP_M" \
+    ${KP_CENTER:+--kp-preferred-center "$KP_CENTER"} \
     --K-values "$K_VALUES" --n-trajectories "$N_TRAJ" \
     --n-thermalize "$N_THERMALIZE" --decorrelation-steps "$DECORR" \
     --seed "$SEED" --skip-ed \
