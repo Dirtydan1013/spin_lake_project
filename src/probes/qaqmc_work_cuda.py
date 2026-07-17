@@ -15,6 +15,8 @@ import time
 import numpy as np
 
 import qaqmc_cuda
+
+from src.probes import memreport
 # Resolve the portable qaqmc_cpp paired with qaqmc_cuda before the legacy CPU
 # facades consider prepending the repository's generic build/ directory.
 from src.engines.qaqmc_renyi_work_cuda import QAQMCRenyiWorkRydbergCUDA
@@ -147,6 +149,12 @@ def main() -> None:
     report["full_step_speedup"] = (
         report["cpu_full_step_s_median"] / report["gpu_full_step_s_median"]
     )
+    report["device_mib_peak_sampled"] = max(
+        value for key, value in report.items() if key.startswith("device_mib_"))
+    report["host_rss_mib"] = round(memreport.rss_mib(), 1)
+    report["host_peak_mib"] = round(memreport.peak_mib(), 1)
+    report["vram_total_mib"] = round(
+        qaqmc_cuda.device_info()[args.device]["total_memory"] / 2**20, 1)
     print(json.dumps(report, indent=2), flush=True)
 
 

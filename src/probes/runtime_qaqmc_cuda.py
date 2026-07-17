@@ -14,6 +14,8 @@ import numpy as np
 
 import qaqmc_cpp
 import qaqmc_cuda
+
+from src.probes import memreport
 from src.engines.qaqmc_cuda import CudaDiagonalBackend
 from src.rydberg.lattices import (
     generate_kagome_bond_lattice,
@@ -145,6 +147,12 @@ def main() -> None:
         )
         print(f"full_mc_speedup_vs_single_cpu_core={cpu_full_s/gpu_full_s:.3f}x",
               flush=True)
+
+        info = qaqmc_cuda.device_info()[args.device]
+        print(f"memory: host RSS {memreport.rss_mib():.0f} MiB "
+              f"(peak {memreport.peak_mib():.0f}); device resident "
+              f"{gpu.device_bytes / 2**20:.1f} MiB of "
+              f"{info['total_memory'] / 2**20:.0f} MiB VRAM", flush=True)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ import time
 
 import numpy as np
 
+from src.probes import memreport
+
 try:
     from mpi4py import MPI
 except ImportError as exc:
@@ -105,6 +107,9 @@ def main():
     ap.add_argument("--target-decorrelation-steps", type=int, default=1000)
     ap.add_argument("--target-n-regions", type=int, default=1,
                     help="if running KP-all (7 regions), set 7 so the estimate scales")
+    ap.add_argument("--target-ranks", type=int, default=None,
+                    help="production rank count for the node-memory estimate")
+    ap.add_argument("--node-mem-gb", type=float, default=240.0)
 
     args = ap.parse_args()
 
@@ -219,6 +224,15 @@ def main():
     t_per_traj = t_traj_block / n_traj
     avg_per_traj = comm.allreduce(t_per_traj, op=MPI.SUM) / n_ranks
     max_per_traj = comm.reduce(t_per_traj, op=MPI.MAX, root=0)
+
+    m_total = 2 * int(args.M)
+    memreport.report(
+        "probe-WORK", comm,
+        engine_core_mib=memreport.renyi_work_core_mib(m_total),
+        core_label=f"engine core (analytic, two replicas, M_total={m_total})",
+        notes=(f"warm-start config export transient ≈ +{2 * m_total * 8 / 2**20:.0f} MiB/rank "
+               "(int32 copies of both replica op strings)",),
+        target_ranks=args.target_ranks, node_mem_gb=args.node_mem_gb)
 
     if rank != 0:
         return
