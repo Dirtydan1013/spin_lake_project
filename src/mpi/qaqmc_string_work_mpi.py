@@ -49,6 +49,9 @@ from src.mpi.chunk_io import (
     compact_operator_checkpoint,
     load_checkpointed_rank_chunks,
 )
+from src.mpi.driver_util import (rank_seed as _rank_seed,
+                                 cuda_device_for_rank as _cuda_device_for_rank,
+                                 permutation_checkpoint as _permutation_checkpoint)
 from src.mpi.equil_progress import run_equil_with_progress
 from src.mpi.site_permutation import (permute_rows, resolve_site_permutation,
                                       to_engine)
@@ -78,13 +81,6 @@ def _engine_type_and_schedule_for_backend(backend: str):
 
 
 _STRING_CHUNK_DATASETS = ("log_j_samples",)
-
-
-def _permutation_checkpoint(site_perm, n_sites: int) -> np.ndarray:
-    return np.asarray(
-        np.arange(n_sites, dtype=np.int32) if site_perm is None else site_perm,
-        dtype=np.int32,
-    )
 
 
 def _string_cuda_checkpoint(eng, site_perm, n_sites: int) -> tuple[dict, dict]:
@@ -129,28 +125,6 @@ def _restore_string_cuda_checkpoint(eng, checkpoint: dict, site_perm,
     eng._eng.topology_id = int(attrs["topology_id"])
 
 
-def _cuda_device_for_rank(comm) -> int:
-    """Map a node-local MPI rank to a visible CUDA device.
-
-    Slurm ``--gpus-per-task=1`` exposes one device per process, in which case
-    its local index is always zero.  Plain ``mpiexec`` commonly exposes every
-    allocated device, so use the shared-memory communicator rank there.
-    """
-    import qaqmc_cuda
-
-    visible = len(qaqmc_cuda.device_info())
-    if visible <= 0:
-        raise RuntimeError("CUDA backend selected but no GPU is visible")
-    local = comm.Split_type(MPI.COMM_TYPE_SHARED)
-    try:
-        local_rank = local.Get_rank()
-    finally:
-        local.Free()
-    return 0 if visible == 1 else int(local_rank % visible)
-
-
-def _rank_seed(seed: int, rank: int) -> int:
-    return int(seed) + 9973 * int(rank)
 
 
 def _aggregate_log_j(log_j: np.ndarray, direction: str) -> dict:

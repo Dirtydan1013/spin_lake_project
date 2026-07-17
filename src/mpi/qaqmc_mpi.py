@@ -10,6 +10,7 @@ Requires: mpi4py, h5py, numpy
 """
 
 import numpy as np
+from types import SimpleNamespace
 import h5py
 import time
 import datetime
@@ -34,6 +35,7 @@ from src.engines.qaqmc import (
     _write_qaqmc_delta_schedule,
 )
 from src.mpi.equil_progress import run_equil_with_progress
+from src.mpi.driver_util import rank_seed as _rank_seed
 from src.rydberg.lattices import (kagome_loop_string_translations,
                           kagome_multi_size_translations, kagome_bulk_sites,
                           kagome_vertex_sites)
@@ -438,7 +440,7 @@ def run_mpi(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
               f"({my_n_samples} per rank ± 1), measure_every={measure_every}")
 
     # Each rank gets a different seed
-    rank_seed = seed + rank * 9973  # large prime to avoid correlation
+    rank_seed = _rank_seed(seed, rank)
 
     # Create the engine
     engine = QAQMC_Rydberg(
@@ -638,7 +640,7 @@ def run_mpi_onthefly(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
         print(f"[MPI-OTF] actual samples: density={n_d}, Z_l={n_z}, C_m_l={n_c}")
 
     # Each rank gets a different seed
-    rank_seed = seed + rank * 9973
+    rank_seed = _rank_seed(seed, rank)
 
     # Create the engine
     engine = QAQMC_Rydberg(
@@ -887,68 +889,20 @@ def _write_result_h5(path, arrays, attrs=None, qaqmc_schedule=None):
     os.replace(tmp, path)
 
 
-def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
-                    pos=None, epsilon=0.01, seed=42, n_equil=0, n_samples=1000,
-                    measure_every=1, profile_step=10000, batch_size=1000,
-                    checkpoint=0, checkpoint_every_batches=0,
-                    filepath='data/qaqmc_profile.h5',
-                    neighbor_cutoff=None,
-                    loop_sizes=None, string_sizes=None,
-                    delta_groups=600, omp_threads=0, nx=6, ny=6,
-                    bond_event_storage='packed64',
-                    sf_q_points=None, sf_delta_points=None,
-                    snapshot_deltas=None, n_snapshots=0, snapshot_sweep='forward',
-                    occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
-                    occ_sf_sweep='forward',
-                    lattice='kagome_bond', boundary='open', box_vectors=None,
-                    config_in=None, config_out=None,
-                    equil_progress_every=500,
-                    permute_site_labels=True,
-                    verbose=True):
-    """
-    MPI-parallel QAQMC asymmetric profile measurement.
 
-    Each rank runs an independent chain. For each sample, the full operator
-    string is traversed and observables (density, Z_l, C_m_l) are recorded
-    every `profile_step` imaginary-time slices, giving the asymmetric profile
-    as a function of the annealing parameter delta(p).
-
-    Parameters
-    ----------
-    measure_every : int or dict
-        int:  all observables use the same interval.
-        dict: {'density': 300, 'Z_l': 20, 'C_m_l': 70} — per-observable intervals.
-        n_samples refers to the finest (smallest) interval.
-    profile_step : int
-        Sample one point along the path every this many slices (default 10000).
-        n_points = M_total / profile_step.
-    """
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    n_ranks = comm.Get_size()
-
-    # Parse per-observable measure_every
-    me_density, me_zl, me_cml = _parse_measure_every(measure_every)
-    min_me = min(me_density, me_zl, me_cml)
-
-    base = n_samples // n_ranks
-    rem  = n_samples % n_ranks
-    my_n_samples = base + (1 if rank < rem else 0)   # finest samples for this rank
-
-    if verbose and rank == 0:
-        n_d = (n_samples * min_me) // me_density
-        n_z = (n_samples * min_me) // me_zl
-        n_c = (n_samples * min_me) // me_cml
-        print(f"[MPI-PROF] {n_ranks} ranks, n_samples(finest)={n_samples}, "
-              f"me={{density:{me_density}, Z_l:{me_zl}, C_m_l:{me_cml}}}, "
-              f"profile_step={profile_step}")
-        print(f"[MPI-PROF] actual samples: density={n_d}, Z_l={n_z}, C_m_l={n_c}")
-
-    rank_seed = seed + rank * 9973
-
-    if verbose and rank == 0:
-        print(f"[MPI-PROF] spatial boundary: {boundary}")
-
+def _profile_setup(*, comm, rank, n_ranks, rank_seed, N, M, Omega, Rb,
+                   delta_min, delta_max, pos, epsilon, n_equil,
+                   neighbor_cutoff, loop_sizes, string_sizes, delta_groups,
+                   omp_threads, nx, ny, bond_event_storage, sf_q_points,
+                   snapshot_deltas, n_snapshots, snapshot_sweep,
+                   occ_sf_delta_points, occ_sf_grid_n, occ_sf_nbatch,
+                   occ_sf_sweep, lattice, boundary, box_vectors, config_in,
+                   config_out, permute_site_labels, profile_step, filepath,
+                   verbose):
+    """Permutation + warm start + engine construction + every observable
+    registration (loops/strings/A_v, VBS/SS, dimer SF, snapshots, occ-SF)
+    plus the rank-0 banner.  Returns the profile context consumed by the
+    sampling stages.  Body moved verbatim from run_mpi_profile."""
     # ── Per-rank site-label permutation (scan-order decorrelation) ──────────
     # The updates visit sites in label order, and that shared fixed order was
     # shown to deterministically select the ordered-phase domain pattern:
@@ -1178,27 +1132,38 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                   f"{n_occ_pts} δ-points (δ≈{np.round(prof_delta[occ_pt_indices],3).tolist()}), "
                   f"{occ_sf_nbatch} super-bins/rank, bulk cells={n_bulk_cells}/{n_cells_total}")
 
-    # Equilibration
-    comm.Barrier()
+    return SimpleNamespace(
+        cfg=cfg, site_perm=site_perm, inv_perm=inv_perm, engine=engine,
+        n_equil=n_equil, unpermute_res=_unpermute_res,
+        save_final_config=_save_final_config,
+        bulk=bulk, loop_sets=loop_sets, string_sets=string_sets,
+        loop_meta=loop_meta, string_meta=string_meta, n_vertex=n_vertex,
+        do_vbs=do_vbs, vbs_tri=vbs_tri, n_q=n_q, sf_q_points=sf_q_points,
+        prof_p_idx=prof_p_idx, prof_delta=prof_delta,
+        snap_pt_indices=snap_pt_indices, n_snap_pts=n_snap_pts,
+        occ_pt_indices=occ_pt_indices, n_occ_pts=n_occ_pts, do_occ=do_occ,
+        occ_q_points=occ_q_points, occ_q_frac=occ_q_frac,
+        occ_cell_R=occ_cell_R, occ_basis=occ_basis, occ_in_bulk=occ_in_bulk,
+        occ2_cell_R=occ2_cell_R, occ2_basis=occ2_basis,
+    )
 
-    def _advance_equil(n):
-        try:
-            engine._cpp_engine.run(n, 0)
-        except TypeError:
-            for _ in range(n):
-                engine._cpp_engine.mc_step()
 
-    t_equil = run_equil_with_progress(
-        _advance_equil, n_equil, label="MPI-PROF", rank=rank,
-        print_every=equil_progress_every, verbose=verbose)
-    comm.Barrier()
-    if verbose and rank == 0:
-        max_eq = comm.reduce(t_equil, op=MPI.MAX, root=0)
-        print(f"[MPI-PROF] Equilibration done in {max_eq:.1f}s (slowest rank)")
-    else:
-        comm.reduce(t_equil, op=MPI.MAX, root=0)
-
-    # Sampling
+def _profile_run_chunked(S, *, comm, rank, n_ranks, my_n_samples, checkpoint,
+                         checkpoint_every_batches, batch_size, filepath,
+                         N, M, Omega, Rb, delta_min, delta_max, epsilon, seed,
+                         n_samples, profile_step, nx, ny, lattice, boundary,
+                         me_density, me_zl, me_cml, n_snapshots, occ_sf_nbatch,
+                         pos, verbose):
+    """Merged bin==chunk checkpoint sampling (writes <run_dir>/rank{r}.h5 +
+    meta.h5 + configs/).  Returns run_dir.  Body moved verbatim."""
+    engine = S.engine
+    _unpermute_res = S.unpermute_res
+    _save_final_config = S.save_final_config
+    site_perm = S.site_perm
+    n_snap_pts, do_occ = S.n_snap_pts, S.do_occ
+    prof_p_idx = S.prof_p_idx
+    snap_pt_indices, occ_pt_indices = S.snap_pt_indices, S.occ_pt_indices
+    occ_basis, occ_cell_R, occ_q_points = S.occ_basis, S.occ_cell_R, S.occ_q_points
     t0 = time.perf_counter()
 
     # ── Merged bin==chunk checkpointing ──────────────────────────────────────
@@ -1299,6 +1264,29 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             comm.reduce(t_sample, op=MPI.MAX, root=0)
         return run_dir
 
+def _profile_run_gather(S, *, comm, rank, n_ranks, my_n_samples, base, rem,
+                        min_me, me_density, me_zl, me_cml, batch_size,
+                        filepath, N, M, Omega, Rb, delta_min, delta_max,
+                        epsilon, seed, n_samples, profile_step, nx, ny,
+                        bond_event_storage, neighbor_cutoff, pos,
+                        sf_delta_points, n_snapshots, occ_sf_grid_n,
+                        occ_sf_nbatch, verbose, t0):
+    """Legacy single-call path: one run_profile per rank, point-to-point
+    gather to rank 0, final HDF5 write.  Body moved verbatim."""
+    engine = S.engine
+    _unpermute_res = S.unpermute_res
+    site_perm = S.site_perm
+    n_equil = S.n_equil
+    loop_sets, string_sets = S.loop_sets, S.string_sets
+    loop_meta, string_meta = S.loop_meta, S.string_meta
+    n_vertex, do_vbs, vbs_tri = S.n_vertex, S.do_vbs, S.vbs_tri
+    n_q, sf_q_points = S.n_q, S.sf_q_points
+    prof_p_idx, prof_delta = S.prof_p_idx, S.prof_delta
+    snap_pt_indices, n_snap_pts = S.snap_pt_indices, S.n_snap_pts
+    do_occ, occ_pt_indices = S.do_occ, S.occ_pt_indices
+    occ_q_points, occ_q_frac = S.occ_q_points, S.occ_q_frac
+    occ_cell_R, occ_basis, occ_in_bulk = S.occ_cell_R, S.occ_basis, S.occ_in_bulk
+    occ2_cell_R, occ2_basis = S.occ2_cell_R, S.occ2_basis
     # ── Legacy single-call path (checkpointing disabled) ─────────────────────
     sa_cb = None
     sa_bar = None
@@ -1617,7 +1605,7 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
                 # Optional δ-subsetting: keep only the profile points nearest to
                 # the user-specified δ values; otherwise save SF at every profile
                 # point (same δ grid as density/Z/C).
-                delta_at_pts = delta_sched[p_indices]
+                delta_at_pts = prof_delta  # aligned with p_indices (full-schedule array was removed)
                 if sf_delta_points is not None and len(sf_delta_points) > 0:
                     req = np.asarray(sf_delta_points, dtype=np.float64)
                     pick = np.array([int(np.argmin(np.abs(delta_at_pts - d))) for d in req])
@@ -1732,9 +1720,143 @@ def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
             comm.Send(np.ascontiguousarray(my_sf_a3), dest=0, tag=820 + rank)
             comm.Send(np.ascontiguousarray(my_sf_a4), dest=0, tag=850 + rank)
 
+
+def run_mpi_profile(*, N, M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.0,
+                    pos=None, epsilon=0.01, seed=42, n_equil=0, n_samples=1000,
+                    measure_every=1, profile_step=10000, batch_size=1000,
+                    checkpoint=0, checkpoint_every_batches=0,
+                    filepath='data/qaqmc_profile.h5',
+                    neighbor_cutoff=None,
+                    loop_sizes=None, string_sizes=None,
+                    delta_groups=600, omp_threads=0, nx=6, ny=6,
+                    bond_event_storage='packed64',
+                    sf_q_points=None, sf_delta_points=None,
+                    snapshot_deltas=None, n_snapshots=0, snapshot_sweep='forward',
+                    occ_sf_delta_points=None, occ_sf_grid_n=0, occ_sf_nbatch=4,
+                    occ_sf_sweep='forward',
+                    lattice='kagome_bond', boundary='open', box_vectors=None,
+                    config_in=None, config_out=None,
+                    equil_progress_every=500,
+                    permute_site_labels=True,
+                    verbose=True):
+    """
+    MPI-parallel QAQMC asymmetric profile measurement.
+
+    Each rank runs an independent chain. For each sample, the full operator
+    string is traversed and observables (density, Z_l, C_m_l) are recorded
+    every `profile_step` imaginary-time slices, giving the asymmetric profile
+    as a function of the annealing parameter delta(p).
+
+    Parameters
+    ----------
+    measure_every : int or dict
+        int:  all observables use the same interval.
+        dict: {'density': 300, 'Z_l': 20, 'C_m_l': 70} — per-observable intervals.
+        n_samples refers to the finest (smallest) interval.
+    profile_step : int
+        Sample one point along the path every this many slices (default 10000).
+        n_points = M_total / profile_step.
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    n_ranks = comm.Get_size()
+
+    # Parse per-observable measure_every
+    me_density, me_zl, me_cml = _parse_measure_every(measure_every)
+    min_me = min(me_density, me_zl, me_cml)
+
+    base = n_samples // n_ranks
+    rem  = n_samples % n_ranks
+    my_n_samples = base + (1 if rank < rem else 0)   # finest samples for this rank
+
+    if verbose and rank == 0:
+        n_d = (n_samples * min_me) // me_density
+        n_z = (n_samples * min_me) // me_zl
+        n_c = (n_samples * min_me) // me_cml
+        print(f"[MPI-PROF] {n_ranks} ranks, n_samples(finest)={n_samples}, "
+              f"me={{density:{me_density}, Z_l:{me_zl}, C_m_l:{me_cml}}}, "
+              f"profile_step={profile_step}")
+        print(f"[MPI-PROF] actual samples: density={n_d}, Z_l={n_z}, C_m_l={n_c}")
+
+    rank_seed = _rank_seed(seed, rank)
+
+    if verbose and rank == 0:
+        print(f"[MPI-PROF] spatial boundary: {boundary}")
+
+    S = _profile_setup(
+        comm=comm, rank=rank, n_ranks=n_ranks, rank_seed=rank_seed,
+        N=N, M=M, Omega=Omega, Rb=Rb, delta_min=delta_min, delta_max=delta_max,
+        pos=pos, epsilon=epsilon, n_equil=n_equil,
+        neighbor_cutoff=neighbor_cutoff, loop_sizes=loop_sizes,
+        string_sizes=string_sizes, delta_groups=delta_groups,
+        omp_threads=omp_threads, nx=nx, ny=ny,
+        bond_event_storage=bond_event_storage, sf_q_points=sf_q_points,
+        snapshot_deltas=snapshot_deltas, n_snapshots=n_snapshots,
+        snapshot_sweep=snapshot_sweep, occ_sf_delta_points=occ_sf_delta_points,
+        occ_sf_grid_n=occ_sf_grid_n, occ_sf_nbatch=occ_sf_nbatch,
+        occ_sf_sweep=occ_sf_sweep, lattice=lattice, boundary=boundary,
+        box_vectors=box_vectors, config_in=config_in, config_out=config_out,
+        permute_site_labels=permute_site_labels, profile_step=profile_step,
+        filepath=filepath, verbose=verbose)
+    engine = S.engine
+    n_equil = S.n_equil          # warm start forces 0
+    _save_final_config = S.save_final_config
+
+    # Equilibration
+    comm.Barrier()
+
+    def _advance_equil(n):
+        try:
+            engine._cpp_engine.run(n, 0)
+        except TypeError:
+            for _ in range(n):
+                engine._cpp_engine.mc_step()
+
+    t_equil = run_equil_with_progress(
+        _advance_equil, n_equil, label="MPI-PROF", rank=rank,
+        print_every=equil_progress_every, verbose=verbose)
+    comm.Barrier()
+    if verbose and rank == 0:
+        max_eq = comm.reduce(t_equil, op=MPI.MAX, root=0)
+        print(f"[MPI-PROF] Equilibration done in {max_eq:.1f}s (slowest rank)")
+    else:
+        comm.reduce(t_equil, op=MPI.MAX, root=0)
+
+    # Sampling
+    t0 = time.perf_counter()
+
+    use_checkpoint = (checkpoint and checkpoint > 0) or \
+                     (checkpoint_every_batches and checkpoint_every_batches > 0)
+    if use_checkpoint:
+        return _profile_run_chunked(
+            S, comm=comm, rank=rank, n_ranks=n_ranks,
+            my_n_samples=my_n_samples, checkpoint=checkpoint,
+            checkpoint_every_batches=checkpoint_every_batches,
+            batch_size=batch_size, filepath=filepath, N=N, M=M, Omega=Omega,
+            Rb=Rb, delta_min=delta_min, delta_max=delta_max, epsilon=epsilon,
+            seed=seed, n_samples=n_samples, profile_step=profile_step,
+            nx=nx, ny=ny, lattice=lattice, boundary=boundary,
+            me_density=me_density, me_zl=me_zl, me_cml=me_cml,
+            n_snapshots=n_snapshots, occ_sf_nbatch=occ_sf_nbatch, pos=pos,
+            verbose=verbose)
+
+    _profile_run_gather(
+        S, comm=comm, rank=rank, n_ranks=n_ranks, my_n_samples=my_n_samples,
+        base=base, rem=rem, min_me=min_me, me_density=me_density, me_zl=me_zl,
+        me_cml=me_cml, batch_size=batch_size, filepath=filepath, N=N, M=M,
+        Omega=Omega, Rb=Rb, delta_min=delta_min, delta_max=delta_max,
+        epsilon=epsilon, seed=seed, n_samples=n_samples,
+        profile_step=profile_step, nx=nx, ny=ny,
+        bond_event_storage=bond_event_storage, neighbor_cutoff=neighbor_cutoff,
+        pos=pos, sf_delta_points=sf_delta_points, n_snapshots=n_snapshots,
+        occ_sf_grid_n=occ_sf_grid_n, occ_sf_nbatch=occ_sf_nbatch,
+        verbose=verbose, t0=t0)
+
     _save_final_config()
     comm.Barrier()
     return filepath
+
+
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from src.engines.qaqmc import QAQMC_Rydberg
+from src.mpi.driver_util import RANK_SEED_STRIDE
 
 
 class QAQMCSharedModelBatch:
@@ -22,7 +23,7 @@ class QAQMCSharedModelBatch:
         *,
         batch_size: int,
         seed: int = 42,
-        seed_stride: int = 9973,
+        seed_stride: int = RANK_SEED_STRIDE,
         **engine_kwargs: Any,
     ) -> None:
         batch_size = int(batch_size)

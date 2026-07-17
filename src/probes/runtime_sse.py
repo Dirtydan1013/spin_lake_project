@@ -22,6 +22,7 @@ import numpy as np
 from mpi4py import MPI
 
 from src.engines.sse import SSE_Rydberg
+from src.probes import memreport
 
 
 def _make_pos(lattice, N, nx, ny, a):
@@ -59,6 +60,11 @@ def main():
     p.add_argument("--target-equil", type=int, default=20000)
     p.add_argument("--target-samples", type=int, default=2000000,
                    help="total samples across ranks")
+    p.add_argument("--target-ranks", type=int, default=None,
+                   help="production rank count for the node-memory estimate "
+                        "(default: $TARGET_RANKS/$SLURM_NTASKS/$NTASKS, else probe ranks)")
+    p.add_argument("--node-mem-gb", type=float, default=240.0,
+                   help="node memory budget for the fit verdict")
     args = p.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -107,6 +113,15 @@ def main():
               f"samples/rank={per_rank} = {total_steps} steps")
         print(f"[probe-SSE] ESTIMATED wall time (slowest rank): "
               f"{est:.0f}s = {est / 3600:.2f}h")
+
+    core = memreport.sse_engine_core_mib(cpp)
+    memreport.report(
+        "probe-SSE", comm,
+        engine_core_mib=core,
+        core_label=f"engine core (analytic, M={int(cpp.M)}, n_ops={int(cpp.n_ops)})",
+        notes=(f"adjust_M realloc transient ≤ +{int(cpp.M) * 8 / 2**20:.0f} MiB/rank "
+               "(old+new op arrays coexist briefly)",),
+        target_ranks=args.target_ranks, node_mem_gb=args.node_mem_gb)
 
 
 if __name__ == "__main__":

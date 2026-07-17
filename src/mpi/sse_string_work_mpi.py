@@ -43,6 +43,7 @@ if _REPO_ROOT not in sys.path:
 from src.engines.sse_string_work import SSEStringWorkRydberg, cosine_schedule
 from src.mpi.chunk_io import RankChunkWriter, check_config_compat, load_warm_config
 from src.mpi.equil_progress import run_equil_with_progress
+from src.mpi.driver_util import rank_seed as _rank_seed
 from src.mpi.qaqmc_string_work_mpi import _aggregate_log_j, _parse_int_list
 from src.mpi.site_permutation import (permute_rows, resolve_site_permutation,
                                       to_engine)
@@ -52,8 +53,6 @@ from src.rydberg.lattices import (
 )
 
 
-def _rank_seed(seed: int, rank: int) -> int:
-    return int(seed) + 9973 * int(rank)
 
 
 def run_sse_string_work_mpi(*, N: int, beta: float, Omega: float, Rb: float,

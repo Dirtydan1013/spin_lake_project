@@ -24,6 +24,8 @@ import time
 import numpy as np
 from mpi4py import MPI
 
+from src.probes import memreport
+
 # Support both repo layouts:
 #   - nested (feature branches): src.rydberg.lattices, src.engines.qaqmc
 #   - flat   (main):              src.lattices,         src.qaqmc
@@ -70,6 +72,9 @@ def main():
     parser.add_argument("--measure-every", type=int, default=1)
     parser.add_argument("--target-equil", type=int, default=0, help="full-run n_equil for estimate")
     parser.add_argument("--target-samples", type=int, default=30000, help="full-run total n_samples")
+    parser.add_argument("--target-ranks", type=int, default=None,
+                        help="production rank count for the node-memory estimate")
+    parser.add_argument("--node-mem-gb", type=float, default=240.0)
     args = parser.parse_args()
 
     if args.omp_threads > 0:
@@ -212,6 +217,19 @@ def main():
         print()
         print("  (on-the-fly mode: no write benchmark needed — output is 3 × n_samples float64)")
         print("=" * 86)
+
+    core = memreport.qaqmc_engine_core_mib(engine._cpp_engine)
+    m_total = 2 * int(args.M)
+    memreport.report(
+        "probe-OTF", comm,
+        engine_core_mib=core,
+        core_label=f"engine core (exact capacity, M_total={m_total})",
+        notes=(
+            f"warm-start config export transient ≈ +{m_total * 8 / 2**20:.0f} MiB/rank (int32 copies)",
+            "production rank-0 additionally gathers occ-SF/profile batch arrays at the end "
+            "— rank-0 peak exceeds the per-rank figure above",
+        ),
+        target_ranks=args.target_ranks, node_mem_gb=args.node_mem_gb)
 
 
 if __name__ == "__main__":

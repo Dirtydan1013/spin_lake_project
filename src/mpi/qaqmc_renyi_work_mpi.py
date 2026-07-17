@@ -39,6 +39,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from src.mpi.equil_progress import run_equil_with_progress
+from src.mpi.driver_util import (rank_seed as _rank_seed,
+                                 cuda_device_for_rank as _cuda_device_for_rank,
+                                 permutation_checkpoint as _permutation_checkpoint)
 from src.mpi.chunk_io import (
     RankChunkWriter,
     array_fingerprint,
@@ -77,13 +80,6 @@ _RENYI_CHUNK_DATASETS = (
     "topology_attempts_per_traj",
     "topology_accepts_per_traj",
 )
-
-
-def _permutation_checkpoint(site_perm, n_sites: int) -> np.ndarray:
-    return np.asarray(
-        np.arange(n_sites, dtype=np.int32) if site_perm is None else site_perm,
-        dtype=np.int32,
-    )
 
 
 def _renyi_cuda_checkpoint(eng, site_perm, n_sites: int) -> tuple[dict, dict]:
@@ -129,21 +125,6 @@ def _stable_region_seed(seed: int, region_name: str) -> int:
     """Process-independent replacement for Python's randomized ``hash``."""
     tag = zlib.crc32(str(region_name).encode("utf-8")) & 0xFFFF
     return int(seed) + 7919 * int(tag)
-
-
-def _cuda_device_for_rank(comm) -> int:
-    """Choose one visible GPU per node-local MPI rank."""
-    import qaqmc_cuda
-
-    visible = len(qaqmc_cuda.device_info())
-    if visible <= 0:
-        raise RuntimeError("CUDA backend selected but no GPU is visible")
-    local = comm.Split_type(MPI.COMM_TYPE_SHARED)
-    try:
-        local_rank = local.Get_rank()
-    finally:
-        local.Free()
-    return 0 if visible == 1 else int(local_rank % visible)
 
 
 def _parse_mask(s: str, N: int) -> np.ndarray:
@@ -234,7 +215,7 @@ def run_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
     base = n_trajectories // n_ranks
     rem  = n_trajectories %  n_ranks
     my_n = base + (1 if rank < rem else 0)
-    rank_seed = int(seed) + 9973 * int(rank)
+    rank_seed = _rank_seed(seed, rank)
 
     if rank == 0 and verbose:
         print(f"[MPI-WORK] backend={backend}, N={N}, M={M}, ranks={n_ranks}, total_trajectories={n_trajectories}, "
