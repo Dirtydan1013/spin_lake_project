@@ -14,11 +14,18 @@
 # 128 logical CPUs (64 cores × 2 hyperthreads), so two 64-task jobs stack on
 # hyperthread pairs (each ~60-70% speed, but higher combined throughput).
 #
-# Site scheduler overrides: the #SBATCH partition/nodelist headers baked into
-# the run scripts are THIS cluster's defaults.  On another cluster set
-# SBATCH_PARTITION / SBATCH_NODELIST (env or scripts/common/site.conf) and
-# this wrapper injects them as sbatch args, which override the headers —
-# no per-script editing.  Explicit CLI args here still win over both.
+# Site scheduler overrides: the #SBATCH partition/nodelist/nodes headers baked
+# into the run scripts are THIS cluster's single-node defaults.  Set
+# SBATCH_PARTITION / SBATCH_NODELIST / SBATCH_NODES / SBATCH_NTASKS_PER_NODE
+# (env or scripts/common/site.conf) and this wrapper injects them as sbatch
+# args, which override the headers — no per-script editing.  Explicit CLI args
+# here still win over both.  Multi-node example (uniform 32 ranks/node; the
+# baked-in --nodelist pin can only be REPLACED, not cleared, so name the node
+# set explicitly):
+#     SBATCH_NODES=2 SBATCH_NTASKS_PER_NODE=32 SBATCH_NODELIST=cpunode[02-03] \
+#         ./scripts/submit.sh scripts/run/cpu/run_kagome_otf.sh
+# (uneven per-node counts: SLURM can't express them here — allocate the nodes
+# and pass HOSTS="nodeA:32,nodeB:16" so mpiexec places ranks, see env.sh)
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -38,6 +45,8 @@ if command -v sbatch >/dev/null 2>&1; then
     SB_ARGS=()
     [ -n "${SBATCH_PARTITION:-}" ] && SB_ARGS+=(--partition "$SBATCH_PARTITION")
     [ -n "${SBATCH_NODELIST:-}" ]  && SB_ARGS+=(--nodelist "$SBATCH_NODELIST")
+    [ -n "${SBATCH_NODES:-}" ]     && SB_ARGS+=(--nodes "$SBATCH_NODES")
+    [ -n "${SBATCH_NTASKS_PER_NODE:-}" ] && SB_ARGS+=(--ntasks-per-node "$SBATCH_NTASKS_PER_NODE")
     [ "${EXCLUSIVE:-0}" = "1" ]    && SB_ARGS+=(--exclusive)
     # user CLI args come last: for repeated flags, sbatch takes the last one
     sbatch "${SB_ARGS[@]}" "$@" "$script"

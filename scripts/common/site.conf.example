@@ -16,10 +16,18 @@
 #NTASKS=${NTASKS:-8}
 
 # Scheduler targets for THIS site (used by submit.sh; they override the
-# #SBATCH partition/nodelist headers baked into the run scripts, which are
-# the original cluster's defaults).  Leave unset to use the headers as-is.
+# #SBATCH partition/nodelist/nodes headers baked into the run scripts, which
+# are the original cluster's single-node defaults).  Leave unset to use the
+# headers as-is.
 #SBATCH_PARTITION=${SBATCH_PARTITION:-cpu}
 #SBATCH_NODELIST=${SBATCH_NODELIST:-cpunode02}
+# Multi-node (uniform ranks/node; nodelist must name the whole node set):
+#SBATCH_NODES=${SBATCH_NODES:-2}
+#SBATCH_NTASKS_PER_NODE=${SBATCH_NTASKS_PER_NODE:-32}
+#SBATCH_NODELIST=${SBATCH_NODELIST:-cpunode[02-03]}
+
+# Uneven per-node rank counts (mpiexec-level placement, see env.sh):
+#HOSTS=${HOSTS:-cpunode02:32,cpunode03:16}   # remember NTASKS = the total
 
 # Core binding (Open MPI / hwloc syntax — vendor-neutral).
 # AMD EPYC (many small NUMA domains): map by NUMA node instead of slot:
