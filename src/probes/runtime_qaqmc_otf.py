@@ -24,7 +24,7 @@ import time
 import numpy as np
 from mpi4py import MPI
 
-from src.probes import memreport
+from src.probes import costreport, memreport
 
 # Support both repo layouts:
 #   - nested (feature branches): src.rydberg.lattices, src.engines.qaqmc
@@ -214,6 +214,7 @@ def main():
         print(f"  est equil  : {_fmt_sec(est_equil)}")
         print(f"  est sample : {_fmt_sec(est_sample)}")
         print(f"  est total  : {_fmt_sec(est_total)}")
+        costreport.report(est_total, n_ranks, args.omp_threads)
         print()
         print("  (on-the-fly mode: no write benchmark needed — output is 3 × n_samples float64)")
         print("=" * 86)

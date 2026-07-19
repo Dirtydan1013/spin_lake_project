@@ -30,7 +30,7 @@ import time
 
 import numpy as np
 
-from src.probes import memreport
+from src.probes import costreport, memreport
 
 try:
     from mpi4py import MPI
@@ -297,6 +297,8 @@ def main():
         print(f"  × {args.target_n_regions} regions                                       : {_fmt(args.target_n_regions * est_per_region)}")
     print("-" * 92)
     print(f"OVERALL ESTIMATE (max rank, single job)              : {_fmt(est_total)}")
+    costreport.report(est_total, n_ranks,
+                      int(os.environ.get("OMP_NUM_THREADS", "1")))
     print("=" * 92)
 
 
