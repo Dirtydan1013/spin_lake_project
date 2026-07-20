@@ -14,7 +14,8 @@
 // passes.
 
 void QAQMCOffDiagonalCore::set_string_sites(const QAQMCEngine& eng,
-                                            const std::vector<int>& sites, int m_star) {
+                                            const std::vector<int>& sites,
+                                            std::int64_t m_star) {
     if (m_star < 0 || m_star >= eng.M_total_) {
         throw std::invalid_argument("m_star must satisfy 0 <= m_star < M_total");
     }
@@ -40,8 +41,8 @@ void QAQMCOffDiagonalCore::set_seam_mask_consistent(QAQMCEngine& eng, uint64_t m
     for (size_t k = 0; k < string_sites_.size(); ++k) {
         const int site = string_sites_[k];
         int parity = 0;
-        int first_pm = -1, first_steal = -1;
-        for (int p = 0; p < eng.M_total_; ++p) {
+        std::int64_t first_pm = -1, first_steal = -1;
+        for (qaqmc_slot_t p = 0; p < eng.M_total_; ++p) {
             const int ot = eng.op_types_[p];
             if (ot == -1 && eng.op_site_at(p) == site) parity ^= 1;
             if (first_pm < 0 && (ot == 1 || ot == -1) && eng.op_site_at(p) == site)
@@ -72,7 +73,7 @@ void QAQMCOffDiagonalCore::set_seam_mask_consistent(QAQMCEngine& eng, uint64_t m
 void QAQMCOffDiagonalCore::recompute_seam_snapshots(const QAQMCEngine& eng) {
     if (m_star_ < 0) return;
     std::vector<int32_t> state(eng.N_, 0);
-    for (int p = 0; p < m_star_; ++p) {
+    for (qaqmc_slot_t p = 0; p < m_star_; ++p) {
         if (eng.op_types_[p] == -1) state[eng.op_site_at(p)] ^= 1;
     }
     state_at_seam_minus_ = state;
@@ -82,7 +83,7 @@ void QAQMCOffDiagonalCore::recompute_seam_snapshots(const QAQMCEngine& eng) {
     state_at_seam_plus_ = state;
 }
 
-void QAQMCOffDiagonalCore::on_diagonal_slice(int p, std::vector<int32_t>& state) {
+void QAQMCOffDiagonalCore::on_diagonal_slice(std::int64_t p, std::vector<int32_t>& state) {
     if (p != m_star_) return;
     state_at_seam_minus_ = state;
     for (size_t k = 0; k < string_sites_.size(); ++k) {
@@ -91,7 +92,7 @@ void QAQMCOffDiagonalCore::on_diagonal_slice(int p, std::vector<int32_t>& state)
     state_at_seam_plus_ = state;
 }
 
-void QAQMCOffDiagonalCore::on_cluster_slice(int p, std::vector<int32_t>& spin_now) const {
+void QAQMCOffDiagonalCore::on_cluster_slice(std::int64_t p, std::vector<int32_t>& spin_now) const {
     if (p != m_star_) return;
     for (size_t k = 0; k < string_sites_.size(); ++k) {
         if ((seam_mask_ >> k) & 1ULL) spin_now[string_sites_[k]] ^= 1;
@@ -127,7 +128,7 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
     // Returns false iff the bond op's old or flipped weight is non-positive
     // (invalid proposal -> caller must reject).  Non-touching bonds
     // contribute nothing and are always "valid".
-    auto bond_ratio_touching_site = [&](int p) -> bool {
+    auto bond_ratio_touching_site = [&](qaqmc_slot_t p) -> bool {
         int b = eng.op_site_at(p);
         int si = bond_sites[b * 2 + 0];
         int sj = bond_sites[b * 2 + 1];
@@ -148,7 +149,7 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
     };
 
     if (direction_right) {
-        for (int p = m_star_; p < eng.M_total_; ++p) {
+        for (qaqmc_slot_t p = m_star_; p < eng.M_total_; ++p) {
             int ot = eng.op_types_[p];
             if ((ot == 1 || ot == -1) && eng.op_site_at(p) == site) {
                 out.terminal_p = p;
@@ -164,7 +165,7 @@ QAQMCOffDiagonalCore::HalfLineProposal QAQMCOffDiagonalCore::build_half_line_pro
         }
         return out; // hit the right boundary without a terminal: invalid
     } else {
-        for (int p = m_star_ - 1; p >= 0; --p) {
+        for (qaqmc_slot_t p = m_star_ - 1; p >= 0; --p) {
             int ot = eng.op_types_[p];
             if ((ot == 1 || ot == -1) && eng.op_site_at(p) == site) {
                 out.terminal_p = p;

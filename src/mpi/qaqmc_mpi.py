@@ -1310,7 +1310,7 @@ def _profile_run_gather(S, *, comm, rank, n_ranks, my_n_samples, base, rem,
     my_density = np.ascontiguousarray(result['density'], dtype=np.float64)
     my_z_raw   = np.ascontiguousarray(result['Z_l'],     dtype=np.float64)
     my_c_m_l   = np.ascontiguousarray(result['C_m_l'],   dtype=np.float64)
-    p_indices  = np.asarray(result['p_indices'], dtype=np.int32)
+    p_indices  = np.asarray(result['p_indices'], dtype=np.int64)
     n_points   = len(p_indices)
 
     # split Z_l size groups from A_v vertex group.
@@ -1656,7 +1656,7 @@ def _profile_run_gather(S, *, comm, rank, n_ranks, my_n_samples, base, rem,
                 sng = f.create_group('snapshots')
                 sng.create_dataset('configs', data=all_snap)              # (n_snaps, n_snap_pts, N) int8
                 sng.create_dataset('delta',     data=prof_delta[snap_pt_indices])
-                sng.create_dataset('p_indices', data=prof_p_idx[snap_pt_indices].astype(np.int32))
+                sng.create_dataset('p_indices', data=prof_p_idx[snap_pt_indices].astype(np.int64))
                 sng.create_dataset('source_rank', data=all_snap_rank)     # (n_snaps,) which rank
                 sng.attrs['n_snapshots_per_rank'] = n_snapshots
                 sng.attrs['n_snapshots_total']    = int(all_snap.shape[0])
@@ -1672,7 +1672,7 @@ def _profile_run_gather(S, *, comm, rank, n_ranks, my_n_samples, base, rem,
                 ocg.create_dataset('q_points',  data=occ_q_points)      # (n_q, 2) cartesian (a=1)
                 ocg.create_dataset('q_frac',    data=occ_q_frac)        # (n_q, 2) fractional (m/G, n/G)
                 ocg.create_dataset('delta',     data=prof_delta[occ_pt_indices])
-                ocg.create_dataset('p_indices', data=prof_p_idx[occ_pt_indices].astype(np.int32))
+                ocg.create_dataset('p_indices', data=prof_p_idx[occ_pt_indices].astype(np.int64))
                 ocg.create_dataset('S_full_re', data=_store_array('occ_S_full_re', all_occ['occ_S_full_re']))
                 ocg.create_dataset('S_full_im', data=_store_array('occ_S_full_im', all_occ['occ_S_full_im']))
                 ocg.create_dataset('S_bulk_re', data=_store_array('occ_S_bulk_re', all_occ['occ_S_bulk_re']))

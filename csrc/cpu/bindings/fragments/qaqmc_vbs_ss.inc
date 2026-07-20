@@ -26,7 +26,7 @@
         .def_property_readonly("n_dimer_measure_points",&QAQMCEngine::get_n_dimer_measure_points)
         .def_property_readonly("dimer_p_indices", [](const QAQMCEngine& self) {
             const auto& v = self.get_dimer_p_indices();
-            return py::array_t<int>(v.size(), v.data());
+            return py::array_t<std::int64_t>(v.size(), v.data());
         })
         .def_property_readonly("dimer_deltas_used", [](const QAQMCEngine& self) {
             const auto& v = self.get_dimer_deltas_used();
@@ -124,7 +124,7 @@
             // Also return the actual slice indices and matched delta values.
             const auto& p_vec = self.get_dimer_p_indices();
             const auto& d_vec = self.get_dimer_deltas_used();
-            py::array_t<int>    p_idx_out(p_vec.size(), p_vec.data());
+            py::array_t<std::int64_t> p_idx_out(p_vec.size(), p_vec.data());
             py::array_t<double> delta_out(d_vec.size(), d_vec.data());
 
             py::dict result;

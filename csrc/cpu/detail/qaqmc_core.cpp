@@ -254,7 +254,7 @@ AliasTable build_qaqmc_alias_tables(int M_total, int N, int n_bonds,
 // ═════════════════════════════════════════════════════════════════════════════
 
 QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
-                          double Rb, int M, double epsilon, uint64_t seed,
+                          double Rb, qaqmc_slot_t M, double epsilon, uint64_t seed,
                           const double* pos, int pos_dim,
                           int neighbor_cutoff, int delta_groups,
                           const double* box, int n_box)
@@ -267,6 +267,11 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
         throw std::invalid_argument(
             "QAQMCEngine: delta_groups must be > 0 (the engine only supports the grouped "
             "alias-table path; the legacy precompute/chunk/on-the-fly modes were removed).");
+    }
+    if (M_ < 1 || M_total_ > kPackedSlotMax) {
+        throw std::invalid_argument(
+            "QAQMCEngine: M must satisfy 1 <= M and 2*M <= 2^41-1 "
+            "(packed64 bond-event slot field)");
     }
     site_W_ = Omega / 2.0;
     site_W_max_ = Omega / 2.0;
@@ -283,6 +288,10 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
 
     // Build V_ij (optional neighbor cutoff; optional periodic box)
     model_->vij = build_rydberg_vij(N, Omega, Rb, pos, pos_dim, neighbor_cutoff, box, n_box);
+    if (model_->vij.n_bonds > kPackedBondMax) {
+        throw std::invalid_argument(
+            "QAQMCEngine: n_bonds exceeds 2^21-1 (packed64 bond-event bond field)");
+    }
 
     // Cache positions for downstream observables (dimer structure factor etc.)
     model_->pos_dim = pos_dim;
@@ -326,8 +335,8 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
 #endif
         for (int g = 0; g < G; ++g) {
             // Find slice range for this group
-            int p_lo = (int)((int64_t)g * M_total_ / G);
-            int p_hi = (int)((int64_t)(g + 1) * M_total_ / G);
+            qaqmc_slot_t p_lo = (qaqmc_slot_t)g * M_total_ / G;
+            qaqmc_slot_t p_hi = (qaqmc_slot_t)(g + 1) * M_total_ / G;
             if (p_hi > M_total_) p_hi = M_total_;
 
             // Compute envelope W_max for each bond: max over all delta in group
@@ -335,7 +344,7 @@ QAQMCEngine::QAQMCEngine(int N, double Omega, double delta_min, double delta_max
             std::vector<double> sample_deltas;
             sample_deltas.push_back(delta_at(p_lo));
             sample_deltas.push_back(delta_at(std::min(p_hi - 1, M_total_ - 1)));
-            int p_mid = (p_lo + p_hi) / 2;
+            qaqmc_slot_t p_mid = (p_lo + p_hi) / 2;
             if (p_mid < M_total_) sample_deltas.push_back(delta_at(p_mid));
 
             std::vector<double> env_W_max(n_bonds, 0.0);
@@ -445,6 +454,11 @@ QAQMCEngine::QAQMCEngine(std::shared_ptr<QAQMCModelData> model_data,
         throw std::invalid_argument(
             "QAQMCEngine: invalid or incomplete shared model data");
     }
+    if (M_total_ > kPackedSlotMax || model_->vij.n_bonds > kPackedBondMax) {
+        throw std::invalid_argument(
+            "QAQMCEngine: shared model exceeds packed64 bond-event limits "
+            "(2*M <= 2^41-1, n_bonds <= 2^21-1)");
+    }
 
     op_types_.assign(M_total_, 1);
     const uint64_t max_location = static_cast<uint64_t>(
@@ -486,22 +500,22 @@ uint64_t QAQMCModelData::logical_bytes() const {
 // ─── Checkpoint helpers ──────────────────────────────────────────────────────
 
 std::vector<double> QAQMCEngine::get_delta_schedule() const {
-    std::vector<double> out(M_total_);
-    for (int p = 0; p < M_total_; ++p) out[p] = delta_at(p);
+    std::vector<double> out(static_cast<size_t>(M_total_));
+    for (qaqmc_slot_t p = 0; p < M_total_; ++p) out[p] = delta_at(p);
     return out;
 }
 
-void QAQMCEngine::export_op_types(int32_t* out, int len) const {
+void QAQMCEngine::export_op_types(int32_t* out, qaqmc_slot_t len) const {
     if (len != M_total_)
         throw std::invalid_argument("export_op_types: output length mismatch");
-    for (int p = 0; p < M_total_; ++p)
+    for (qaqmc_slot_t p = 0; p < M_total_; ++p)
         out[p] = static_cast<int32_t>(op_types_[p]);
 }
 
-void QAQMCEngine::export_op_sites(int32_t* out, int len) const {
+void QAQMCEngine::export_op_sites(int32_t* out, qaqmc_slot_t len) const {
     if (len != M_total_)
         throw std::invalid_argument("export_op_sites: output length mismatch");
-    for (int p = 0; p < M_total_; ++p)
+    for (qaqmc_slot_t p = 0; p < M_total_; ++p)
         out[p] = static_cast<int32_t>(op_site_at(p));
 }
 
@@ -520,6 +534,12 @@ void QAQMCEngine::set_bond_event_storage(const std::string& mode) {
         throw std::invalid_argument(
             "bond event storage must be 'packed64', 'p_bond16', or "
             "'p_only32'");
+    }
+    if (requested != BondEventStorage::Packed64
+        && M_total_ > (qaqmc_slot_t)std::numeric_limits<uint32_t>::max()) {
+        throw std::invalid_argument(
+            "p_bond16/p_only32 store slot positions in uint32; "
+            "2*M exceeds 2^32-1 — use packed64");
     }
     if (requested == bond_event_storage_) return;
     bond_event_storage_ = requested;
@@ -632,10 +652,10 @@ void QAQMCEngine::set_rng_state(const std::string& state_str) {
     iss >> rng_;
 }
 
-void QAQMCEngine::set_op_string(const int32_t* types, const int32_t* sites, int len) {
+void QAQMCEngine::set_op_string(const int32_t* types, const int32_t* sites, qaqmc_slot_t len) {
     if (len != M_total_)
         throw std::invalid_argument("set_op_string: operator string length mismatch");
-    for (int p = 0; p < len; ++p) {
+    for (qaqmc_slot_t p = 0; p < len; ++p) {
         const int type = types[p];
         const int site = sites[p];
         if (type != -1 && type != 1 && type != 2)
@@ -644,7 +664,7 @@ void QAQMCEngine::set_op_string(const int32_t* types, const int32_t* sites, int 
         if (site < 0 || site >= limit)
             throw std::invalid_argument("set_op_string: operator location out of range");
     }
-    for (int p = 0; p < len; ++p) {
+    for (qaqmc_slot_t p = 0; p < len; ++p) {
         const int type = types[p];
         op_types_[p] = static_cast<OpType>(type);
         set_op_site_at(p, sites[p]);
@@ -745,7 +765,7 @@ QAQMCEngine::MidpointObservables QAQMCEngine::measure_at_midpoint() const {
 // code serves both the standalone measure_profile() sweep and the fused
 // capture inside diagonal_update_profiled().
 
-void QAQMCEngine::profile_alloc(ProfileObservables& prof, int n_points) const {
+void QAQMCEngine::profile_alloc(ProfileObservables& prof, qaqmc_slot_t n_points) const {
     prof.n_points = n_points;
     prof.density.assign(n_points, 0.0);
     const int n_zg = (int)loop_group_n_copies_.size();
@@ -788,7 +808,7 @@ void QAQMCEngine::profile_alloc(ProfileObservables& prof, int n_points) const {
     }
 }
 
-void QAQMCEngine::profile_measure_point(const std::vector<int32_t>& state, int out_idx,
+void QAQMCEngine::profile_measure_point(const std::vector<int32_t>& state, qaqmc_slot_t out_idx,
                                         ProfileObservables& prof,
                                         size_t& next_snap, size_t& next_occ) const {
     const int n_zg = (int)loop_group_n_copies_.size();
@@ -938,7 +958,7 @@ void QAQMCEngine::profile_measure_point(const std::vector<int32_t>& state, int o
 
 QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) const {
     if (profile_step <= 0) profile_step = 1;
-    int n_points = M_total_ / profile_step;
+    qaqmc_slot_t n_points = M_total_ / profile_step;
 
     ProfileObservables prof;
     profile_alloc(prof, n_points);
@@ -947,9 +967,9 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
 
     // Propagate state from left boundary |0...0>
     std::vector<int32_t> state(N_, 0);
-    int out_idx = 0;
+    qaqmc_slot_t out_idx = 0;
 
-    for (int p = 0; p < M_total_ && out_idx < n_points; ++p) {
+    for (qaqmc_slot_t p = 0; p < M_total_ && out_idx < n_points; ++p) {
         // Off-diagonal operator: flip the site
         if (op_types_[p] == -1) state[op_site_at(p)] ^= 1;
 
@@ -962,13 +982,13 @@ QAQMCEngine::ProfileObservables QAQMCEngine::measure_profile(int profile_step) c
     return prof;
 }
 
-void QAQMCEngine::set_snapshot_point_indices(const std::vector<int>& point_indices) {
+void QAQMCEngine::set_snapshot_point_indices(const std::vector<qaqmc_slot_t>& point_indices) {
     snapshot_point_indices_ = point_indices;
     std::sort(snapshot_point_indices_.begin(), snapshot_point_indices_.end());
     snapshot_point_indices_.erase(
         std::unique(snapshot_point_indices_.begin(), snapshot_point_indices_.end()),
         snapshot_point_indices_.end());
-    for (int idx : snapshot_point_indices_) {
+    for (qaqmc_slot_t idx : snapshot_point_indices_) {
         if (idx < 0) {
             throw std::runtime_error(
                 "set_snapshot_point_indices: profile-point index must be >= 0");
@@ -1053,13 +1073,13 @@ void QAQMCEngine::set_occ_sf_q_points(
     }
 }
 
-void QAQMCEngine::set_occ_sf_point_indices(const std::vector<int>& point_indices) {
+void QAQMCEngine::set_occ_sf_point_indices(const std::vector<qaqmc_slot_t>& point_indices) {
     occ_sf_point_indices_ = point_indices;
     std::sort(occ_sf_point_indices_.begin(), occ_sf_point_indices_.end());
     occ_sf_point_indices_.erase(
         std::unique(occ_sf_point_indices_.begin(), occ_sf_point_indices_.end()),
         occ_sf_point_indices_.end());
-    for (int idx : occ_sf_point_indices_)
+    for (qaqmc_slot_t idx : occ_sf_point_indices_)
         if (idx < 0) throw std::runtime_error("set_occ_sf_point_indices: index < 0");
 }
 
@@ -1110,10 +1130,10 @@ void QAQMCEngine::set_vbs_triangles(const std::vector<int>& corners_flat,
 }
 
 void QAQMCEngine::set_dimer_sf_measure_p_indices(
-        const std::vector<int>& p_indices) {
+        const std::vector<qaqmc_slot_t>& p_indices) {
     dimer_p_indices_.clear();
     dimer_deltas_used_.clear();
-    for (int p : p_indices) {
+    for (qaqmc_slot_t p : p_indices) {
         if (p < 0 || p >= M_) {
             throw std::runtime_error(
                 "set_dimer_sf_measure_p_indices: p must be in forward ramp [0, M)");
@@ -1122,22 +1142,38 @@ void QAQMCEngine::set_dimer_sf_measure_p_indices(
     }
     // Sort ascending so propagation in measure_dimer_sf is a single forward sweep.
     std::sort(dimer_p_indices_.begin(), dimer_p_indices_.end());
-    for (int p : dimer_p_indices_) {
+    for (qaqmc_slot_t p : dimer_p_indices_) {
         dimer_deltas_used_.push_back(delta_at(p));
     }
 }
 
 void QAQMCEngine::set_dimer_sf_measure_deltas(
         const std::vector<double>& target_deltas) {
-    std::vector<int> p_idx;
+    std::vector<qaqmc_slot_t> p_idx;
     p_idx.reserve(target_deltas.size());
     for (double target : target_deltas) {
-        // Forward ramp only: argmin over p ∈ [0, M).
-        int best_p = 0;
-        double best_diff = std::abs(delta_at(0) - target);
-        for (int p = 1; p < M_; ++p) {
-            double d = std::abs(delta_at(p) - target);
-            if (d < best_diff) { best_diff = d; best_p = p; }
+        // Forward ramp only.  The ramp is monotonic in p, so the argmin is the
+        // rounded inverse of delta_at — O(1) instead of the former O(M) scan
+        // (which would never finish at M ~ 1e11).
+        double span = delta_max_ - delta_min_;
+        qaqmc_slot_t best_p = 0;
+        if (span != 0.0) {
+            qaqmc_slot_t guess = (qaqmc_slot_t)std::llround(
+                (target - delta_min_) / span * (double)M_);
+            // Rounding can be off by one vs |delta_at(p)-target|; scan the
+            // 3-neighbourhood ascending with strict `<` so the result matches
+            // the former full scan exactly, including its smallest-p
+            // tie-break.
+            qaqmc_slot_t lo = std::max<qaqmc_slot_t>(
+                std::min(guess - 1, M_ - 1), 0);
+            qaqmc_slot_t hi = std::min<qaqmc_slot_t>(
+                std::max(guess + 1, (qaqmc_slot_t)0), M_ - 1);
+            best_p = lo;
+            double best_diff = std::abs(delta_at(lo) - target);
+            for (qaqmc_slot_t cand = lo + 1; cand <= hi; ++cand) {
+                double d = std::abs(delta_at(cand) - target);
+                if (d < best_diff) { best_diff = d; best_p = cand; }
+            }
         }
         p_idx.push_back(best_p);
     }
@@ -1157,9 +1193,9 @@ QAQMCEngine::DimerSFSample QAQMCEngine::measure_dimer_sf() const {
     // Walk forward from p=0, flipping offdiag ops; at each target p, snapshot s_q.
     std::vector<int32_t> state(N_, 0);
     size_t next_idx = 0;
-    const int target_max = dimer_p_indices_.back();
+    const qaqmc_slot_t target_max = dimer_p_indices_.back();
 
-    for (int p = 0; p <= target_max; ++p) {
+    for (qaqmc_slot_t p = 0; p <= target_max; ++p) {
         // If this p is a measurement point, snapshot BEFORE applying op at p.
         // (state[i] here is n_i at "just after slice p-1 finished" = entering p.
         //  Equivalent to "state at p" in the trace boundary convention.)
@@ -1250,8 +1286,8 @@ void QAQMCEngine::diagonal_update_profiled(ProfileObservables* prof, int profile
     std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
 
     // Fused profile capture bookkeeping.
-    int out_idx = 0;
-    int n_points = 0;
+    qaqmc_slot_t out_idx = 0;
+    qaqmc_slot_t n_points = 0;
     size_t next_snap = 0, next_occ = 0;
     if (prof != nullptr) {
         if (profile_step <= 0) profile_step = 1;
@@ -1259,7 +1295,7 @@ void QAQMCEngine::diagonal_update_profiled(ProfileObservables* prof, int profile
         profile_alloc(*prof, n_points);
     }
 
-    for (int p = 0; p < M_total_; ++p) {
+    for (qaqmc_slot_t p = 0; p < M_total_; ++p) {
         // Capture state at symmetry point
         if (p == M_) std::memcpy(state_at_M_.data(), state.data(), N_ * sizeof(int32_t));
 
@@ -1366,13 +1402,14 @@ static void resize_scratch_with_bounded_headroom(std::vector<T>& v,
 }
 
 void QAQMCEngine::build_vertex_lists() {
-    const int M = M_total_, N = N_;
+    const qaqmc_slot_t M = M_total_;
+    const int N = N_;
     const int* bond_sites = model_->vij.bond_sites_flat.data();
 
     if (!vertex_counts_valid_) {
         std::fill(site_op_count_.begin(), site_op_count_.end(), 0);
         std::fill(site_bond_count_.begin(), site_bond_count_.end(), 0);
-        for (int p = 0; p < M; ++p) {
+        for (qaqmc_slot_t p = 0; p < M; ++p) {
             int ot = op_types_[p];
             if (ot == 1 || ot == -1) {
                 site_op_count_[op_site_at(p)]++;
@@ -1390,8 +1427,8 @@ void QAQMCEngine::build_vertex_lists() {
         site_op_head_[i]   = site_op_head_[i-1]   + site_op_count_[i-1];
         site_bond_head_[i] = site_bond_head_[i-1]  + site_bond_count_[i-1];
     }
-    int total_sops  = site_op_head_[N-1]   + site_op_count_[N-1];
-    int total_bents = site_bond_head_[N-1] + site_bond_count_[N-1];
+    int64_t total_sops  = site_op_head_[N-1]   + site_op_count_[N-1];
+    int64_t total_bents = site_bond_head_[N-1] + site_bond_count_[N-1];
 
     resize_scratch_with_bounded_headroom(site_op_list_,
                                          static_cast<size_t>(total_sops));
@@ -1412,13 +1449,13 @@ void QAQMCEngine::build_vertex_lists() {
         }
     }
 
-    std::vector<int32_t> cur_op(N, 0);
-    std::vector<int32_t> cur_bond(N, 0);
+    std::vector<int64_t> cur_op(N, 0);
+    std::vector<int64_t> cur_bond(N, 0);
 
     // Fill pass + former Phase B (bond_spin_ from |0...0> propagation).
     std::fill(spin_now_.begin(), spin_now_.end(), 0);
 
-    for (int p = 0; p < M; ++p) {
+    for (qaqmc_slot_t p = 0; p < M; ++p) {
         // Off-diagonal string seam: same convention as diagonal_update(), so
         // bond_spin_[p] for p >= m_star_ reflects the post-seam occupation.
         off_diag_.on_cluster_slice(p, spin_now_);
@@ -1439,8 +1476,8 @@ void QAQMCEngine::build_vertex_lists() {
                 site_bond_list_[site_bond_head_[sj] + cur_bond[sj]++] =
                     pack_bond_entry(p, b, 1);
             } else {
-                const int si_index = site_bond_head_[si] + cur_bond[si]++;
-                const int sj_index = site_bond_head_[sj] + cur_bond[sj]++;
+                const int64_t si_index = site_bond_head_[si] + cur_bond[si]++;
+                const int64_t sj_index = site_bond_head_[sj] + cur_bond[sj]++;
                 site_bond_p_list_[si_index] = static_cast<uint32_t>(p);
                 site_bond_p_list_[sj_index] = static_cast<uint32_t>(p);
                 if (bond_event_storage_ == BondEventStorage::PositionBond16) {
@@ -1467,7 +1504,7 @@ void QAQMCEngine::cluster_update() {
     if (M_total_ == 0) return;
 
     const int* bond_sites = model_->vij.bond_sites_flat.data();
-    const int  M = M_total_, N = N_;
+    const int N = N_;
 
     // ── Phase A (+ fused former Phase B: bond_spin_ fill) ───────────────────
     build_vertex_lists();
@@ -1480,15 +1517,15 @@ void QAQMCEngine::cluster_update() {
     // Zero weights are tallied separately so "excluded → allowed" (inf) and
     // "allowed → excluded" (0) factors can't produce inf*0 = NaN; the running
     // product is renormalised by 1e±100 so long segments can't over/underflow.
-    auto decode_event = [&](int site_i, int absolute_index,
-                            int& p, int& b, int& ep) {
+    auto decode_event = [&](int site_i, int64_t absolute_index,
+                            qaqmc_slot_t& p, int& b, int& ep) {
         if (bond_event_storage_ == BondEventStorage::Packed64) {
             const int64_t event = site_bond_list_[absolute_index];
             p = bond_entry_p(event);
             b = bond_entry_b(event);
             ep = bond_entry_endpoint(event);
         } else {
-            p = static_cast<int>(site_bond_p_list_[absolute_index]);
+            p = static_cast<qaqmc_slot_t>(site_bond_p_list_[absolute_index]);
             b = bond_event_storage_ == BondEventStorage::PositionBond16
                 ? static_cast<int>(site_bond_b16_list_[absolute_index])
                 : op_site_at(p);
@@ -1496,14 +1533,15 @@ void QAQMCEngine::cluster_update() {
         }
     };
 
-    auto accept_for_range = [&](int site_i, int bop_base,
-                                int j_begin, int j_end) -> bool {
+    auto accept_for_range = [&](int site_i, int64_t bop_base,
+                                int64_t j_begin, int64_t j_end) -> bool {
         double ratio = 1.0;
         int shift = 0;      // ratio_total = ratio * 1e100^shift
         int inf_ct = 0;     // factors with w_old == 0 < w_new  (force-accept)
         int zero_ct = 0;    // factors with w_new == 0 < w_old  (force-reject)
-        for (int j = j_begin; j < j_end; ++j) {
-            int p, b, ep;
+        for (int64_t j = j_begin; j < j_end; ++j) {
+            qaqmc_slot_t p;
+            int b, ep;
             decode_event(site_i, bop_base + j, p, b, ep);
             const int si = bond_sites[b * 2 + 0];
             const int sj = bond_sites[b * 2 + 1];
@@ -1540,34 +1578,36 @@ void QAQMCEngine::cluster_update() {
     };
 
     // Helper: flip site_i's bit in bond_spin_[p] for range [j_begin, j_end)
-    auto flip_bond_range = [&](int site_i, int bop_base,
-                               int j_begin, int j_end) {
-        for (int j = j_begin; j < j_end; ++j) {
-            int p, b, ep;
+    auto flip_bond_range = [&](int site_i, int64_t bop_base,
+                               int64_t j_begin, int64_t j_end) {
+        for (int64_t j = j_begin; j < j_end; ++j) {
+            qaqmc_slot_t p;
+            int b, ep;
             decode_event(site_i, bop_base + j, p, b, ep);
             bond_spin_[p] ^= (ep == 0 ? 2 : 1);
         }
     };
 
-    auto upper_bound_idx = [&](int bop_base, int n_bops, int val) -> int {
+    auto upper_bound_idx = [&](int64_t bop_base, int64_t n_bops,
+                               qaqmc_slot_t val) -> int64_t {
         if (bond_event_storage_ == BondEventStorage::Packed64) {
             const int64_t* base = site_bond_list_.data() + bop_base;
             // Largest packed value with entry_p == val.
             const int64_t key =
-                (static_cast<int64_t>(val) << 32) | 0xFFFFFFFFll;
-            return static_cast<int>(
-                std::upper_bound(base, base + n_bops, key) - base);
+                (static_cast<int64_t>(val) << kPackedSlotShift)
+                | ((int64_t(1) << kPackedSlotShift) - 1);
+            return std::upper_bound(base, base + n_bops, key) - base;
         }
         const uint32_t* base = site_bond_p_list_.data() + bop_base;
-        return static_cast<int>(std::upper_bound(
-            base, base + n_bops, static_cast<uint32_t>(val)) - base);
+        return std::upper_bound(
+            base, base + n_bops, static_cast<uint32_t>(val)) - base;
     };
 
     for (int site_i = 0; site_i < N; ++site_i) {
-        int n_sops   = site_op_count_[site_i];
-        int sop_base = site_op_head_[site_i];
-        int n_bops   = site_bond_count_[site_i];
-        int bop_base = site_bond_head_[site_i];
+        int64_t n_sops   = site_op_count_[site_i];
+        int64_t sop_base = site_op_head_[site_i];
+        int64_t n_bops   = site_bond_count_[site_i];
+        int64_t bop_base = site_bond_head_[site_i];
 
         if (n_sops == 0) continue;  // no single-site ops → nothing to flip
 
@@ -1578,14 +1618,14 @@ void QAQMCEngine::cluster_update() {
 
         seg_flipped_.assign(n_sops + 1, 0);  // n_sops+1 segments total
 
-        for (int seg = 1; seg < n_sops; ++seg) {
+        for (int64_t seg = 1; seg < n_sops; ++seg) {
             // Segment between single-site op (seg-1) and op (seg)
-            int p_start = site_op_list_[sop_base + seg - 1];
-            int p_end   = site_op_list_[sop_base + seg];
+            qaqmc_slot_t p_start = site_op_list_[sop_base + seg - 1];
+            qaqmc_slot_t p_end   = site_op_list_[sop_base + seg];
 
             // Bond ops in (p_start, p_end] — no wrapping needed (open BC)
-            int j0 = upper_bound_idx(bop_base, n_bops, p_start);
-            int j1 = upper_bound_idx(bop_base, n_bops, p_end);
+            int64_t j0 = upper_bound_idx(bop_base, n_bops, p_start);
+            int64_t j1 = upper_bound_idx(bop_base, n_bops, p_end);
 
             if (accept_for_range(site_i, bop_base, j0, j1)) {
                 flip_bond_range(site_i, bop_base, j0, j1);
@@ -1596,12 +1636,12 @@ void QAQMCEngine::cluster_update() {
         // ── Phase D: reassign op_types for this site's single-site ops ───────
         // seg_flipped_[0] = 0 (frozen boundary), seg_flipped_[n_sops] = 0 (frozen boundary)
         // For op k (0-indexed): seg_before = k, seg_after = k+1
-        for (int k = 0; k < n_sops; ++k) {
-            int seg_before = k;       // segment ending at op k
-            int seg_after  = k + 1;   // segment starting at op k
+        for (int64_t k = 0; k < n_sops; ++k) {
+            int64_t seg_before = k;       // segment ending at op k
+            int64_t seg_after  = k + 1;   // segment starting at op k
             bool flip_xor = seg_flipped_[seg_before] != seg_flipped_[seg_after];
             if (flip_xor) {
-                int p_op = site_op_list_[sop_base + k];
+                qaqmc_slot_t p_op = site_op_list_[sop_base + k];
                 op_types_[p_op] = (op_types_[p_op] == 1) ? -1 : 1;
             }
         }
