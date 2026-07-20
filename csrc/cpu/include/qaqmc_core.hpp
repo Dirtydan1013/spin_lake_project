@@ -14,6 +14,11 @@
 #include <omp.h>
 #endif
 
+// Operator-string slot index / slot count. int64 so M_total = 2M can exceed
+// 2^31 (target M up to ~1e11); every p-typed variable in the QAQMC engine
+// stays on this alias so a future width change is one edit.
+using qaqmc_slot_t = std::int64_t;
+
 // ─── RNG helpers ─────────────────────────────────────────────────────────────
 // Shared by qaqmc_core.cpp (diagonal_update/cluster_update) and
 // qaqmc_off_diagonal_core.cpp (half-line proposal/topology_sweep) -- header-
@@ -30,7 +35,11 @@ static inline double uniform01(std::mt19937_64& rng) {
 // Exactly uniform on [0, n); the rejection branch fires with probability
 // < n / 2^64 (i.e. essentially never), replacing the per-call division that
 // std::uniform_int_distribution performs.
-static inline int randint(std::mt19937_64& rng, int n) {
+// Templated on the integer type so int and int64 call sites both work; the
+// math is identical for any n < 2^63 (one 64x64->128 multiply), so widening
+// the bound type does not change the draw sequence or results.
+template <typename I>
+static inline I randint(std::mt19937_64& rng, I n) {
     const uint64_t un = (uint64_t)n;
     uint64_t x = rng();
     __uint128_t m = (__uint128_t)x * un;
@@ -43,7 +52,7 @@ static inline int randint(std::mt19937_64& rng, int n) {
             lo = (uint64_t)m;
         }
     }
-    return (int)(uint64_t)(m >> 64);
+    return (I)(uint64_t)(m >> 64);
 }
 
 #include "../detail/qaqmc_off_diagonal_core.hpp"
@@ -83,8 +92,8 @@ struct QAQMCGroupedAlias {
 // RNG, operator-string, event-scratch and checkpoint state stays per engine.
 struct QAQMCModelData {
     int N{0};
-    int M{0};
-    int M_total{0};
+    qaqmc_slot_t M{0};
+    qaqmc_slot_t M_total{0};
     double Omega{0.0};
     double Rb{0.0};
     double delta_min{0.0};
@@ -149,7 +158,7 @@ public:
     using OpType = int8_t;
 
     QAQMCEngine(int N, double Omega, double delta_min, double delta_max,
-                double Rb, int M, double epsilon, uint64_t seed,
+                double Rb, qaqmc_slot_t M, double epsilon, uint64_t seed,
                 const double* pos, int pos_dim,
                 int neighbor_cutoff = -1, int delta_groups = 600,
                 const double* box = nullptr, int n_box = 0);
@@ -170,15 +179,15 @@ public:
 
     // Accessors
     int get_N() const { return N_; }
-    int get_M() const { return M_; }
-    int get_M_total() const { return M_total_; }
+    qaqmc_slot_t get_M() const { return M_; }
+    qaqmc_slot_t get_M_total() const { return M_total_; }
     double get_delta_min() const { return delta_min_; }
     double get_delta_max() const { return delta_max_; }
     double get_epsilon() const { return epsilon_; }
     const std::vector<OpType>& get_op_types() const { return op_types_; }
-    int get_op_site(int p) const { return op_site_at(p); }
-    void export_op_types(int32_t* out, int len) const;
-    void export_op_sites(int32_t* out, int len) const;
+    int get_op_site(qaqmc_slot_t p) const { return op_site_at(p); }
+    void export_op_types(int32_t* out, qaqmc_slot_t len) const;
+    void export_op_sites(int32_t* out, qaqmc_slot_t len) const;
     const std::vector<int>& get_bond_sites_flat() const {
         return model_->vij.bond_sites_flat;
     }
@@ -205,11 +214,39 @@ public:
 
     // delta at slice p. The materialized O(M) schedule was removed; callers
     // that need the complete public schedule receive an on-demand export.
-    inline double delta_at(int p) const {
-        return (p < M_)
-            ? delta_min_ + (delta_max_ - delta_min_) * ((double)p / M_)
-            : delta_max_ - (delta_max_ - delta_min_) * ((double)(p - M_) / M_);
+    // Exact for any p, M up to 2^53 (double holds integers that far, and the
+    // p/M ratio carries full 1e-16 relative precision at all scales).
+    // The static form exists so the large-M unit tests can exercise the exact
+    // production expression without allocating an engine.
+    static inline double delta_at_static(qaqmc_slot_t p, qaqmc_slot_t M,
+                                         double delta_min, double delta_max) {
+        return (p < M)
+            ? delta_min + (delta_max - delta_min) * ((double)p / (double)M)
+            : delta_max - (delta_max - delta_min) * ((double)(p - M) / (double)M);
     }
+    inline double delta_at(qaqmc_slot_t p) const {
+        return delta_at_static(p, M_, delta_min_, delta_max_);
+    }
+
+    // Packed64 bond-event encoding: public so the large-M unit tests can
+    // verify the bit layout; the event lists themselves stay private.
+    static constexpr int          kPackedBondBits = 21;
+    static constexpr int64_t      kPackedBondMax  = (int64_t(1) << kPackedBondBits) - 1;
+    static constexpr int          kPackedSlotShift = kPackedBondBits + 1;  // 22
+    static constexpr qaqmc_slot_t kPackedSlotMax =
+        (qaqmc_slot_t(1) << (63 - kPackedSlotShift)) - 1;                  // 2^41 - 1
+    static inline int64_t pack_bond_entry(qaqmc_slot_t p, int b, int endpoint) {
+        return (static_cast<int64_t>(p) << kPackedSlotShift)
+             | (static_cast<int64_t>(static_cast<uint32_t>(b)) << 1)
+             | static_cast<int64_t>(endpoint & 1);
+    }
+    static inline qaqmc_slot_t bond_entry_p(int64_t e) {
+        return static_cast<qaqmc_slot_t>(e >> kPackedSlotShift);
+    }
+    static inline int bond_entry_b(int64_t e) {
+        return static_cast<int>((e >> 1) & kPackedBondMax);
+    }
+    static inline int bond_entry_endpoint(int64_t e) { return static_cast<int>(e & 1); }
 
     // ── On-the-fly observable support ─────────────────────────────────────
     // Set loop/string site index arrays for Z(l) and C_m(l) measurement.
@@ -287,7 +324,7 @@ public:
         //   M_vbs[pt] = (1/N_tri) Σ (-1)^{n1+n2} u ; M_ss[pt] = (1/N_tri) Σ (-1)^{n1} u
         std::vector<double> M_vbs;                         // [n_points]
         std::vector<double> M_ss;                          // [n_points]
-        int n_points;
+        qaqmc_slot_t n_points;
     };
     ProfileObservables measure_profile(int profile_step) const;
 
@@ -295,9 +332,9 @@ public:
     // Request that measure_profile also dump the full state vector (all N
     // sites) at the given profile-point indices (0-based, into the n_points
     // grid).  Indices are sorted/deduped.  Empty list disables snapshotting.
-    void set_snapshot_point_indices(const std::vector<int>& point_indices);
+    void set_snapshot_point_indices(const std::vector<qaqmc_slot_t>& point_indices);
     int  get_n_snapshot_points() const { return (int)snapshot_point_indices_.size(); }
-    const std::vector<int>& get_snapshot_point_indices() const { return snapshot_point_indices_; }
+    const std::vector<qaqmc_slot_t>& get_snapshot_point_indices() const { return snapshot_point_indices_; }
 
     // ── Sublattice-resolved occupation structure factor ────────────────────
     // q-points (each length pos_dim) for the matrix SF S_αβ(q).
@@ -310,11 +347,11 @@ public:
                              const std::vector<int>& site_in_bulk_cell,
                              int n_basis);
     // Profile-point indices (into the n_points grid) at which to measure occ-SF.
-    void set_occ_sf_point_indices(const std::vector<int>& point_indices);
+    void set_occ_sf_point_indices(const std::vector<qaqmc_slot_t>& point_indices);
     int  get_n_occ_q_points()     const { return (int)occ_q_points_.size(); }
     int  get_occ_n_basis()        const { return occ_n_basis_; }
     int  get_n_occ_sf_points()    const { return (int)occ_sf_point_indices_.size(); }
-    const std::vector<int>& get_occ_sf_point_indices() const { return occ_sf_point_indices_; }
+    const std::vector<qaqmc_slot_t>& get_occ_sf_point_indices() const { return occ_sf_point_indices_; }
 
     // Second occ-SF unit cell (triangle-pair). site_basis has α∈[0,n_basis) or
     // -1 for sites not belonging to any complete triangle cell (excluded).
@@ -349,10 +386,10 @@ public:
     // (argmin over p ∈ [0, M) of |delta_sched_[p] - target|).
     void set_dimer_sf_measure_deltas(const std::vector<double>& deltas);
     // Optional: directly specify p indices on the forward ramp.
-    void set_dimer_sf_measure_p_indices(const std::vector<int>& p_indices);
+    void set_dimer_sf_measure_p_indices(const std::vector<qaqmc_slot_t>& p_indices);
     int  get_n_q_points()             const { return (int)dimer_q_points_.size(); }
     int  get_n_dimer_measure_points() const { return (int)dimer_p_indices_.size(); }
-    const std::vector<int>&     get_dimer_p_indices()  const { return dimer_p_indices_; }
+    const std::vector<qaqmc_slot_t>& get_dimer_p_indices()  const { return dimer_p_indices_; }
     const std::vector<double>&  get_dimer_deltas_used() const { return dimer_deltas_used_; }
 
     // Single-sample measurement: forward-propagate state from p=0 through
@@ -378,7 +415,7 @@ public:
     void set_rng_state(const std::string& state_str);
 
     // Checkpoint: restore operator string from external data
-    void set_op_string(const int32_t* types, const int32_t* sites, int len);
+    void set_op_string(const int32_t* types, const int32_t* sites, qaqmc_slot_t len);
 
     // ── Off-diagonal string (X_C) support ──────────────────────────────────
     // All seam/half-line/topology_sweep state and logic lives in off_diag_
@@ -388,14 +425,14 @@ public:
     // for the on_diagonal_slice()/on_cluster_slice() hook call sites.
     using HalfLineProposal = QAQMCOffDiagonalCore::HalfLineProposal;
 
-    void set_string_sites(const std::vector<int>& sites, int m_star) {
+    void set_string_sites(const std::vector<int>& sites, qaqmc_slot_t m_star) {
         off_diag_.set_string_sites(*this, sites, m_star);
     }
     void set_seam_mask(uint64_t mask) { off_diag_.set_seam_mask(mask); }
     void set_seam_mask_consistent(uint64_t mask) { off_diag_.set_seam_mask_consistent(*this, mask); }
     uint64_t get_seam_mask() const { return off_diag_.get_seam_mask(); }
     const std::vector<int>& get_string_sites() const { return off_diag_.get_string_sites(); }
-    int get_m_star() const { return off_diag_.get_m_star(); }
+    qaqmc_slot_t get_m_star() const { return off_diag_.get_m_star(); }
     const std::vector<int32_t>& get_state_at_seam_minus() const { return off_diag_.get_state_at_seam_minus(); }
     const std::vector<int32_t>& get_state_at_seam_plus()  const { return off_diag_.get_state_at_seam_plus(); }
     void recompute_seam_snapshots() { off_diag_.recompute_seam_snapshots(*this); }
@@ -438,7 +475,8 @@ public:
 private:
     friend class QAQMCOffDiagonalCore;
 
-    int N_, M_, M_total_;
+    int N_;
+    qaqmc_slot_t M_, M_total_;
     double Omega_, Rb_, delta_min_, delta_max_;
     double site_W_, site_W_max_;
     double epsilon_;
@@ -459,11 +497,11 @@ private:
     std::vector<uint16_t> op_sites16_;
     std::vector<uint32_t> op_sites32_;
 
-    inline int op_site_at(int p) const {
+    inline int op_site_at(qaqmc_slot_t p) const {
         return op_sites_u16_ ? static_cast<int>(op_sites16_[p])
                              : static_cast<int>(op_sites32_[p]);
     }
-    inline void set_op_site_at(int p, int value) {
+    inline void set_op_site_at(qaqmc_slot_t p, int value) {
         if (op_sites_u16_) op_sites16_[p] = static_cast<uint16_t>(value);
         else               op_sites32_[p] = static_cast<uint32_t>(value);
     }
@@ -492,11 +530,11 @@ private:
     std::vector<std::vector<double>> dimer_q_points_;     // [n_q][pos_dim]
     std::vector<double> dimer_phase_cos_;                 // [n_q * N] row-major
     std::vector<double> dimer_phase_sin_;                 // [n_q * N]
-    std::vector<int>    dimer_p_indices_;                 // forward-ramp slices, sorted ascending
+    std::vector<qaqmc_slot_t> dimer_p_indices_;           // forward-ramp slices, sorted ascending
     std::vector<double> dimer_deltas_used_;               // delta_at(p) for each p in indices
 
     // ── Snapshot data ─────────────────────────────────────────────────────
-    std::vector<int> snapshot_point_indices_;             // profile-point indices to snapshot, sorted ascending
+    std::vector<qaqmc_slot_t> snapshot_point_indices_;    // profile-point indices to snapshot, sorted ascending
 
     // ── Sublattice-resolved occupation SF data ────────────────────────────
     std::vector<std::vector<double>> occ_q_points_;       // [n_q][pos_dim]
@@ -506,7 +544,7 @@ private:
     std::vector<int8_t> occ_site_in_bulk_;                // [N] 1 if site in a bulk-complete cell
     std::vector<double> occ_cell_R_flat_;                 // [N * pos_dim] cell Bravais pos per site
     int occ_n_basis_{0};
-    std::vector<int>    occ_sf_point_indices_;            // profile points, sorted ascending
+    std::vector<qaqmc_slot_t> occ_sf_point_indices_;      // profile points, sorted ascending
 
     // ── Second occ-SF unit cell (triangle-pair) ───────────────────────────
     std::vector<double> occ2_phase_cos_;                  // [n_q * N] cos(q·R_tri(i))
@@ -523,31 +561,27 @@ private:
     int vbs_n_tri_{0};
 
     // ── Vertex lists for O(M) cluster update ──────────────────────────────
-    std::vector<int32_t> site_op_count_;
-    std::vector<int32_t> site_op_head_;
-    std::vector<int32_t> site_op_list_;
+    // Counts/heads are int64: heads are prefix offsets into the GLOBAL event
+    // lists, whose total length is O(n_ops) and crosses 2^31 near M ~ 1e9.
+    std::vector<int64_t> site_op_count_;
+    std::vector<int64_t> site_op_head_;
+    std::vector<int64_t> site_op_list_;   // stores slot indices p
 
-    std::vector<int32_t> site_bond_count_;
-    std::vector<int32_t> site_bond_head_;
-    // Packed bond-op vertex events: [ p : 32 ][ b : 31 ][ endpoint : 1 ]
+    std::vector<int64_t> site_bond_count_;
+    std::vector<int64_t> site_bond_head_;
+    // Packed bond-op vertex events: [ sign 0 | p : 41 ][ b : 21 ][ endpoint : 1 ]
     // (endpoint = 0 if the owning site is bonds_i[b], 1 if bonds_j[b]).
     // Lists are filled in ascending p per site and p occupies the high bits,
     // so packed order == p order and upper_bound can search the packed key
     // directly.  Carrying b avoids the dependent op_sites_[p] load in the
-    // segment-Metropolis hot loop.
+    // segment-Metropolis hot loop.  The bit split bounds Packed64 at
+    // M_total <= 2^41-1 (~2.2e12) and n_bonds <= 2^21-1 (~2.1e6, N <= ~2048
+    // full graph); both are enforced in the engine constructors.
     std::vector<int64_t> site_bond_list_;
     enum class BondEventStorage { Packed64, PositionBond16, Position32 };
     BondEventStorage bond_event_storage_{BondEventStorage::Packed64};
     std::vector<uint32_t> site_bond_p_list_;
     std::vector<uint16_t> site_bond_b16_list_;
-    static inline int64_t pack_bond_entry(int p, int b, int endpoint) {
-        return (static_cast<int64_t>(p) << 32)
-             | (static_cast<int64_t>(static_cast<uint32_t>(b)) << 1)
-             | static_cast<int64_t>(endpoint & 1);
-    }
-    static inline int bond_entry_p(int64_t e)        { return static_cast<int>(e >> 32); }
-    static inline int bond_entry_b(int64_t e)        { return static_cast<int>((e >> 1) & 0x7FFFFFFF); }
-    static inline int bond_entry_endpoint(int64_t e) { return static_cast<int>(e & 1); }
 
     // Bond-op spin cache, values 0..3 — int8 quarters the footprint of the
     // random-access reads/XORs in the segment Metropolis.
@@ -564,8 +598,8 @@ private:
     void diagonal_update_profiled(ProfileObservables* prof, int profile_step);
     void cluster_update();
     void build_vertex_lists();
-    void profile_alloc(ProfileObservables& prof, int n_points) const;
-    void profile_measure_point(const std::vector<int32_t>& state, int out_idx,
+    void profile_alloc(ProfileObservables& prof, qaqmc_slot_t n_points) const;
+    void profile_measure_point(const std::vector<int32_t>& state, qaqmc_slot_t out_idx,
                                ProfileObservables& prof,
                                size_t& next_snap, size_t& next_occ) const;
 };

@@ -30,10 +30,12 @@
         },
         py::arg("q_points"),
         "Set q-points (n_q, pos_dim) for the occupation SF matrix (phases use cell R).")
-        .def("set_occ_sf_point_indices", [](QAQMCEngine& self, py::array_t<int> idx_arr) {
+        .def("set_occ_sf_point_indices", [](QAQMCEngine& self,
+                py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> idx_arr) {
             auto buf = idx_arr.request();
-            std::vector<int> idx(static_cast<const int*>(buf.ptr),
-                                 static_cast<const int*>(buf.ptr) + buf.shape[0]);
+            std::vector<qaqmc_slot_t> idx(
+                static_cast<const std::int64_t*>(buf.ptr),
+                static_cast<const std::int64_t*>(buf.ptr) + buf.shape[0]);
             self.set_occ_sf_point_indices(idx);
         },
         py::arg("point_indices"),

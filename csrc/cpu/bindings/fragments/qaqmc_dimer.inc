@@ -26,19 +26,23 @@
         "Set target delta values for dimer SF measurements; engine snaps each "
         "to the nearest forward-ramp slice p ∈ [0, M).")
 
-        .def("set_dimer_sf_measure_p_indices", [](QAQMCEngine& self, py::array_t<int> p_arr) {
+        .def("set_dimer_sf_measure_p_indices", [](QAQMCEngine& self,
+                py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> p_arr) {
             auto buf = p_arr.request();
-            std::vector<int> p_idx(static_cast<const int*>(buf.ptr),
-                                   static_cast<const int*>(buf.ptr) + buf.shape[0]);
+            std::vector<qaqmc_slot_t> p_idx(
+                static_cast<const std::int64_t*>(buf.ptr),
+                static_cast<const std::int64_t*>(buf.ptr) + buf.shape[0]);
             self.set_dimer_sf_measure_p_indices(p_idx);
         },
         py::arg("p_indices"),
         "Directly specify forward-ramp slice indices for dimer SF measurements.")
 
-        .def("set_snapshot_point_indices", [](QAQMCEngine& self, py::array_t<int> idx_arr) {
+        .def("set_snapshot_point_indices", [](QAQMCEngine& self,
+                py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> idx_arr) {
             auto buf = idx_arr.request();
-            std::vector<int> idx(static_cast<const int*>(buf.ptr),
-                                 static_cast<const int*>(buf.ptr) + buf.shape[0]);
+            std::vector<qaqmc_slot_t> idx(
+                static_cast<const std::int64_t*>(buf.ptr),
+                static_cast<const std::int64_t*>(buf.ptr) + buf.shape[0]);
             self.set_snapshot_point_indices(idx);
         },
         py::arg("point_indices"),
@@ -47,5 +51,5 @@
         .def_property_readonly("n_snapshot_points", &QAQMCEngine::get_n_snapshot_points)
         .def_property_readonly("snapshot_point_indices", [](const QAQMCEngine& self) {
             const auto& v = self.get_snapshot_point_indices();
-            return py::array_t<int>(v.size(), v.data());
+            return py::array_t<std::int64_t>(v.size(), v.data());
         })

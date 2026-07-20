@@ -134,8 +134,8 @@
                     progress_callback(i + 1, n_equil, "equil");
             }
 
-            int M_total   = self.get_M_total();
-            int n_points  = M_total / profile_step;
+            const std::int64_t M_total = self.get_M_total();
+            const py::ssize_t n_points = (py::ssize_t)(M_total / profile_step);
             int n_zg      = self.get_n_loop_size_groups();
             int n_cg      = self.get_n_string_size_groups();
             int n_q       = self.get_n_q_points();  // 0 if SF not configured
@@ -193,9 +193,9 @@
             long occ_count = 0, occ_bin = 0;
             long occ_bin_size = do_occ ? std::max<long>(1, total_steps / occ_nb) : 1;
 
-            int n_batches_d = (total_steps / me_density) / batch_size;
-            int n_batches_z = (total_steps / me_zl)  / batch_size;
-            int n_batches_c = (total_steps / me_cml) / batch_size;
+            py::ssize_t n_batches_d = (total_steps / me_density) / batch_size;
+            py::ssize_t n_batches_z = (total_steps / me_zl)  / batch_size;
+            py::ssize_t n_batches_c = (total_steps / me_cml) / batch_size;
             if (n_batches_d < 1) n_batches_d = 1;
             if (n_batches_z < 1) n_batches_z = 1;
             if (n_batches_c < 1) n_batches_c = 1;
@@ -206,16 +206,16 @@
             auto d_buf = density_out.mutable_unchecked<2>();
 
             // Z_l, C_m_l: batched per size group (n_batches, n_points, n_size_groups)
-            py::array_t<double> z_l_out  ({n_batches_z, n_points, n_zg});
-            py::array_t<double> c_m_l_out({n_batches_c, n_points, n_cg});
+            py::array_t<double> z_l_out  ({n_batches_z, n_points, (py::ssize_t)n_zg});
+            py::array_t<double> c_m_l_out({n_batches_c, n_points, (py::ssize_t)n_cg});
             auto z_buf = z_l_out.mutable_unchecked<3>();
             auto c_buf = c_m_l_out.mutable_unchecked<3>();
 
             // SF: batched per q-point (n_batches_sf, n_points, n_q).  Shares the
             // same cadence + batch_size as Z_l (both ride the same forward walk).
             // Allocate at least size 1 to keep numpy happy even if n_q==0.
-            int n_q_alloc       = std::max(n_q, 1);
-            int n_batches_sf    = (n_q > 0) ? n_batches_z : 1;
+            py::ssize_t n_q_alloc    = std::max(n_q, 1);
+            py::ssize_t n_batches_sf = (n_q > 0) ? n_batches_z : (py::ssize_t)1;
             py::array_t<double> s_q_real_out({n_batches_sf, n_points, n_q_alloc});
             py::array_t<double> s_q_imag_out({n_batches_sf, n_points, n_q_alloc});
             py::array_t<double> s_q_abs1_out({n_batches_sf, n_points, n_q_alloc});
@@ -232,10 +232,10 @@
             // VBS/SS: per-sample scalar at each profile point → batched means of
             // M_vbs, M_ss and their squares (ride the me_zl batch cadence).
             bool do_vbs = (self.get_n_vbs_triangles() > 0);
-            py::array_t<double> mvbs_out ({do_vbs?n_batches_z:1, n_points});
-            py::array_t<double> mss_out  ({do_vbs?n_batches_z:1, n_points});
-            py::array_t<double> mvbs2_out({do_vbs?n_batches_z:1, n_points});
-            py::array_t<double> mss2_out ({do_vbs?n_batches_z:1, n_points});
+            py::array_t<double> mvbs_out ({do_vbs?n_batches_z:(py::ssize_t)1, n_points});
+            py::array_t<double> mss_out  ({do_vbs?n_batches_z:(py::ssize_t)1, n_points});
+            py::array_t<double> mvbs2_out({do_vbs?n_batches_z:(py::ssize_t)1, n_points});
+            py::array_t<double> mss2_out ({do_vbs?n_batches_z:(py::ssize_t)1, n_points});
             auto mvb_buf  = mvbs_out.mutable_unchecked<2>();
             auto mss_buf  = mss_out.mutable_unchecked<2>();
             auto mvb2_buf = mvbs2_out.mutable_unchecked<2>();
@@ -366,11 +366,11 @@
                         if (occ_count >= occ_bin_size && occ_bin < occ_nb - 1) occ_flush();
                     }
                     if (need_d) {
-                        for (int k = 0; k < n_points; ++k) d_acc[k] += prof.density[k];
+                        for (py::ssize_t k = 0; k < n_points; ++k) d_acc[k] += prof.density[k];
                         ++d_in_batch;
                         if (d_in_batch >= batch_size && batch_d < n_batches_d) {
                             double inv = 1.0 / d_in_batch;
-                            for (int k = 0; k < n_points; ++k) {
+                            for (py::ssize_t k = 0; k < n_points; ++k) {
                                 d_buf(batch_d, k) = d_acc[k] * inv;
                                 d_acc[k] = 0.0;
                             }
@@ -380,18 +380,18 @@
                     }
                     if (need_z) {
                         for (int g = 0; g < n_zg; ++g)
-                            for (int pt = 0; pt < n_points; ++pt)
+                            for (py::ssize_t pt = 0; pt < n_points; ++pt)
                                 z_acc[g][pt] += prof.Z_l_by_size[g][pt];
                         // VBS/SS rides same cadence as Z_l.
                         if (do_vbs)
-                            for (int pt = 0; pt < n_points; ++pt) {
+                            for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                                 double mv = prof.M_vbs[pt], ms = prof.M_ss[pt];
                                 mvb_acc[pt]  += mv;      mss_acc[pt]  += ms;
                                 mvb2_acc[pt] += mv * mv; mss2_acc[pt] += ms * ms;
                             }
                         // SF rides same cadence as Z_l.
                         for (int qi = 0; qi < n_q; ++qi)
-                            for (int pt = 0; pt < n_points; ++pt) {
+                            for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                                 sf_re_acc[qi][pt] += prof.s_q_real[qi][pt];
                                 sf_im_acc[qi][pt] += prof.s_q_imag[qi][pt];
                                 sf_a1_acc[qi][pt] += prof.s_q_abs1[qi][pt];
@@ -403,12 +403,12 @@
                         if (z_in_batch >= batch_size && batch_z < n_batches_z) {
                             double inv = 1.0 / z_in_batch;
                             for (int g = 0; g < n_zg; ++g)
-                                for (int pt = 0; pt < n_points; ++pt) {
+                                for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                                     z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
                                     z_acc[g][pt] = 0.0;
                                 }
                             if (do_vbs)
-                                for (int pt = 0; pt < n_points; ++pt) {
+                                for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                                     mvb_buf (batch_z, pt) = mvb_acc[pt]  * inv;
                                     mss_buf (batch_z, pt) = mss_acc[pt]  * inv;
                                     mvb2_buf(batch_z, pt) = mvb2_acc[pt] * inv;
@@ -416,7 +416,7 @@
                                     mvb_acc[pt]=mss_acc[pt]=mvb2_acc[pt]=mss2_acc[pt]=0.0;
                                 }
                             for (int qi = 0; qi < n_q; ++qi)
-                                for (int pt = 0; pt < n_points; ++pt) {
+                                for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                                     sf_re_buf(batch_z, pt, qi) = sf_re_acc[qi][pt] * inv;
                                     sf_im_buf(batch_z, pt, qi) = sf_im_acc[qi][pt] * inv;
                                     sf_a1_buf(batch_z, pt, qi) = sf_a1_acc[qi][pt] * inv;
@@ -436,13 +436,13 @@
                     }
                     if (need_c) {
                         for (int g = 0; g < n_cg; ++g)
-                            for (int pt = 0; pt < n_points; ++pt)
+                            for (py::ssize_t pt = 0; pt < n_points; ++pt)
                                 c_acc[g][pt] += prof.C_m_l_by_size[g][pt];
                         ++c_in_batch;
                         if (c_in_batch >= batch_size && batch_c < n_batches_c) {
                             double inv = 1.0 / c_in_batch;
                             for (int g = 0; g < n_cg; ++g)
-                                for (int pt = 0; pt < n_points; ++pt) {
+                                for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                                     c_buf(batch_c, pt, g) = c_acc[g][pt] * inv;
                                     c_acc[g][pt] = 0.0;
                                 }
@@ -463,23 +463,23 @@
             // Flush remaining partial batch
             if (d_in_batch > 0 && batch_d < n_batches_d) {
                 double inv = 1.0 / d_in_batch;
-                for (int k = 0; k < n_points; ++k)
+                for (py::ssize_t k = 0; k < n_points; ++k)
                     d_buf(batch_d, k) = d_acc[k] * inv;
             }
             if (z_in_batch > 0 && batch_z < n_batches_z) {
                 double inv = 1.0 / z_in_batch;
                 for (int g = 0; g < n_zg; ++g)
-                    for (int pt = 0; pt < n_points; ++pt)
+                    for (py::ssize_t pt = 0; pt < n_points; ++pt)
                         z_buf(batch_z, pt, g) = z_acc[g][pt] * inv;
                 if (do_vbs)
-                    for (int pt = 0; pt < n_points; ++pt) {
+                    for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                         mvb_buf (batch_z, pt) = mvb_acc[pt]  * inv;
                         mss_buf (batch_z, pt) = mss_acc[pt]  * inv;
                         mvb2_buf(batch_z, pt) = mvb2_acc[pt] * inv;
                         mss2_buf(batch_z, pt) = mss2_acc[pt] * inv;
                     }
                 for (int qi = 0; qi < n_q; ++qi)
-                    for (int pt = 0; pt < n_points; ++pt) {
+                    for (py::ssize_t pt = 0; pt < n_points; ++pt) {
                         sf_re_buf(batch_z, pt, qi) = sf_re_acc[qi][pt] * inv;
                         sf_im_buf(batch_z, pt, qi) = sf_im_acc[qi][pt] * inv;
                         sf_a1_buf(batch_z, pt, qi) = sf_a1_acc[qi][pt] * inv;
@@ -491,15 +491,15 @@
             if (c_in_batch > 0 && batch_c < n_batches_c) {
                 double inv = 1.0 / c_in_batch;
                 for (int g = 0; g < n_cg; ++g)
-                    for (int pt = 0; pt < n_points; ++pt)
+                    for (py::ssize_t pt = 0; pt < n_points; ++pt)
                         c_buf(batch_c, pt, g) = c_acc[g][pt] * inv;
             }
 
-            // p-index array
-            py::array_t<int> p_indices(n_points);
+            // p-index array (slot indices — int64, they exceed int32 at large M)
+            py::array_t<std::int64_t> p_indices(n_points);
             auto p_buf = p_indices.mutable_unchecked<1>();
-            for (int k = 0; k < n_points; ++k)
-                p_buf(k) = (k + 1) * profile_step - 1;
+            for (py::ssize_t k = 0; k < n_points; ++k)
+                p_buf(k) = (std::int64_t)(k + 1) * profile_step - 1;
 
             py::dict result;
             result["density"]    = density_out;  // (n_density, n_points)

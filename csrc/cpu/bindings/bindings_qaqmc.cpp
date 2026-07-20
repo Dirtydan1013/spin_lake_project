@@ -4,6 +4,21 @@
 #include <cstring>
 
 void bind_qaqmc(py::module_& m) {
+    // Allocation-free hooks for the large-M unit tests: exercise the exact
+    // production slot arithmetic (delta schedule, packed64 event encoding)
+    // at p ~ 1e11 without building an engine.
+    m.def("_delta_at", &QAQMCEngine::delta_at_static,
+          py::arg("p"), py::arg("M"), py::arg("delta_min"), py::arg("delta_max"));
+    m.def("_packed64_roundtrip", [](std::int64_t p, int b, int e) {
+        const std::int64_t packed = QAQMCEngine::pack_bond_entry(p, b, e);
+        return py::make_tuple(packed,
+                              QAQMCEngine::bond_entry_p(packed),
+                              QAQMCEngine::bond_entry_b(packed),
+                              QAQMCEngine::bond_entry_endpoint(packed));
+    });
+    m.attr("_packed64_slot_max") = py::int_(QAQMCEngine::kPackedSlotMax);
+    m.attr("_packed64_bond_max") = py::int_(QAQMCEngine::kPackedBondMax);
+
     // ── QAQMCEngine ──────────────────────────────────────────────────────────
 
     py::class_<QAQMCEngine::HalfLineProposal>(m, "HalfLineProposal")
@@ -29,7 +44,7 @@ void bind_qaqmc(py::module_& m) {
 
     py::class_<QAQMCEngine>(m, "QAQMCEngine")
         .def(py::init([](int N, double Omega, double delta_min, double delta_max,
-                         double Rb, int M, double epsilon, uint64_t seed,
+                         double Rb, std::int64_t M, double epsilon, uint64_t seed,
                          py::array_t<double> pos_arr, int neighbor_cutoff,
                          int delta_groups, py::object box_vectors) {
             auto buf = pos_arr.request();
@@ -72,12 +87,12 @@ void bind_qaqmc(py::module_& m) {
                     progress_callback(i + 1, n_equil, "equil");
             }
 
-            int M2 = self.get_M_total();
+            const py::ssize_t M2 = self.get_M_total();
             int total_steps = n_samples * measure_every;
 
             // Allocate output numpy arrays
-            py::array_t<int8_t> types_out({n_samples, M2});
-            py::array_t<int32_t> sites_out({n_samples, M2});
+            py::array_t<int8_t> types_out({(py::ssize_t)n_samples, M2});
+            py::array_t<int32_t> sites_out({(py::ssize_t)n_samples, M2});
             auto t_buf = types_out.mutable_unchecked<2>();
             auto s_buf = sites_out.mutable_unchecked<2>();
 
@@ -86,7 +101,7 @@ void bind_qaqmc(py::module_& m) {
                 self.mc_step();
                 if ((i + 1) % measure_every == 0) {
                     const auto& ot = self.get_op_types();
-                    for (int p = 0; p < M2; ++p) {
+                    for (py::ssize_t p = 0; p < M2; ++p) {
                         t_buf(sample_idx, p) = static_cast<int8_t>(ot[p]);
                         s_buf(sample_idx, p) = static_cast<int32_t>(self.get_op_site(p));
                     }
@@ -118,7 +133,8 @@ void bind_qaqmc(py::module_& m) {
         .def_property_readonly("op_types", [](const QAQMCEngine& self) {
             const auto& v = self.get_op_types();
             py::array_t<int32_t> out(v.size());
-            self.export_op_types(out.mutable_data(), static_cast<int>(v.size()));
+            self.export_op_types(out.mutable_data(),
+                                 static_cast<qaqmc_slot_t>(v.size()));
             return out;
         })
         .def_property_readonly("op_sites", [](const QAQMCEngine& self) {
@@ -164,11 +180,11 @@ void bind_qaqmc(py::module_& m) {
                     "set_op_string: types/sites must be equal-length 1D arrays");
             self.set_op_string(static_cast<const int32_t*>(t.ptr),
                                static_cast<const int32_t*>(s.ptr),
-                               (int)t.shape[0]);
+                               (qaqmc_slot_t)t.shape[0]);
         })
 
         // ── Off-diagonal string (X_C) seam support — Phase A ───────────────────
-        .def("set_string_sites", [](QAQMCEngine& self, py::list sites_py, int m_star) {
+        .def("set_string_sites", [](QAQMCEngine& self, py::list sites_py, std::int64_t m_star) {
             std::vector<int> sites;
             for (auto& x : sites_py) sites.push_back(x.cast<int>());
             self.set_string_sites(sites, m_star);

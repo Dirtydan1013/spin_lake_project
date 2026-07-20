@@ -25,7 +25,7 @@ class QAQMCOffDiagonalCore {
 public:
     struct HalfLineProposal {
         bool valid = false;
-        int terminal_p = -1;          // operator-string position to toggle on commit
+        std::int64_t terminal_p = -1; // operator-string position to toggle on commit
         double log_physical_ratio = 0.0;
     };
 
@@ -36,7 +36,8 @@ public:
     // propagated through operators 0..m_star-1 unmodified (n^-), then XORed
     // by the active seam bits, then propagation continues through operators
     // m_star..M_total-1 (n^+ = n^- xor b).
-    void set_string_sites(const QAQMCEngine& eng, const std::vector<int>& sites, int m_star);
+    void set_string_sites(const QAQMCEngine& eng, const std::vector<int>& sites,
+                          std::int64_t m_star);
 
     // Recompute state_at_seam_minus_/plus_ from eng's CURRENT op_types_/
     // op_sites_/seam_mask_ without resampling any operators (read-only pass,
@@ -78,8 +79,8 @@ public:
     // diagonal_update() needs the full pre/post snapshot (consumed later by
     // build_half_line_proposal); cluster_update()'s spin_now_ is a transient
     // scratch array that only needs the in-place XOR, no snapshot.
-    void on_diagonal_slice(int p, std::vector<int32_t>& state);
-    void on_cluster_slice(int p, std::vector<int32_t>& spin_now) const;
+    void on_diagonal_slice(std::int64_t p, std::vector<int32_t>& state);
+    void on_cluster_slice(std::int64_t p, std::vector<int32_t>& spin_now) const;
 
     // Set the seam mask AND repair per-site worldline closure. The fixed
     // |0...0> boundary at BOTH tau ends imposes, per string site,
@@ -100,7 +101,7 @@ public:
     void set_seam_mask(uint64_t mask) { seam_mask_ = mask; }
     uint64_t get_seam_mask() const { return seam_mask_; }
     const std::vector<int>& get_string_sites() const { return string_sites_; }
-    int get_m_star() const { return m_star_; }
+    std::int64_t get_m_star() const { return m_star_; }
 
     // Pre-/post-seam spin state at m_star_. Both are full-length (N)
     // snapshots; only string_sites_ entries can differ between the two.
@@ -110,7 +111,7 @@ public:
 
 private:
     std::vector<int> string_sites_;            // physical site ids in C (size L_C)
-    int m_star_{-1};                           // cut position; -1 = no string configured
+    std::int64_t m_star_{-1};                  // cut position; -1 = no string configured
     uint64_t seam_mask_{0};                    // bit k <-> string_sites_[k]
     std::vector<int32_t> state_at_seam_minus_; // n^- at m_star_ (pre-seam)
     std::vector<int32_t> state_at_seam_plus_;  // n^+ at m_star_ (post-seam)
