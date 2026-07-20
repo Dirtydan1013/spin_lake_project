@@ -113,5 +113,7 @@ print(f"probe wall = {probe_elapsed:.1f}s for {probe_traj_per_rank} traj/rank "
       f"(includes init+thermalize {$PROBE_THERMALIZE} sweeps)")
 print(f"UPPER-BOUND production estimate ≈ {per_traj:.1f}s/traj × {target_per_rank} traj/rank "
       f"= {per_traj * target_per_rank / 3600:.2f} h  (plus thermalize scaling)")
+from src.probes import costreport
+costreport.report(per_traj * target_per_rank, $NTASKS, $CPT)
 print("For a tighter estimate use the per-K 'elapsed=' line printed by the driver.")
 PY

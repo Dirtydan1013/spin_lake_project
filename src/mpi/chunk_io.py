@@ -24,6 +24,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import re
+import socket
 from pathlib import Path
 
 import numpy as np
@@ -176,6 +177,10 @@ class RankChunkWriter:
             else:
                 g.create_dataset(key, data=arr)
         g.attrs["chunk"] = int(idx)
+        # Provenance, not identity: per chunk (not file-level, which resume
+        # validates for equality) — after a resume, later chunks of the same
+        # rank file may come from a different node.
+        g.attrs["hostname"] = socket.gethostname()
         for key, value in (attrs or {}).items():
             g.attrs[key] = value
         if checkpoint_datasets is not None or checkpoint_attrs is not None:
@@ -210,6 +215,7 @@ class RankChunkWriter:
         if "final_config" in self._h5:
             del self._h5["final_config"]
         g = self._h5.create_group("final_config")
+        g.attrs["hostname"] = socket.gethostname()
         for key, value in datasets.items():
             if isinstance(value, (str, bytes)):
                 g.attrs[key] = value

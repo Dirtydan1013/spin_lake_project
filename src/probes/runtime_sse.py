@@ -16,13 +16,14 @@ mpiexec -n 24 python -u "scripts/python script/probe_runtime_sse.py" \
 """
 
 import argparse
+import os
 import time
 
 import numpy as np
 from mpi4py import MPI
 
 from src.engines.sse import SSE_Rydberg
-from src.probes import memreport
+from src.probes import costreport, memreport
 
 
 def _make_pos(lattice, N, nx, ny, a):
@@ -113,6 +114,8 @@ def main():
               f"samples/rank={per_rank} = {total_steps} steps")
         print(f"[probe-SSE] ESTIMATED wall time (slowest rank): "
               f"{est:.0f}s = {est / 3600:.2f}h")
+        costreport.report(est, n_ranks,
+                          int(os.environ.get("OMP_NUM_THREADS", "1")))
 
     core = memreport.sse_engine_core_mib(cpp)
     memreport.report(

@@ -7,8 +7,10 @@ Three layers of information:
    happened DURING the probe (alias-table build, first cluster event
    allocation, SSE ``adjust_M`` growth ...).
 2. Extrapolated to production: chains are independent, so per-rank RSS does
-   not depend on rank count; node total ≈ target_ranks × per-rank.  A fit
-   verdict is printed against ``--node-mem-gb`` (default 240, cpunode02).
+   not depend on rank count; node total ≈ ranks-per-node × per-rank.  When the
+   probe spans several nodes the target rank count is split over them (ceil:
+   most-loaded node governs).  A fit verdict is printed against
+   ``--node-mem-gb`` (default 240, cpunode02).
 3. Analytic notes for known transients the probe did NOT exercise (e.g.
    warm-start config export, rank-0 result gathers) — passed in by each
    probe as plain strings and printed verbatim.
@@ -99,8 +101,16 @@ def report(tag: str, comm=None, *, engine_core_mib: float | None = None,
     peak = peak_mib()
 
     if comm is not None:
+        from mpi4py import MPI
         rank = comm.Get_rank()
         n_ranks = comm.Get_size()
+        # Node count via the shared-memory communicator (each rank contributes
+        # 1/node_size, so the sum counts distinct nodes).  Collective — must
+        # run before the non-root early return.
+        local = comm.Split_type(MPI.COMM_TYPE_SHARED)
+        node_size = local.Get_size()
+        local.Free()
+        n_nodes = int(round(comm.allreduce(1.0 / node_size, op=MPI.SUM)))
         rows = comm.gather((now, peak), root=0)
         if rank != 0:
             return
@@ -112,12 +122,14 @@ def report(tag: str, comm=None, *, engine_core_mib: float | None = None,
         peak_max = peak_values[-1]
     else:
         n_ranks = 1
+        n_nodes = 1
         now_med = now_max = now
         peak_med = peak_max = peak
 
     ranks = default_target_ranks(target_ranks or n_ranks)
-    node_now_gib = ranks * now_max / 1024.0
-    node_peak_gib = ranks * peak_max / 1024.0
+    ranks_per_node = -(-ranks // max(n_nodes, 1))   # ceil: most-loaded node
+    node_now_gib = ranks_per_node * now_max / 1024.0
+    node_peak_gib = ranks_per_node * peak_max / 1024.0
     node_gib = node_mem_gb * 1000**3 / 2**30   # GB (Slurm convention) → GiB
     headroom = 1.0 - node_peak_gib / node_gib
     verdict = "OK" if headroom > 0.10 else ("TIGHT" if headroom > 0.0 else "DOES NOT FIT")
@@ -128,12 +140,15 @@ def report(tag: str, comm=None, *, engine_core_mib: float | None = None,
         print(f"[{tag}]   {core_label} ≈ {engine_core_mib:.1f} MiB")
     for note in notes:
         print(f"[{tag}]   note: {note}")
-    print(f"[{tag}] node @ {ranks} ranks: now ~{node_now_gib:.1f} GiB, "
+    layout = (f"{ranks} ranks" if n_nodes <= 1
+              else f"{ranks_per_node} ranks/node ({ranks} ranks on {n_nodes} nodes)")
+    print(f"[{tag}] node @ {layout}: now ~{node_now_gib:.1f} GiB, "
           f"peak ~{node_peak_gib:.1f} GiB → {node_mem_gb:.0f} GB node "
           f"{verdict} (headroom {100 * headroom:.0f}%)")
     print(f"[{tag}] memory-json: " + json.dumps(dict(
         rank_rss_mib_median=round(now_med, 1), rank_rss_mib_max=round(now_max, 1),
         rank_peak_mib_median=round(peak_med, 1), rank_peak_mib_max=round(peak_max, 1),
         engine_core_mib=None if engine_core_mib is None else round(engine_core_mib, 1),
-        target_ranks=ranks, node_peak_gib=round(node_peak_gib, 2),
+        target_ranks=ranks, n_nodes=n_nodes, ranks_per_node=ranks_per_node,
+        node_peak_gib=round(node_peak_gib, 2),
         node_mem_gb=node_mem_gb, verdict=verdict)))

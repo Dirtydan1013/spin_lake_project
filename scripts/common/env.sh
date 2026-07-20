@@ -7,9 +7,13 @@
 #     sbatch scripts/run/cpu/run_x.sh   # SLURM: resources from the job
 #     bash   scripts/run/cpu/run_x.sh   # bare server: env vars / autodetect
 #
-# The launcher is mpiexec in BOTH cases (conda-forge Open MPI has no
-# SLURM/PMIx integration, hence the PMI unsets below), so behavior is
-# identical inside and outside a job — only where NTASKS/CPT come from differs.
+# The launcher is mpiexec in BOTH cases, so behavior is identical inside and
+# outside a job — only where NTASKS/CPT come from differs.  The conda-forge
+# Open MPI 5 runtime (PRRTE) ships slurm+ssh launch plugins: inside a
+# multi-node SLURM allocation mpiexec reads the node list itself and spawns
+# remote daemons via srun; outside SLURM use HOSTS/HOSTFILE below (needs
+# passwordless ssh and identical repo/conda paths on every node).  The PMI
+# unsets below only stop stale client-side PMI vars leaking into the job.
 #
 # Everything is overridable from the environment or scripts/common/site.conf
 # (gitignored; copy site.conf.example):
@@ -22,6 +26,10 @@
 #                           "--map-by numa:PE=$CPT --bind-to core") or disable in
 #                           cgroup-limited containers ("--bind-to none")
 #   MPI_EXTRA_FLAGS         extra mpiexec flags, e.g. --oversubscribe
+#   HOSTS                   explicit per-node rank placement, e.g.
+#                           "cpunode02:32,cpunode03:16" (slots per node; becomes
+#                           mpiexec --host).  Set NTASKS to the TOTAL rank count.
+#   HOSTFILE                same via an Open MPI hostfile ("nodeX slots=N" lines)
 #
 # Exports: NTASKS, CPT, JOB_TAG (job id or timestamp.pid), NODE_DESC, MPIEXEC.
 
@@ -82,7 +90,11 @@ export NUMEXPR_NUM_THREADS=1
 # ~GB/rank op arrays; unbound ranks migrate across sockets).
 BIND_FLAGS=${BIND_FLAGS:---map-by slot:PE=$CPT --bind-to core}
 MPI_EXTRA_FLAGS=${MPI_EXTRA_FLAGS:-}
-MPIEXEC="mpiexec $BIND_FLAGS $MPI_EXTRA_FLAGS -n $NTASKS"
+PLACE_FLAGS=
+[ -n "${HOSTS:-}" ]    && PLACE_FLAGS="--host $HOSTS"
+[ -n "${HOSTFILE:-}" ] && PLACE_FLAGS="$PLACE_FLAGS --hostfile $HOSTFILE"
+MPIEXEC="mpiexec $PLACE_FLAGS $BIND_FLAGS $MPI_EXTRA_FLAGS -n $NTASKS"
 
 echo "[env.sh] mode=$([ -n "${SLURM_JOB_ID:-}" ] && echo slurm || echo bare)" \
-     "node=$NODE_DESC ntasks=$NTASKS cpt=$CPT bind='$BIND_FLAGS'"
+     "node=$NODE_DESC ntasks=$NTASKS cpt=$CPT bind='$BIND_FLAGS'" \
+     "${HOSTS:+hosts=$HOSTS}${HOSTFILE:+hostfile=$HOSTFILE}"
