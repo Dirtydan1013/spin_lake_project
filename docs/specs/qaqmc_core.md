@@ -102,13 +102,22 @@ Python 端經 `src/engines/qaqmc.py`（`QAQMC_Rydberg`）、
 - `op_types` 編碼 `-1/1/2`（見上）；內部 `OpType = int8_t`。
 - `op_sites` 內部自動選型：`max_location ≤ 65535` → `uint16_t`
   （N=216 full-bond 落在此），否則 `uint32_t`；恰好配置一個 storage
-  vector。對外 API/checkpoint 一律 int32。
+  vector。對外 API/checkpoint 一律 int32（值域 = 站/鍵編號，與 M 無關）。
+- **Slot index 型別 `qaqmc_slot_t = int64_t`**（`M`/`M_total`/所有 `p`、
+  event offset、profile point index、pybind `M` 參數與 p-index 陣列）。
+  上限由 packed64 bond-event 的位元分割決定：`M_total ≤ 2^41−1`（≈2.2e12，
+  即 `M ≤ ~1.1e12`）且 `n_bonds ≤ 2^21−1`（≈2.1e6，全連接 N≲2048），兩者
+  在建構子檢查、超界丟 `ValueError`。float 端無進位問題：`delta_at` 的
+  `p/M` 在 double 下對 p、M ≤ 2^53 精確，觀測量累加器 scale 於 n_samples
+  而非 M，slot 抽樣走 64-bit 整數 Lemire draw。
 - Grouped alias：`alias_prob` + `alias_idx16‖idx32`（`alias_u16` 旗標），
   location kind 由 sampled index 推導，不再存 `loc_kind` 陣列；
   `bond_W_max_all` 已移除（無 hot-path 讀者），保留 `bond_W_rmax_all`。
 - Bond event 三種表示（`set_bond_event_storage`）：
-  - `packed64`：int64 `[p:32|b:31|endpoint:1]`，p 在高位 ⇒ packed 序 == p 序，
-    upper_bound 可直接搜 packed key；
+  - `packed64`：int64 `[sign 0|p:41|b:21|endpoint:1]`，p 在高位 ⇒ packed 序
+    == p 序，upper_bound 可直接搜 packed key（sentinel key 由
+    `kPackedSlotShift` 造，非硬編 `0xFFFFFFFF`）；`p_bond16`/`p_only32` 的
+    `uint32 p` 僅支援 `M_total ≤ 2^32−1`，超界時 setter 丟 `ValueError`；
   - `p_bond16`：`uint32 p` + `uint16 b`（6 B/event；**n_bonds > 65535 建構時
     直接拒絕**，不做 silent narrowing）；
   - `p_only32`：只存 `uint32 p`，b/endpoint 在 hot loop 由 op string 重建。
@@ -176,6 +185,10 @@ Python 端經 `src/engines/qaqmc.py`（`QAQMC_Rydberg`）、
 - `tests/engines/unit/test_qaqmc_cpu_memory_layout.py`：compact 表示、
   overflow fallback、三種 event layout exact、shared-model 不改 trajectory、
   checkpoint replay、scratch headroom。
+- `tests/engines/unit/test_qaqmc_large_m_slots.py`：int64 slot 遷移的
+  packed64 位元分割/roundtrip/排序、`delta_at` 在 p~1e11 的端點/對稱/
+  相鄰解析、建構子上限守衛（皆 allocation-free）；`QAQMC_BIG_M_TESTS=1`
+  另跑一個真正跨過 2^31 slots 的 mc_step（M=1.2e9，~30 GB，大記憶體節點用）。
 - `tests/engines/unit/test_cpu_module_api.py`：module API 面。
 - `tests/mpi/unit/test_qaqmc_profile_grid.py`：profile 網格（不再
   materialize 全 ramp）。
