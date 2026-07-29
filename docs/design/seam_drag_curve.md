@@ -204,7 +204,34 @@ pytest 收，N=5 chain / M=16 / C={2}，ED = `qaqmc_exact_string_zratio` 逐 m�
 只跑過 m_star=M）。回歸：`tests/engines/{unit,integration}` 120 passed
 + 手動 string mains 全綠。
 
-## 6. 成本備註
+## 6. M4-1/2/3（2026-07-30 晚，mirror 平均、M-scaling、two-site）
+
+**新 API**：`run_drag_curve_mirrored(m_grid_forward, ...)` — 左右兩族共用
+m=M anchor、逐點幾何平均；`run_drag_ladder` 增 `n_equil_at_anchor`
+（第二族從前一族遠端 config 重錨定時必須 > 0 — 順帶修掉 gate 裡原本的
+輕微 sloppiness）。新 gate：mirrored 曲線 vs ED（0.3–0.7%）、two-site
+C={1,3} ladder vs ED（0.1–0.8%，驗 bond 同時碰多個 active site 的 frame
+bookkeeping）。QMC mirrored @M=64 對 ED geo-mean：2–5% ≈ 1σ。
+
+**M-scaling 研究（ED 精確，M=16→2048，δ ∈ {−1, 0.5, 2, 4}，
+`plots/seam_drag_mirror_vscaling.png`）— 結論比 §2 的天真預期更微妙：**
+
+1. **單 branch 的 finite-v 誤差本來就幾乎是 v 的偶函數**：up/down 兩 branch
+   幾乎重合（M=64 時 |L−R| ~ 5%，共同 lag 卻 40–80%）。palindrome 轉置對稱
+   對 X_C 插入近似成立（差一個 one-slot schedule shift）。所以 mirror 平均
+   **不改變收斂階** — 尾端斜率單 branch 與 mirrored 都 ≈ 2。
+2. mirror 平均的實際價值：(a) 消掉殘餘奇數項；(b) 撫平單 branch 的
+   **零交叉病態**（|O−G| 在大 M 端因變號而假性下沉/抖動，見 δ=−1、δ=2
+   面板），mirrored 曲線是乾淨單調的 ~1/M² → **可安全 Richardson 外插**。
+   成本幾乎為零（兩族共用 anchor）→ production 預設開啟。
+3. **絕熱收斂很慢**：ε-offset 使 v = Δλ·Ẽ 在小 M 不小（N=5 chain 在 M=256
+   仍差 GS 10–20%；M=2048 才到 10⁻³–10⁻⁴ 量級；δ=0.5（⟨σˣ⟩ 峰附近）
+   最慢，M=2048 斜率仍只有 1.7）。v ∝ N/M ⇒ kagome 生產要「基態極限」的
+   數字必須靠 **M-序列 + 1/M² 外插**（對 mirrored 曲線做），不能單靠加大 M；
+   這跟熵 ladder 的 rung-decimation 紀律同精神。有限-v 曲線本身（非平衡
+   sweep 的物理）則不受此限 — 那正是 spin-lake 情境關心的對象。
+
+## 7. 成本備註
 
 - drag 全程 O(M_total)/趟 + 每段 relax O(M)·steps + 每次進場 recompute O(M)
   → 一條 trajectory ≈ (n_grid × relax_steps + 2) 個 mc_step 的量級；
