@@ -231,7 +231,51 @@ bookkeeping）。QMC mirrored @M=64 對 ED geo-mean：2–5% ≈ 1σ。
    這跟熵 ladder 的 rung-decimation 紀律同精神。有限-v 曲線本身（非平衡
    sweep 的物理）則不受此限 — 那正是 spin-lake 情境關心的對象。
 
-## 7. 成本備註
+## 7. M4-4/6/8（2026-07-30 深夜：block-RB、driver、kagome 標定、scripts）
+
+**Block-RB rung（生產可行性的關鍵）**：生產 M=10⁵ 下逐 slot ladder 要 10⁵ 個
+rung，不可行。給定 worldline，各 crossed slot 的 diagonal-op 選擇條件獨立 →
+block 的 RB 條件期望精確分解為逐 slot Λ 比值乘積，一次 O(k·n_bonds) read-only
+walk（C++ `seam_rb_log_ratio_to(m_new)`；`seam_rung_rb_ratio` 改為其 k=1 特例）。
+單元測試：block == 逐 slot 組合（1e-10）、read-only 不變量。
+
+**MPI driver**（`qaqmc_string_work_mpi --drag-*`）：λ-anchor 之後接 drag phase
+（reverse-sector 熱化 → 每 rank `--drag-repeats` 趟 mirrored ladder），per-pass
+chunk 進 `<ckpt>/drag/rank{r}.h5`，rank0 以 pass 散佈聚合誤差、逐 K 組合
+O_C(δ) 曲線存 HDF5 `drag/` group（含 `curves/K{K}/o_curve`）。anchor 誤差改由
+`_aggregate_log_j` 內建 bootstrap（`log_o_c_sem_boot`）。無 drag flags 時行為
+與舊版 bit-exact。測試：`tests/mpi/integration/test_qaqmc_string_drag_mpi_integration.py`
+（單 rank plumbing）＋ 2-rank CLI 實跑（δ→slot 轉換、gather、HDF5 驗證，
+數值對 ED 1σ 內）。⚠️ root PROD .so 尚未部署新 API — 生產前要 `mv` 部署。
+
+**kagome 標定（kagome_bond 4×4 N=96 PBC，a=4、Rb=2.4、δ −2→6、M=4096，
+size-2 中央 C_m 弦）**：
+
+| δ | rung log-sd @spr=1 | 8 | 32 | 128 |
+|---|---|---|---|---|
+| 5.0 | 0.0034 | 0.011 | 0.20 | 0.55 |
+| 4.25 | 0.0039 | 0.008 | 0.12 | 0.41 |
+| 3.0 | 0.0038 | 0.023 | 0.09 | 0.43 |
+| 1.0 | 0.0052 | 0.051 | 0.11 | 0.57 |
+| −1.0 | 0.0057 | 0.045 | 0.18 | 1.68 |
+
+1. **rung log-sd 不是 √spr 縮放**：spr ≳ 8 後轉為 ~線性（甚至超線性）增長 —
+   worldline 虛時關聯讓 block 內逐 slot 貢獻同調累積。⇒「cost ∝ 1/spr」只在
+   關聯 crossover 之內成立；**最佳 spr = 讓 rung log-sd ≈ 0.3**（此幾何 ≈ 64，
+   scripts 預設已設 64；換幾何/M 用 probe 重標）。
+2. 完整 11-δ mirrored 曲線（δ 6→−1、spr=64、200/rung、112 rungs）：**59 s**
+   單鏈；log r 誤差 0.02（近端）→ 0.11（δ=−1）。timing：mc_step 0.92 ms、
+   block eval 1.07 ms（O(M) snapshot recompute 主導）→ 每 rung 樣本 ≈ 2×mc_step。
+3. rate check（sweeps 1 vs 3，獨立 seed，最遠點全程 drag）：z=1.1 ✓。
+4. 分支不對稱 L−R 在此 M 很大（log 差 0.1–1.4）— M=4096 對 N=96 是很快的
+   ramp（v ∝ N/M）；mirror 平均是必要的，且生產 M=10⁵（×25 慢）下會縮小。
+
+**Scripts**：`run_kagome_string_work.sh` 增 `DRAG_*` 旋鈕（`DRAG_DELTAS` 非空
+才啟用；預設行為不變）；`probe_string_work_runtime.sh` 增 drag 段 — probe 以
+production grid/spr × 少量 samples 實跑，生產時間 = 實測 × (samples 比) ×
+repeats（rung 數按構造相同），計入 CPU-hours 報告。
+
+## 8. 成本備註
 
 - drag 全程 O(M_total)/趟 + 每段 relax O(M)·steps + 每次進場 recompute O(M)
   → 一條 trajectory ≈ (n_grid × relax_steps + 2) 個 mc_step 的量級；
