@@ -29,6 +29,7 @@ mkdir -p logs
 
 # ─── Production target being estimated (mirror run_kagome_string_work.sh) ───
 LATTICE=${LATTICE:-kagome_bond_triangle}
+BOUNDARY=${BOUNDARY:-open}
 NX=${NX:-6}
 NY=${NY:-6}
 A_LAT=${A_LAT:-4.0}
@@ -64,6 +65,10 @@ PROBE_THERMALIZE=${PROBE_THERMALIZE:-50}
 
 PROBE_TRAJ=$(( PROBE_TRAJ_PER_RANK * NTASKS ))
 
+# Explicit STRING_SITES overrides the auto-pick (same contract as the run
+# script — e.g. a vertex hexagon loop that is smaller than any Z_l copy).
+STRING_SITES=${STRING_SITES:-""}
+if [ -z "$STRING_SITES" ]; then
 STRING_SITES=$(python - <<PY
 import numpy as np
 nx, ny, s = $NX, $NY, $STRING_SIZE
@@ -84,10 +89,11 @@ best = min(ssets, key=lambda st: np.linalg.norm(pos[st].mean(axis=0) - centre))
 print(",".join(str(x) for x in best))
 PY
 )
+fi
 
 echo "=== Probing string-work runtime ==="
 echo "Node: $NODE_DESC, ranks=$NTASKS"
-echo "Geometry: $LATTICE ${NX}x${NY}, M=$M, K=$K ($SCHEDULE), string sites: $STRING_SITES"
+echo "Geometry: $LATTICE ${NX}x${NY} ($BOUNDARY), M=$M, K=$K ($SCHEDULE), string sites: $STRING_SITES"
 echo "Probe: $PROBE_TRAJ trajectories total ($PROBE_TRAJ_PER_RANK/rank), thermalize=$PROBE_THERMALIZE"
 echo "Estimating production: n_traj=$TARGET_N_TRAJ, thermalize=$TARGET_THERMALIZE"
 if [ -n "$DRAG_DELTAS" ]; then
@@ -109,6 +115,7 @@ $MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     --delta-min "$DELTA_MIN" --delta-max "$DELTA_MAX" \
     --epsilon "$EPSILON" \
     --neighbor-cutoff "$NEIGHBOR_CUTOFF" \
+    --boundary "$BOUNDARY" \
     --delta-groups "$DELTA_GROUPS" \
     --string-sites "$STRING_SITES" \
     --K-values "$K" \
