@@ -42,6 +42,7 @@ NEIGHBOR_CUTOFF=${NEIGHBOR_CUTOFF:--1}
 DELTA_GROUPS=${DELTA_GROUPS:-600}
 K=${K:-200}
 SCHEDULE=${SCHEDULE:-cosine}
+DIRECTION=${DIRECTION:-forward}
 STRING_SIZE=${STRING_SIZE:-2}
 TARGET_N_TRAJ=${TARGET_N_TRAJ:-4000}
 TARGET_THERMALIZE=${TARGET_THERMALIZE:-5000}
@@ -125,6 +126,7 @@ $MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     --string-sites "$STRING_SITES" \
     --K-values "$K" \
     --schedule "$SCHEDULE" \
+    --direction "$DIRECTION" \
     --n-trajectories "$PROBE_TRAJ" \
     --n-thermalize "$PROBE_THERMALIZE" \
     --decorrelation-steps "$DECORR" \
