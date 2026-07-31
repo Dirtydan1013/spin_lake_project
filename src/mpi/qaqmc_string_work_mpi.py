@@ -132,7 +132,8 @@ def _aggregate_log_j(log_j: np.ndarray, direction: str) -> dict:
     n = int(log_j.size)
     finite = np.isfinite(log_j)
     if not np.any(finite):
-        return dict(o_c=0.0, log_o_c=-math.inf, n_eff=0.0, p_max=0.0,
+        return dict(o_c=0.0, log_o_c=-math.inf, log_o_c_sem_boot=math.inf,
+                    n_eff=0.0, p_max=0.0,
                     zero_weight_fraction=1.0, n_trajectories=n)
     max_log = float(log_j[finite].max())
     weights = np.zeros(n, dtype=np.float64)
@@ -141,8 +142,17 @@ def _aggregate_log_j(log_j: np.ndarray, direction: str) -> dict:
     log_mean_j = max_log + math.log(sum_w / n)
     log_o_c = log_mean_j if direction == "forward" else -log_mean_j
     p = weights / sum_w
+    # Bootstrap sem of log O_C (fixed rng: reproducible; needed to give the
+    # drag-composed curve an anchor error bar).
+    rng = np.random.default_rng(0)
+    boot = np.empty(200, dtype=np.float64)
+    for b in range(boot.size):
+        pick = rng.choice(log_j, n)  # zero-weight samples resample too
+        pmax = pick[np.isfinite(pick)].max() if np.any(np.isfinite(pick)) else 0.0
+        boot[b] = pmax + math.log(max(np.mean(np.exp(pick - pmax)), 1e-300))
     return dict(
         o_c=math.exp(log_o_c), log_o_c=log_o_c,
+        log_o_c_sem_boot=float(boot.std(ddof=1)),
         n_eff=1.0 / float(np.sum(p ** 2)), p_max=float(p.max()),
         zero_weight_fraction=float(np.count_nonzero(~finite)) / max(n, 1),
         n_trajectories=n,
@@ -170,6 +180,15 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         permute_site_labels: bool = True,
                         backend: str = "cpu",
                         resume: bool = False,
+                        drag_grid: list[int] | None = None,
+                        drag_mirror: bool = True,
+                        drag_samples_per_rung: int = 400,
+                        drag_sweeps_between_samples: int = 1,
+                        drag_burn_per_rung: int = 5,
+                        drag_slots_per_rung: int = 1,
+                        drag_repeats: int = 1,
+                        drag_thermalize: int = -1,
+                        drag_equil_at_anchor: int = 100,
                         verbose: bool = True) -> dict | None:
     """config_in: warm-start directory of rank{r}.h5 final configurations from
     a previous run with the same (N, M, Hamiltonian); when given, per-K
@@ -195,6 +214,15 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         raise ValueError("K_values must contain positive integers")
     if resume and backend != "cuda":
         raise ValueError("exact trajectory resume is supported only by backend='cuda'")
+    if drag_grid:
+        if backend != "cpu":
+            raise ValueError("the drag-ladder phase is CPU-only")
+        if drag_samples_per_rung < 2 or drag_repeats < 1 or drag_slots_per_rung < 1:
+            raise ValueError("drag_samples_per_rung >= 2, drag_repeats >= 1, "
+                             "drag_slots_per_rung >= 1 required")
+        if drag_mirror and m_star is not None and int(m_star) != int(M):
+            raise ValueError("drag_mirror requires the anchor at the symmetric "
+                             "point m_star = M")
     if resume and (checkpoint_every_trajectories <= 0 or not checkpoint_dir):
         raise ValueError("resume requires checkpoint_every_trajectories and checkpoint_dir")
     engine_type, cosine_schedule = _engine_type_and_schedule_for_backend(backend)
@@ -438,6 +466,119 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                       f"zero_frac={agg['zero_weight_fraction']:.1%} "
                       f"elapsed={t_elapsed:.1f}s", flush=True)
 
+    # ── Drag-ladder phase: whole-curve O_C(delta) from the last K's engine ──
+    # (docs/design/seam_drag_curve.md).  Each rank runs drag_repeats
+    # independent mirrored (or left-only) RB-ladder passes on its own chain;
+    # rank 0 aggregates pass-level log_r rows (scatter SEM across passes) and
+    # composes O_C(delta) = O_C(anchor; K) * exp(log_r) per K.
+    drag_payload = None
+    if drag_grid:
+        grid = np.asarray(sorted({int(m) for m in drag_grid}, reverse=True),
+                          dtype=np.int64)
+        anchor_m = int(M if m_star is None else m_star)
+        n_therm_drag = int(n_thermalize if drag_thermalize < 0 else drag_thermalize)
+        comm.Barrier()
+        t0 = time.perf_counter()
+        # Full-mask sector equilibrium at the anchor (the lambda phase left
+        # the chain in its trajectory end sector).
+        run_equil_with_progress(
+            lambda n: eng.thermalize(n, direction="reverse"),
+            n_therm_drag, label="MPI-STRWORK drag",
+            rank=rank, print_every=equil_progress_every, verbose=verbose)
+
+        drag_run_attrs = dict(
+            checkpoint_schema=1, phase="drag", seed=rank_seed,
+            n_ranks=int(n_ranks), N=int(N), M_total=int(2 * M),
+            m_anchor=int(anchor_m), mirror=bool(drag_mirror),
+            m_grid=np.asarray(grid, dtype=np.int64),
+            samples_per_rung=int(drag_samples_per_rung),
+            sweeps_between_samples=int(drag_sweeps_between_samples),
+            burn_per_rung=int(drag_burn_per_rung),
+            slots_per_rung=int(drag_slots_per_rung),
+            repeats=int(drag_repeats),
+            string_sites=np.asarray(list(string_sites), dtype=np.int32),
+        )
+        kw = dict(n_samples_per_rung=drag_samples_per_rung,
+                  n_sweeps_between_samples=drag_sweeps_between_samples,
+                  n_burn_per_rung=drag_burn_per_rung,
+                  slots_per_rung=drag_slots_per_rung,
+                  n_equil_at_anchor=drag_equil_at_anchor)
+
+        def _one_pass():
+            if drag_mirror:
+                res = eng.run_drag_curve_mirrored(grid, **kw)
+                return dict(log_r=np.asarray(res.log_r_mirror),
+                            log_r_sem=np.asarray(res.log_r_sem),
+                            log_r_left=np.asarray(res.left.log_r),
+                            log_r_right=np.asarray(res.right.log_r))
+            res = eng.run_drag_ladder(grid, m_anchor=anchor_m, **kw)
+            return dict(log_r=np.asarray(res.log_r),
+                        log_r_sem=np.asarray(res.log_r_sem))
+
+        rows = []
+        drag_dir = (os.path.join(checkpoint_dir, "drag")
+                    if (checkpoint_dir and checkpoint_every_trajectories > 0)
+                    else None)
+        if drag_dir:
+            with RankChunkWriter(drag_dir, rank, run_attrs=drag_run_attrs) as w:
+                for rep in range(drag_repeats):
+                    row = _one_pass()
+                    rows.append(row)
+                    w.write_chunk(rep, datasets=row, attrs=dict(rep=int(rep)))
+                    if rank == 0 and verbose:
+                        print(f"[MPI-STRWORK] drag rank0 pass {rep + 1}/"
+                              f"{drag_repeats} written", flush=True)
+        else:
+            for rep in range(drag_repeats):
+                rows.append(_one_pass())
+
+        all_rows = comm.gather(rows, root=0)
+        t_drag = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
+        if rank == 0:
+            flat = [row for rr in all_rows for row in rr]
+            mat = np.stack([r["log_r"] for r in flat])          # (P, n_grid)
+            within = np.stack([r["log_r_sem"] for r in flat])   # (P, n_grid)
+            n_passes = mat.shape[0]
+            log_r_mean = mat.mean(axis=0)
+            sem_within = np.sqrt((within ** 2).mean(axis=0) / n_passes)
+            sem_scatter = (mat.std(axis=0, ddof=1) / math.sqrt(n_passes)
+                           if n_passes > 1 else sem_within)
+            deltas = delta_min + (delta_max - delta_min) * grid / float(M)
+            drag_payload = dict(
+                m_grid=grid, deltas=deltas, m_anchor=anchor_m,
+                mirror=bool(drag_mirror), n_passes=int(n_passes),
+                samples_per_rung=int(drag_samples_per_rung),
+                sweeps_between_samples=int(drag_sweeps_between_samples),
+                burn_per_rung=int(drag_burn_per_rung),
+                slots_per_rung=int(drag_slots_per_rung),
+                thermalize=int(n_therm_drag), elapsed=float(t_drag),
+                log_r_passes=mat, log_r_sem_passes=within,
+                log_r_mean=log_r_mean,
+                log_r_sem=np.maximum(sem_scatter, sem_within),
+                curves={},
+            )
+            if drag_mirror:
+                drag_payload["log_r_left_passes"] = np.stack(
+                    [r["log_r_left"] for r in flat])
+                drag_payload["log_r_right_passes"] = np.stack(
+                    [r["log_r_right"] for r in flat])
+            for K, res_k in results.items():
+                log_o = res_k["log_o_c"] + log_r_mean
+                sem_o = np.sqrt(res_k["log_o_c_sem_boot"] ** 2
+                                + drag_payload["log_r_sem"] ** 2)
+                drag_payload["curves"][int(K)] = dict(
+                    log_o_curve=log_o, o_curve=np.exp(log_o),
+                    log_o_curve_sem=sem_o)
+            if verbose:
+                print(f"[MPI-STRWORK] drag: {n_passes} passes x "
+                      f"{grid.size} points (mirror={drag_mirror}, "
+                      f"spr={drag_slots_per_rung}) elapsed={t_drag:.1f}s",
+                      flush=True)
+                for j in range(grid.size):
+                    print(f"[MPI-STRWORK]   delta={deltas[j]:+.3f} (m={grid[j]}): "
+                          f"log r={log_r_mean[j]:+.4f} ± "
+                          f"{drag_payload['log_r_sem'][j]:.4f}", flush=True)
+
     if rank != 0:
         return None
 
@@ -458,11 +599,11 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             string_sites=np.asarray(list(string_sites), dtype=np.int32),
             m_star=(-1 if m_star is None else int(m_star)),
             schedule=str(schedule), direction=str(direction),
-            K_values=K_values, results=results,
+            K_values=K_values, results=results, drag=drag_payload,
         ))
         if verbose:
             print(f"[MPI-STRWORK] saved HDF5 → {filepath}", flush=True)
-    return {"K_results": results}
+    return {"K_results": results, "drag": drag_payload}
 
 
 def _save_hdf5(path: str, payload: dict) -> None:
@@ -487,11 +628,28 @@ def _save_hdf5(path: str, payload: dict) -> None:
         rg = f.create_group("K_results")
         for K, res in payload["results"].items():
             sg = rg.create_group(f"K{int(K)}")
-            for key in ("o_c", "log_o_c", "n_eff", "p_max",
+            for key in ("o_c", "log_o_c", "log_o_c_sem_boot", "n_eff", "p_max",
                         "zero_weight_fraction", "n_trajectories", "elapsed"):
                 sg.attrs[key] = res[key]
             sg.create_dataset("log_j_samples", data=res["log_j_samples"],
                               compression="gzip")
+        drag = payload.get("drag")
+        if drag is not None:
+            dg = f.create_group("drag")
+            for key in ("m_anchor", "mirror", "n_passes", "samples_per_rung",
+                        "sweeps_between_samples", "burn_per_rung",
+                        "slots_per_rung", "thermalize", "elapsed"):
+                dg.attrs[key] = drag[key]
+            for key in ("m_grid", "deltas", "log_r_passes", "log_r_sem_passes",
+                        "log_r_mean", "log_r_sem",
+                        "log_r_left_passes", "log_r_right_passes"):
+                if key in drag:
+                    dg.create_dataset(key, data=np.asarray(drag[key]))
+            cg = dg.create_group("curves")
+            for K, cur in drag["curves"].items():
+                kg = cg.create_group(f"K{int(K)}")
+                for key in ("log_o_curve", "o_curve", "log_o_curve_sem"):
+                    kg.create_dataset(key, data=np.asarray(cur[key]))
 
 
 def _parse_int_list(text: str) -> list[int]:
@@ -562,6 +720,33 @@ def main():
     parser.add_argument("--config-out", type=str, default=None,
                         help="where to save final configurations "
                              "(default: <filepath minus .h5>_configs)")
+    # ── Drag-ladder phase (whole-curve O_C(delta); docs/design/seam_drag_curve.md)
+    parser.add_argument("--drag-deltas", type=str, default=None,
+                        help="comma-separated delta values at which to record the "
+                             "drag curve (converted to forward-branch slots "
+                             "m = round(M*(delta-delta_min)/span), clipped to "
+                             "[1, M-1]); enables the drag phase")
+    parser.add_argument("--drag-grid", type=str, default=None,
+                        help="explicit comma-separated forward-branch record slots "
+                             "(alternative to --drag-deltas)")
+    parser.add_argument("--drag-mirror",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="mirror-average the two branches about m=M "
+                             "(odd-in-v removal; requires the default m_star)")
+    parser.add_argument("--drag-samples-per-rung", type=int, default=400)
+    parser.add_argument("--drag-sweeps-between-samples", type=int, default=1)
+    parser.add_argument("--drag-burn-per-rung", type=int, default=5)
+    parser.add_argument("--drag-slots-per-rung", type=int, default=1,
+                        help="slots per RB rung; raise until the rung log-sd is "
+                             "~0.3 (cost scales as 1/slots_per_rung at fixed "
+                             "statistical error)")
+    parser.add_argument("--drag-repeats", type=int, default=1,
+                        help="independent ladder passes per rank (scatter over "
+                             "ranks x repeats gives the curve error bar)")
+    parser.add_argument("--drag-thermalize", type=int, default=-1,
+                        help="reverse-sector thermalization before the drag phase "
+                             "(-1 = reuse --n-thermalize)")
+    parser.add_argument("--drag-equil-at-anchor", type=int, default=100)
     parser.add_argument("--permute-site-labels",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="per-rank random site-label permutation (identical "
@@ -605,6 +790,23 @@ def main():
             raise ValueError("--checkpoint-every-trajectories requires "
                              "--checkpoint-dir or --filepath")
 
+    drag_grid = None
+    if args.drag_deltas and args.drag_grid:
+        raise ValueError("give either --drag-deltas or --drag-grid, not both")
+    if args.drag_deltas:
+        span = args.delta_max - args.delta_min
+        drag_grid = sorted(
+            {min(max(int(round(args.M * (float(tok) - args.delta_min) / span)), 1),
+                 args.M - 1)
+             for tok in args.drag_deltas.replace(";", ",").split(",") if tok.strip()},
+            reverse=True)
+    elif args.drag_grid:
+        drag_grid = sorted({int(t) for t in _parse_int_list(args.drag_grid)},
+                           reverse=True)
+        if any(m < 1 or m >= args.M for m in drag_grid):
+            raise ValueError("--drag-grid slots must lie in [1, M-1] "
+                             "(forward branch)")
+
     run_string_work_mpi(
         N=N, M=args.M, Omega=args.Omega, Rb=args.Rb,
         delta_min=args.delta_min, delta_max=args.delta_max,
@@ -631,6 +833,15 @@ def main():
         permute_site_labels=args.permute_site_labels,
         backend=args.backend,
         resume=args.resume,
+        drag_grid=drag_grid,
+        drag_mirror=args.drag_mirror,
+        drag_samples_per_rung=args.drag_samples_per_rung,
+        drag_sweeps_between_samples=args.drag_sweeps_between_samples,
+        drag_burn_per_rung=args.drag_burn_per_rung,
+        drag_slots_per_rung=args.drag_slots_per_rung,
+        drag_repeats=args.drag_repeats,
+        drag_thermalize=args.drag_thermalize,
+        drag_equil_at_anchor=args.drag_equil_at_anchor,
     )
 
 

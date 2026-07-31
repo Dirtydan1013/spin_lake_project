@@ -77,6 +77,23 @@ CONFIG_OUT=${CONFIG_OUT:-""}
 # restores pre-2026-07 fixed-seed trajectories.
 PERMUTE_SITES=${PERMUTE_SITES:-1}
 
+# ── Drag-ladder phase (whole-curve O_C(delta); docs/design/seam_drag_curve.md)
+# DRAG_DELTAS non-empty enables the phase after the lambda-anchor: the RB
+# ladder drags the seam cut along the ramp and records log[Z_X(m)/Z_X(M)] at
+# each delta; the driver composes O_C(delta) = O_C(anchor;K) x ratio per K.
+# DRAG_SPR = slots per RB rung — bigger cuts rung count, but beyond the
+# worldline correlation crossover the rung log-sd grows ~linearly and
+# efficiency drops again: keep the rung log-sd <~0.3 (kagome 4x4/M=4096
+# calibration → 64; re-probe per geometry/M, design doc SS7).
+DRAG_DELTAS=${DRAG_DELTAS:-""}          # e.g. "5.0,4.5,4.25,4.0,3.5,3.0"
+DRAG_MIRROR=${DRAG_MIRROR:-1}           # mirror-average the two branches
+DRAG_SAMPLES=${DRAG_SAMPLES:-400}       # equilibrium samples per rung
+DRAG_SWEEPS=${DRAG_SWEEPS:-1}           # mc_steps between rung samples
+DRAG_BURN=${DRAG_BURN:-5}               # mc_steps after each rung move
+DRAG_SPR=${DRAG_SPR:-64}               # slots per rung
+DRAG_REPEATS=${DRAG_REPEATS:-1}         # independent ladder passes per rank
+DRAG_THERMALIZE=${DRAG_THERMALIZE:--1}  # reverse-sector equil (-1 = N_THERMALIZE)
+
 # String selection.  Either give explicit site indices via STRING_SITES
 # ("s0,s1,..."), or set STRING_SIZE to auto-pick the most central size-s
 # C_m string copy on the (kagome_bond) lattice.
@@ -116,6 +133,10 @@ echo "Geometry: $LATTICE ${NX}x${NY}, a=$A_LAT; string sites: $STRING_SITES"
 echo "QAQMC: M=$M, delta=[$DELTA_MIN,$DELTA_MAX], Rb=$RB, groups=$DELTA_GROUPS"
 echo "Protocol: K=$K_VALUES ($SCHEDULE, $DIRECTION), n_traj=$N_TRAJ, "
 echo "          thermalize=$N_THERMALIZE, decorr=$DECORR, ckpt every $CKPT_TRAJ traj"
+if [ -n "$DRAG_DELTAS" ]; then
+    echo "Drag:     deltas=$DRAG_DELTAS, mirror=$DRAG_MIRROR, spr=$DRAG_SPR, "
+    echo "          samples/rung=$DRAG_SAMPLES (sweeps=$DRAG_SWEEPS, burn=$DRAG_BURN), repeats/rank=$DRAG_REPEATS"
+fi
 echo "Output: $FILEPATH"
 echo
 
@@ -144,6 +165,14 @@ $MPIEXEC \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"} \
     ${CONFIG_OUT:+--config-out "$CONFIG_OUT"} \
     $( [ "$PERMUTE_SITES" = "1" ] || printf %s --no-permute-site-labels ) \
+    ${DRAG_DELTAS:+--drag-deltas "$DRAG_DELTAS"} \
+    ${DRAG_DELTAS:+--drag-samples-per-rung "$DRAG_SAMPLES"} \
+    ${DRAG_DELTAS:+--drag-sweeps-between-samples "$DRAG_SWEEPS"} \
+    ${DRAG_DELTAS:+--drag-burn-per-rung "$DRAG_BURN"} \
+    ${DRAG_DELTAS:+--drag-slots-per-rung "$DRAG_SPR"} \
+    ${DRAG_DELTAS:+--drag-repeats "$DRAG_REPEATS"} \
+    ${DRAG_DELTAS:+--drag-thermalize "$DRAG_THERMALIZE"} \
+    $( [ -n "$DRAG_DELTAS" ] && [ "$DRAG_MIRROR" != "1" ] && printf %s --no-drag-mirror ) \
     --filepath "$FILEPATH"
 
 echo

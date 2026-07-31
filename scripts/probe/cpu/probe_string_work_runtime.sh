@@ -46,6 +46,18 @@ TARGET_N_TRAJ=${TARGET_N_TRAJ:-4000}
 TARGET_THERMALIZE=${TARGET_THERMALIZE:-5000}
 DECORR=${DECORR:-100}
 
+# Drag-ladder phase target (empty DRAG_DELTAS = phase disabled, both in the
+# probe and in the production estimate).  The probe runs the drag over the
+# FULL target grid/spr with only PROBE_DRAG_SAMPLES samples/rung, so the
+# production drag time is the measured drag time x DRAG_SAMPLES/
+# PROBE_DRAG_SAMPLES x DRAG_REPEATS (rung count identical by construction).
+DRAG_DELTAS=${DRAG_DELTAS:-""}
+DRAG_SPR=${DRAG_SPR:-64}
+DRAG_SAMPLES=${DRAG_SAMPLES:-400}
+DRAG_SWEEPS=${DRAG_SWEEPS:-1}
+DRAG_REPEATS=${DRAG_REPEATS:-1}
+PROBE_DRAG_SAMPLES=${PROBE_DRAG_SAMPLES:-4}
+
 # Probe scale: a couple of trajectories per rank + a short thermalize.
 PROBE_TRAJ_PER_RANK=${PROBE_TRAJ_PER_RANK:-2}
 PROBE_THERMALIZE=${PROBE_THERMALIZE:-50}
@@ -78,7 +90,14 @@ echo "Node: $NODE_DESC, ranks=$NTASKS"
 echo "Geometry: $LATTICE ${NX}x${NY}, M=$M, K=$K ($SCHEDULE), string sites: $STRING_SITES"
 echo "Probe: $PROBE_TRAJ trajectories total ($PROBE_TRAJ_PER_RANK/rank), thermalize=$PROBE_THERMALIZE"
 echo "Estimating production: n_traj=$TARGET_N_TRAJ, thermalize=$TARGET_THERMALIZE"
+if [ -n "$DRAG_DELTAS" ]; then
+    echo "Drag probe: deltas=$DRAG_DELTAS spr=$DRAG_SPR, $PROBE_DRAG_SAMPLES samples/rung "
+    echo "            (target $DRAG_SAMPLES/rung x $DRAG_REPEATS repeats/rank)"
+fi
 echo
+
+PROBE_LOG=$(mktemp)
+trap 'rm -f "$PROBE_LOG"' EXIT
 
 T0=$(date +%s.%N)
 # $MPIEXEC (from env.sh) = mpiexec + core binding + -n $NTASKS
@@ -97,23 +116,47 @@ $MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     --n-trajectories "$PROBE_TRAJ" \
     --n-thermalize "$PROBE_THERMALIZE" \
     --decorrelation-steps "$DECORR" \
-    --seed 7
+    ${DRAG_DELTAS:+--drag-deltas "$DRAG_DELTAS"} \
+    ${DRAG_DELTAS:+--drag-slots-per-rung "$DRAG_SPR"} \
+    ${DRAG_DELTAS:+--drag-samples-per-rung "$PROBE_DRAG_SAMPLES"} \
+    ${DRAG_DELTAS:+--drag-sweeps-between-samples "$DRAG_SWEEPS"} \
+    ${DRAG_DELTAS:+--drag-repeats 1} \
+    ${DRAG_DELTAS:+--drag-thermalize "$PROBE_THERMALIZE"} \
+    --seed 7 2>&1 | tee "$PROBE_LOG"
 T1=$(date +%s.%N)
 
 python - <<PY
+import re
 probe_elapsed = $T1 - $T0
 probe_traj_per_rank = $PROBE_TRAJ_PER_RANK
 target_per_rank = ($TARGET_N_TRAJ + $NTASKS - 1) // $NTASKS
+
+# Parse the driver's own phase timings from the tee'd log.
+log = open("$PROBE_LOG").read()
+drag_m = re.search(r"drag: .* elapsed=([0-9.]+)s", log)
+drag_probe = float(drag_m.group(1)) if drag_m else 0.0
+lam_probe = probe_elapsed - drag_probe
+
 # Rough split: engine init + thermalize is a fixed overhead; per-trajectory
 # cost scales linearly.  The K-line "elapsed=" in the log gives the pure
-# sampling time; here we scale the whole probe conservatively.
-per_traj = probe_elapsed / max(probe_traj_per_rank, 1)
-est = per_traj * target_per_rank + ($TARGET_THERMALIZE - $PROBE_THERMALIZE) * 0.0
-print(f"probe wall = {probe_elapsed:.1f}s for {probe_traj_per_rank} traj/rank "
-      f"(includes init+thermalize {$PROBE_THERMALIZE} steps)")
-print(f"UPPER-BOUND production estimate ≈ {per_traj:.1f}s/traj × {target_per_rank} traj/rank "
-      f"= {per_traj * target_per_rank / 3600:.2f} h  (plus thermalize scaling)")
+# sampling time; here we scale the whole lambda part conservatively.
+per_traj = lam_probe / max(probe_traj_per_rank, 1)
+lam_est = per_traj * target_per_rank
+print(f"probe wall = {probe_elapsed:.1f}s "
+      f"(lambda part {lam_probe:.1f}s for {probe_traj_per_rank} traj/rank, "
+      f"includes init+thermalize {$PROBE_THERMALIZE} steps)")
+print(f"UPPER-BOUND lambda-anchor estimate ≈ {per_traj:.1f}s/traj × "
+      f"{target_per_rank} traj/rank = {lam_est / 3600:.2f} h")
+drag_est = 0.0
+if drag_probe > 0.0:
+    # Rung count is identical between probe and production (same grid/spr);
+    # only samples/rung and repeats scale.
+    scale = ($DRAG_SAMPLES / $PROBE_DRAG_SAMPLES) * $DRAG_REPEATS
+    drag_est = drag_probe * scale
+    print(f"drag probe = {drag_probe:.1f}s at $PROBE_DRAG_SAMPLES samples/rung → "
+          f"production drag ≈ ×{scale:.0f} = {drag_est / 3600:.2f} h "
+          f"($DRAG_SAMPLES samples/rung × $DRAG_REPEATS repeats/rank)")
 from src.probes import costreport
-costreport.report(per_traj * target_per_rank, $NTASKS, $CPT)
-print("For a tighter estimate use the per-K 'elapsed=' line printed by the driver.")
+costreport.report(lam_est + drag_est, $NTASKS, $CPT)
+print("For a tighter estimate use the per-K 'elapsed=' / 'drag:' lines printed by the driver.")
 PY
