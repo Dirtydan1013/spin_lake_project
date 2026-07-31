@@ -57,6 +57,57 @@ class StringWorkTrajectoryResult:
 
 
 @dataclass
+class StringDragRunResult:
+    """Per-grid-point Jarzynski estimates of Z_X(m) / Z_X(m_anchor)."""
+    m_anchor: int
+    m_grid: np.ndarray            # (n_grid,) cut positions, in protocol order
+    log_r: np.ndarray             # (n_grid,) log of the Jarzynski mean
+    r: np.ndarray                 # (n_grid,) exp(log_r)
+    n_eff: np.ndarray             # (n_grid,) effective sample size
+    p_max: np.ndarray             # (n_grid,) largest normalized weight
+    zero_weight_fraction: np.ndarray  # (n_grid,)
+    n_trajectories: int
+    log_j_samples: np.ndarray     # (n_trajectories, n_grid) raw accumulated work
+
+
+@dataclass
+class StringDragLadderResult:
+    """Rao-Blackwellized ladder estimates of Z_X(m) / Z_X(m_anchor)."""
+    m_anchor: int
+    m_grid: np.ndarray        # (n_grid,) record points, in protocol order
+    log_r: np.ndarray         # (n_grid,) accumulated log ratio at each record point
+    log_r_sem: np.ndarray     # (n_grid,) propagated per-rung SEM (quadrature)
+    r: np.ndarray             # (n_grid,) exp(log_r)
+    rung_m: np.ndarray        # (n_rungs,) target cut of each single-slot rung
+    rung_log: np.ndarray      # (n_rungs,) log of each rung's mean RB ratio
+    rung_sem: np.ndarray      # (n_rungs,) SEM of log rung ratio
+    n_samples_per_rung: int
+
+
+@dataclass
+class StringDragMirroredResult:
+    """Mirror-averaged drag curve: geometric mean of the two branches.
+
+    The palindromic operator sequence satisfies Z_X(m; v) ~= Z_X(2M - m; -v)
+    (exact up to a one-slot schedule shift), so averaging the two branches at
+    the same delta (log-space mean == geo mean) cancels the odd-in-v part.
+    Empirically (ED M-scaling, docs/design/seam_drag_curve.md SS6) the
+    single-branch lag is ALREADY nearly even in v -- the mirror average does
+    not change the ~v^2 convergence order, but it removes the residual odd
+    component and the single-branch zero-crossing artifacts, yielding a
+    clean monotone 1/M^2 tail that is safe to Richardson-extrapolate to the
+    ground-state limit.
+    """
+    m_forward: np.ndarray     # (n_grid,) forward-branch cut positions (< M)
+    m_mirror: np.ndarray      # (n_grid,) 2M - m_forward (same delta)
+    log_r_mirror: np.ndarray  # (n_grid,) (log_r_L + log_r_R) / 2
+    log_r_sem: np.ndarray     # (n_grid,) quadrature/2 of the branch sems
+    r_mirror: np.ndarray      # exp(log_r_mirror) = Z-ratio geo mean
+    left: "StringDragLadderResult"
+    right: "StringDragLadderResult"
+
+
+@dataclass
 class StringWorkRunResult:
     o_c: float                  # estimate of Z_C / Z_empty
     log_o_c: float
@@ -246,6 +297,265 @@ class QAQMCStringWorkRydberg:
             n_eff=n_eff, p_max=p_max,
             zero_weight_fraction=zero_count / n_trajectories,
             log_j_samples=log_j_samples,
+        )
+
+
+    # ── Seam-drag trajectories (cut-position Jarzynski) ──────────────────
+    # docs/design/seam_drag_curve.md: the driven parameter is the cut
+    # position m, not the seam strength lambda. Every grid point along one
+    # trajectory yields a work sample, so a single family of trajectories
+    # estimates the whole curve Z_X(m)/Z_X(m_anchor); combined with the
+    # existing run_trajectories() anchor at m_anchor this gives O_C(m) for
+    # all m in the grid.
+
+    def _validate_drag_grid(self, m_grid) -> np.ndarray:
+        m_grid = np.asarray(m_grid, dtype=np.int64)
+        if m_grid.ndim != 1 or m_grid.size < 1:
+            raise ValueError("m_grid must be a non-empty 1D array of cut positions")
+        if np.any(m_grid < 0) or np.any(m_grid >= self.M_total):
+            raise ValueError(f"m_grid entries must lie in [0, {self.M_total - 1}]")
+        diffs = np.diff(m_grid)
+        if not (np.all(diffs > 0) or np.all(diffs < 0)):
+            raise ValueError("m_grid must be strictly monotonic (one drag direction "
+                             "per trajectory family; run the other side separately)")
+        return m_grid
+
+    def run_drag_trajectory(self, m_grid: np.ndarray,
+                            n_qaqmc_sweeps_per_shift: int = 1,
+                            slots_per_block: int = 1) -> np.ndarray:
+        """One drag trajectory from the CURRENT (equilibrated) cut position.
+
+        The protocol moves the cut in switch blocks of ``slots_per_block``
+        slots, relaxing with ``n_qaqmc_sweeps_per_shift`` mc_steps between
+        blocks; ``m_grid`` is only the set of RECORD points (accumulated
+        log-work is snapshotted whenever the cut passes a grid entry).
+        Protocol speed = block size / relaxation, NOT the grid spacing --
+        a whole grid gap in one block is a fast quench (wide work
+        distribution, collapsing n_eff), so keep slots_per_block small.
+        A zero-weight crossing makes that and all later entries -inf
+        (exact-zero sample). Returns (n_grid,) accumulated log-work.
+        """
+        m_grid = self._validate_drag_grid(m_grid)
+        if slots_per_block < 1:
+            raise ValueError("slots_per_block must be >= 1")
+        log_j = 0.0
+        out = np.empty(m_grid.size, dtype=np.float64)
+        m_curr = int(self._eng.m_star)
+        for j, m in enumerate(m_grid):
+            m = int(m)
+            step = 1 if m > m_curr else -1
+            while m_curr != m:
+                m_next = m_curr + step * min(slots_per_block, abs(m - m_curr))
+                log_j += self._eng.seam_drag_to(m_next)
+                m_curr = m_next
+                if m_curr != m or j + 1 < m_grid.size:
+                    for _ in range(n_qaqmc_sweeps_per_shift):
+                        self._eng.mc_step()
+            out[j] = log_j
+        return out
+
+    def run_drag_trajectories(self, m_grid: np.ndarray, n_trajectories: int,
+                              decorrelation_steps: int = 100,
+                              n_qaqmc_sweeps_per_shift: int = 1,
+                              slots_per_block: int = 1,
+                              m_anchor: int | None = None) -> StringDragRunResult:
+        """Family of drag trajectories anchored at ``m_anchor`` (default: the
+        m_star at call time -- pass it explicitly when a previous family left
+        the cut parked at its far end).
+
+        Each trajectory re-anchors the cut at ``m_anchor`` via
+        ``seam_set_position`` -- the configuration left at the
+        far end of the previous trajectory is a sample of the wrong ensemble,
+        so ``decorrelation_steps`` mc_steps re-equilibrate before dragging
+        (same contract as the lambda-protocol's set_seam_mask_consistent
+        reset). The seam mask is never touched: dragging preserves worldline
+        closure by construction.
+        """
+        m_grid = self._validate_drag_grid(m_grid)
+        if m_anchor is None:
+            m_anchor = int(self._eng.m_star)
+        m_anchor = int(m_anchor)
+        if m_anchor < 0:
+            raise RuntimeError("call set_string_sites() first")
+        if not (0 <= m_anchor < self.M_total):
+            raise ValueError(f"m_anchor must lie in [0, {self.M_total - 1}]")
+
+        n_grid = m_grid.size
+        log_j_samples = np.empty((n_trajectories, n_grid), dtype=np.float64)
+        for r in range(n_trajectories):
+            self._eng.seam_set_position(m_anchor)
+            for _ in range(decorrelation_steps):
+                self._eng.mc_step()
+            log_j_samples[r] = self.run_drag_trajectory(
+                m_grid, n_qaqmc_sweeps_per_shift=n_qaqmc_sweeps_per_shift,
+                slots_per_block=slots_per_block)
+
+        log_r = np.empty(n_grid, dtype=np.float64)
+        n_eff = np.zeros(n_grid, dtype=np.float64)
+        p_max = np.zeros(n_grid, dtype=np.float64)
+        zero_frac = np.empty(n_grid, dtype=np.float64)
+        for j in range(n_grid):
+            col = log_j_samples[:, j]
+            finite = np.isfinite(col)
+            zero_frac[j] = 1.0 - finite.mean()
+            if not np.any(finite):
+                log_r[j] = -math.inf
+                continue
+            max_log = col[finite].max()
+            weights = np.zeros(n_trajectories, dtype=np.float64)
+            weights[finite] = np.exp(col[finite] - max_log)
+            sum_w = weights.sum()
+            log_r[j] = max_log + math.log(sum_w / n_trajectories)
+            p = weights / sum_w
+            n_eff[j] = 1.0 / float(np.sum(p ** 2))
+            p_max[j] = float(p.max())
+
+        return StringDragRunResult(
+            m_anchor=m_anchor, m_grid=m_grid,
+            log_r=log_r, r=np.exp(log_r),
+            n_eff=n_eff, p_max=p_max, zero_weight_fraction=zero_frac,
+            n_trajectories=n_trajectories, log_j_samples=log_j_samples,
+        )
+
+
+    def run_drag_ladder(self, m_grid: np.ndarray, n_samples_per_rung: int = 400,
+                        n_sweeps_between_samples: int = 1,
+                        n_burn_per_rung: int = 5,
+                        n_equil_at_anchor: int = 0,
+                        slots_per_rung: int = 1,
+                        m_anchor: int | None = None) -> StringDragLadderResult:
+        """RB ladder for the drag curve -- the recommended estimator.
+
+        Walks the cut from the anchor through ``m_grid`` (record points) in
+        rungs of ``slots_per_rung`` slots. Each rung m -> m' is an
+        EQUILIBRIUM estimate
+
+            Z_X(m')/Z_X(m) = E_{Z_X(m)}[ exp(seam_rb_log_ratio_to(m')) ]
+
+        (the block RB conditional factorizes exactly into per-slot Lambda
+        ratios). Raising ``slots_per_rung`` cuts the rung count -- what makes
+        production M ~ 1e5 feasible -- but the per-slot log contributions are
+        NOT independent along a block (imaginary-time correlations): beyond a
+        correlation crossover the rung log-sd grows ~linearly in the block
+        size and efficiency degrades again. Calibrate so the rung log-sd
+        stays <~0.3 (kagome 4x4/M=4096: ~64 slots; see the design doc SS7
+        and the probe script).
+
+        averaged over ``n_samples_per_rung`` samples separated by
+        ``n_sweeps_between_samples`` mc_steps; the RB conditional
+        (Lambda_tgt/Lambda_cur over the diagonal-op menu, see
+        docs/design/seam_drag_curve.md) keeps per-sample values O(1), unlike
+        the raw per-config ratio whose ~1/epsilon whales give the plain
+        Jarzynski drag a one-sided bias at reachable sample sizes
+        (run_drag_trajectories is kept as a bracketing diagnostic: forward /
+        inverted-reverse runs bracket the ladder answer). After each rung
+        the cut moves via ``seam_drag_to`` and ``n_burn_per_rung`` mc_steps
+        re-equilibrate at the new m. The caller must have equilibrated the
+        full-mask sector at the anchor (thermalize(direction="reverse"));
+        when the current configuration was left at a DIFFERENT cut (e.g. a
+        previous family parked it at its far end), pass ``n_equil_at_anchor``
+        > 0 to re-equilibrate after the re-anchor and before the first rung.
+
+        Error bars: per-rung SEM propagated in quadrature. Samples within a
+        rung are Markov-chain correlated -- increase
+        ``n_sweeps_between_samples`` until the quoted SEM is honest (the
+        rate-independence check in the vs-ED gate covers this).
+        """
+        m_grid = self._validate_drag_grid(m_grid)
+        if slots_per_rung < 1:
+            raise ValueError("slots_per_rung must be >= 1")
+        if m_anchor is None:
+            m_anchor = int(self._eng.m_star)
+        m_anchor = int(m_anchor)
+        if not (0 <= m_anchor < self.M_total):
+            raise ValueError(f"m_anchor must lie in [0, {self.M_total - 1}]")
+        self._eng.seam_set_position(m_anchor)
+        for _ in range(n_equil_at_anchor):
+            self._eng.mc_step()
+
+        n_grid = m_grid.size
+        log_r = np.empty(n_grid, dtype=np.float64)
+        log_r_var = np.empty(n_grid, dtype=np.float64)
+        rung_m, rung_log, rung_sem = [], [], []
+        log_cum, var_cum = 0.0, 0.0
+        m_curr = m_anchor
+        samples = np.empty(n_samples_per_rung, dtype=np.float64)
+        for j, m in enumerate(m_grid):
+            m = int(m)
+            step = 1 if m > m_curr else -1
+            while m_curr != m:
+                m_next = m_curr + step * min(slots_per_rung, abs(m - m_curr))
+                for s in range(n_samples_per_rung):
+                    samples[s] = math.exp(self._eng.seam_rb_log_ratio_to(m_next))
+                    for _ in range(n_sweeps_between_samples):
+                        self._eng.mc_step()
+                mean = float(samples.mean())
+                sem = float(samples.std(ddof=1)) / math.sqrt(n_samples_per_rung)
+                log_cum += math.log(mean)
+                var_cum += (sem / mean) ** 2
+                m_curr = m_next
+                rung_m.append(m_curr)
+                rung_log.append(math.log(mean))
+                rung_sem.append(sem / mean)
+                self._eng.seam_drag_to(m_curr)
+                for _ in range(n_burn_per_rung):
+                    self._eng.mc_step()
+            log_r[j] = log_cum
+            log_r_var[j] = var_cum
+        return StringDragLadderResult(
+            m_anchor=m_anchor, m_grid=m_grid,
+            log_r=log_r, log_r_sem=np.sqrt(log_r_var), r=np.exp(log_r),
+            rung_m=np.array(rung_m), rung_log=np.array(rung_log),
+            rung_sem=np.array(rung_sem),
+            n_samples_per_rung=n_samples_per_rung,
+        )
+
+
+    def run_drag_curve_mirrored(self, m_grid_forward: np.ndarray,
+                                n_samples_per_rung: int = 400,
+                                n_sweeps_between_samples: int = 1,
+                                n_burn_per_rung: int = 5,
+                                n_equil_at_anchor: int = 100,
+                                slots_per_rung: int = 1) -> StringDragMirroredResult:
+        """Mirror-averaged drag curve about the symmetric anchor m = M.
+
+        Runs the left family down ``m_grid_forward`` (strictly decreasing,
+        all < M) and the right family up the mirror grid ``2M - m`` (same
+        delta values), then geo-means the two branches per point -- even in
+        the sweep velocity by the palindrome's transpose symmetry. See the
+        class of caveats in StringDragMirroredResult: the win over a single
+        branch is odd-part removal and zero-crossing smoothing (clean ~1/M^2
+        tail for extrapolation), not a change of convergence order.
+        Estimator correctness is gated vs ED in
+        tests/engines/integration/test_qaqmc_string_drag_vs_ed.py; the
+        convergence systematics in docs/design/seam_drag_curve.md SS6.
+        The anchor sits at the symmetric point and is shared by both
+        families (its error is common-mode for the whole curve).
+
+        The caller must have equilibrated the full-mask sector at m = M;
+        ``n_equil_at_anchor`` re-equilibrates before each family (the second
+        family starts from a configuration parked at the first family's far
+        end, so this must be > 0 in any real run).
+        """
+        m_grid_forward = self._validate_drag_grid(m_grid_forward)
+        m_anchor = self.M
+        if np.any(m_grid_forward >= m_anchor) or np.any(np.diff(m_grid_forward) >= 0):
+            raise ValueError("m_grid_forward must be strictly decreasing and < M "
+                             "(the mirror pairs are m and 2M - m about the anchor M)")
+        kwargs = dict(n_samples_per_rung=n_samples_per_rung,
+                      n_sweeps_between_samples=n_sweeps_between_samples,
+                      n_burn_per_rung=n_burn_per_rung,
+                      n_equil_at_anchor=n_equil_at_anchor,
+                      slots_per_rung=slots_per_rung)
+        left = self.run_drag_ladder(m_grid_forward, m_anchor=m_anchor, **kwargs)
+        m_mirror = 2 * m_anchor - m_grid_forward
+        right = self.run_drag_ladder(m_mirror, m_anchor=m_anchor, **kwargs)
+        log_r_mirror = 0.5 * (left.log_r + right.log_r)
+        log_r_sem = 0.5 * np.sqrt(left.log_r_sem ** 2 + right.log_r_sem ** 2)
+        return StringDragMirroredResult(
+            m_forward=m_grid_forward, m_mirror=m_mirror,
+            log_r_mirror=log_r_mirror, log_r_sem=log_r_sem,
+            r_mirror=np.exp(log_r_mirror), left=left, right=right,
         )
 
 

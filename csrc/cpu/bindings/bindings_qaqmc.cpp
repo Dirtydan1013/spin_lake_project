@@ -226,6 +226,27 @@ void bind_qaqmc(py::module_& m) {
         .def("topology_sweep", &QAQMCEngine::topology_sweep, py::arg("lambda_"),
              "Random-permutation sweep: one attempt_string_toggle per string site")
 
+        // ── Off-diagonal string seam drag (cut-position Jarzynski) ─────────────
+        .def("seam_drag_to", &QAQMCEngine::seam_drag_to, py::arg("m_new"),
+             "Drag the seam cut to m_new and return the exact log[W_new/W_old] of the "
+             "current configuration (-inf on a zero-weight crossing). Updates m_star and "
+             "the seam snapshots; consumes no RNG; seam_mask unchanged.")
+        .def("seam_rung_rb_ratio", &QAQMCEngine::seam_rung_rb_ratio, py::arg("right"),
+             "Rao-Blackwellized single-rung drag ratio: E[W_target/W_current | state] for "
+             "crossing one slot right/left of the cut (1.0 on a flip slot, else "
+             "Lambda_tgt/Lambda_cur over the diagonal-op menu). Equilibrium average over "
+             "Z_X(m) samples = Z_X(m+-1)/Z_X(m), with bounded per-sample values. "
+             "Read-only; no RNG.")
+        .def("seam_rb_log_ratio_to", &QAQMCEngine::seam_rb_log_ratio_to, py::arg("m_new"),
+             "Block RB drag log-ratio: read-only sum of per-slot ln(Lambda_tgt/Lambda_cur) "
+             "over the diagonal slots between the current cut and m_new (flip slots "
+             "contribute no factor). E[exp(.)] over Z_X(m) equilibrium = Z_X(m_new)/Z_X(m). "
+             "Does not move the cut; no RNG.")
+        .def("seam_set_position", &QAQMCEngine::seam_set_position, py::arg("m_new"),
+             "Re-anchor the seam cut at m_new WITHOUT work accumulation (mask unchanged, "
+             "snapshots recomputed). The configuration is a sample of the old-m ensemble: "
+             "decorrelate before measuring.")
+
 // The remaining chained registrations are grouped by observable domain. They
 // intentionally remain in this translation unit so the py::class_ fluent
 // expression and its exact public API stay unchanged.

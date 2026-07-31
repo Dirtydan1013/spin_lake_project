@@ -201,6 +201,175 @@ void QAQMCOffDiagonalCore::commit_half_line_proposal(QAQMCEngine& eng, int local
     else                            state_at_seam_minus_[site] ^= 1;
 }
 
+double QAQMCOffDiagonalCore::seam_drag_to(const QAQMCEngine& eng, std::int64_t m_new) {
+    if (m_star_ < 0) {
+        throw std::runtime_error("seam_drag_to: no string configured (call set_string_sites first)");
+    }
+    if (m_new < 0 || m_new >= eng.M_total_) {
+        throw std::invalid_argument("seam_drag_to: m_new must satisfy 0 <= m_new < M_total");
+    }
+    // cluster_update() stales the snapshots and only diagonal_update()
+    // refreshes them; rebuild before walking (O(M), no RNG).
+    recompute_seam_snapshots(eng);
+    if (m_new == m_star_) return 0.0;
+
+    // Per-site seam flip: ratio != 1 only for bond ops touching a string
+    // site whose seam bit is ACTIVE (inactive bits leave n^+ == n^- there).
+    std::vector<int8_t> seam_flip(eng.N_, 0);
+    for (size_t k = 0; k < string_sites_.size(); ++k) {
+        if ((seam_mask_ >> k) & 1ULL) seam_flip[string_sites_[k]] = 1;
+    }
+
+    const int* bond_sites = eng.model_->vij.bond_sites_flat.data();
+    std::vector<int32_t>& nm = state_at_seam_minus_;  // walked in place
+
+    double ratio = 1.0;
+    int shift = 0;  // ratio_total = ratio * 1e100^shift
+    bool zero = false;
+    static const double LOG_1E100 = std::log(1e100);
+
+    // Accumulate w_target/w_current for the bond op at slot p, where nm must
+    // hold the state BEFORE slot p in the unflipped frame. num_is_unflipped:
+    // true when the op leaves the flipped (post-seam) frame -- a rightward
+    // crossing -- false when it enters it (leftward). The current frame's
+    // weight is the sampled configuration's own and is strictly positive;
+    // the target frame's can be zero (exact-zero trajectory).
+    auto bond_ratio = [&](qaqmc_slot_t p, bool num_is_unflipped) {
+        const int b = eng.op_site_at(p);
+        const int si = bond_sites[b * 2 + 0];
+        const int sj = bond_sites[b * 2 + 1];
+        const int fi = seam_flip[si], fj = seam_flip[sj];
+        if (!(fi | fj) || zero) return;
+        const double delta = eng.delta_at(p);
+        const double di = delta * eng.model_->vij.inv_coord[si];
+        const double dj = delta * eng.model_->vij.inv_coord[sj];
+        double W[4], wmax;
+        QAQMCEngine::compute_bond_W_inline(di, dj, eng.model_->vij.vij_list[b],
+                                           eng.epsilon_, W, wmax);
+        const int ni = nm[si], nj = nm[sj];
+        const double w_minus = W[ni * 2 + nj];                // unflipped frame
+        const double w_plus  = W[(ni ^ fi) * 2 + (nj ^ fj)];  // flipped frame
+        const double w_num = num_is_unflipped ? w_minus : w_plus;
+        const double w_den = num_is_unflipped ? w_plus : w_minus;
+        if (w_num <= 0.0) { zero = true; return; }
+        ratio *= w_num / w_den;
+        if (ratio > 1e100)       { ratio *= 1e-100; ++shift; }
+        else if (ratio < 1e-100) { ratio *= 1e100;  --shift; }
+    };
+
+    // On a zero-weight crossing the walk continues (the type -1 flips keep
+    // the n^- bookkeeping exact) but stops accumulating: the object must end
+    // consistent at m_new even for a dead trajectory.
+    if (m_new > m_star_) {
+        for (qaqmc_slot_t p = m_star_; p < m_new; ++p) {
+            const int ot = eng.op_types_[p];
+            if (ot == 2)       bond_ratio(p, /*num_is_unflipped=*/true);
+            else if (ot == -1) nm[eng.op_site_at(p)] ^= 1;
+        }
+    } else {
+        for (qaqmc_slot_t p = m_star_ - 1; p >= m_new; --p) {
+            const int ot = eng.op_types_[p];
+            // Un-apply first: nm becomes the state BEFORE slot p (a no-op
+            // for bond ops, so the two branches are order-safe).
+            if (ot == -1)     nm[eng.op_site_at(p)] ^= 1;
+            else if (ot == 2) bond_ratio(p, /*num_is_unflipped=*/false);
+        }
+    }
+
+    m_star_ = m_new;
+    state_at_seam_plus_ = nm;
+    for (size_t k = 0; k < string_sites_.size(); ++k) {
+        if ((seam_mask_ >> k) & 1ULL) state_at_seam_plus_[string_sites_[k]] ^= 1;
+    }
+
+    if (zero) return -std::numeric_limits<double>::infinity();
+    return std::log(ratio) + shift * LOG_1E100;
+}
+
+double QAQMCOffDiagonalCore::seam_rung_rb_ratio(const QAQMCEngine& eng, bool right) {
+    if (m_star_ < 0) {
+        throw std::runtime_error("seam_rung_rb_ratio: no string configured (call set_string_sites first)");
+    }
+    const std::int64_t m_new = right ? m_star_ + 1 : m_star_ - 1;
+    return std::exp(seam_rb_log_ratio_to(eng, m_new));
+}
+
+double QAQMCOffDiagonalCore::seam_rb_log_ratio_to(const QAQMCEngine& eng, std::int64_t m_new) {
+    if (m_star_ < 0) {
+        throw std::runtime_error("seam_rb_log_ratio_to: no string configured (call set_string_sites first)");
+    }
+    if (m_new < 0 || m_new >= eng.M_total_) {
+        throw std::invalid_argument("seam_rb_log_ratio_to: m_new must satisfy 0 <= m_new < M_total");
+    }
+    recompute_seam_snapshots(eng);
+    if (m_new == m_star_) return 0.0;
+
+    std::vector<int8_t> seam_flip(eng.N_, 0);
+    for (size_t k = 0; k < string_sites_.size(); ++k) {
+        if ((seam_mask_ >> k) & 1ULL) seam_flip[string_sites_[k]] = 1;
+    }
+
+    const int* bond_sites = eng.model_->vij.bond_sites_flat.data();
+    const int n_bonds = eng.model_->vij.n_bonds;
+    const double site_total = (double)eng.N_ * eng.site_W_;
+    const bool right = (m_new > m_star_);
+
+    // Local walk copy: this method must not move the cut, so the member
+    // snapshots stay untouched after the entry recompute.
+    std::vector<int32_t> nm = state_at_seam_minus_;
+
+    double log_ratio = 0.0;
+    // For a diagonal slot the state before it equals the state after it, so
+    // nm (kept as "state before slot p, unflipped frame") is valid for the
+    // Lambda sums in both directions; only type -1 slots advance it.
+    auto diagonal_slot_factor = [&](qaqmc_slot_t p) {
+        const double delta = eng.delta_at(p);
+        double lam_minus = site_total, lam_plus = site_total;
+        for (int b = 0; b < n_bonds; ++b) {
+            const int si = bond_sites[b * 2 + 0];
+            const int sj = bond_sites[b * 2 + 1];
+            const double di = delta * eng.model_->vij.inv_coord[si];
+            const double dj = delta * eng.model_->vij.inv_coord[sj];
+            double W[4], wmax;
+            QAQMCEngine::compute_bond_W_inline(di, dj, eng.model_->vij.vij_list[b],
+                                               eng.epsilon_, W, wmax);
+            const int fi = seam_flip[si], fj = seam_flip[sj];
+            lam_minus += W[nm[si] * 2 + nm[sj]];
+            lam_plus  += W[(nm[si] ^ fi) * 2 + (nm[sj] ^ fj)];
+        }
+        // Current frame: flipped (post-seam) when the slot leaves the seam
+        // region rightward; unflipped when it enters it leftward.
+        log_ratio += right ? std::log(lam_minus) - std::log(lam_plus)
+                           : std::log(lam_plus) - std::log(lam_minus);
+    };
+
+    if (right) {
+        for (qaqmc_slot_t p = m_star_; p < m_new; ++p) {
+            const int ot = eng.op_types_[p];
+            if (ot == -1) nm[eng.op_site_at(p)] ^= 1;
+            else          diagonal_slot_factor(p);
+        }
+    } else {
+        for (qaqmc_slot_t p = m_star_ - 1; p >= m_new; --p) {
+            const int ot = eng.op_types_[p];
+            if (ot == -1) nm[eng.op_site_at(p)] ^= 1;  // un-apply: state before p
+            else          diagonal_slot_factor(p);
+        }
+    }
+    return log_ratio;
+}
+
+void QAQMCOffDiagonalCore::seam_set_position(const QAQMCEngine& eng, std::int64_t m_new) {
+    if (m_star_ < 0) {
+        throw std::runtime_error("seam_set_position: no string configured (call set_string_sites first)");
+    }
+    if (m_new < 0 || m_new >= eng.M_total_) {
+        throw std::invalid_argument("seam_set_position: m_new must satisfy 0 <= m_new < M_total");
+    }
+    m_star_ = m_new;
+    recompute_seam_snapshots(eng);
+}
+
 bool QAQMCOffDiagonalCore::attempt_string_toggle(QAQMCEngine& eng, int local_index, double lambda) {
     if (lambda <= 0.0 || lambda >= 1.0) return false;
 

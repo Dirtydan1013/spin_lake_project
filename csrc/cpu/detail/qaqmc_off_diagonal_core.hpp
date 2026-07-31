@@ -73,6 +73,68 @@ public:
     // attempt_string_toggle each, at fixed lambda.
     void topology_sweep(QAQMCEngine& eng, double lambda);
 
+    // ── Seam drag (cut-position Jarzynski) ───────────────────────────────
+    // Drag the cut from m_star_ to m_new (either direction) and return the
+    // exact log weight ratio ln[W_{m_new}(sigma)/W_{m_star_}(sigma)] of the
+    // CURRENT configuration (-inf if a crossed bond op has zero weight in
+    // the target frame -- an exact-zero trajectory, not an error). Moving
+    // the cut past slot p changes only that operator's frame: single-site
+    // ops have constant weight (ratio 1, type -1 just flips the n^- book-
+    // keeping), bond ops not touching an ACTIVE seam site are frame-blind,
+    // and bond ops touching one contribute W[n^-]/W[n^+] at the slot's own
+    // delta_at(p). Consumes no RNG; never mutates eng. Rebuilds the seam
+    // snapshots on entry (cluster_update stales them; same guard as
+    // topology_sweep) and leaves m_star_/snapshots consistent at m_new.
+    double seam_drag_to(const QAQMCEngine& eng, std::int64_t m_new);
+
+    // Rao-Blackwellized single-rung ratio for dragging the cut one slot
+    // right (crossing slot p = m_star_) or left (p = m_star_ - 1): the
+    // conditional expectation of W_target(sigma)/W_current(sigma) over the
+    // diagonal-op choice at the crossing slot given the state trajectory,
+    //
+    //   E[ratio | state] = 1                          (flip slot: frame-blind)
+    //                    = Lambda_tgt(s)/Lambda_cur(s) (diagonal slot)
+    //   Lambda(s) = N * site_W + sum_b W_b(s)   at the slot's own delta_at(p),
+    //
+    // which is exactly the stationary conditional of diagonal_update's
+    // alias-proposal + envelope-rejection sampling. Averaging this over
+    // equilibrium samples of Z_X(m_star_) estimates Z_X(m+-1)/Z_X(m) with
+    // BOUNDED per-sample values: the raw per-config ratio is heavy-tailed
+    // (a crossed bond op can sit at W ~ epsilon*m_abs in one frame and O(1)
+    // in the other, ratio ~ 1/epsilon), which is why plain Jarzynski dragging
+    // shows one-sided bias at reachable sample sizes; the RB form replaces
+    // the whale by a ratio of two O(N) sums. Expectation is unchanged
+    // (Rao-Blackwell). Rebuilds the seam snapshots on entry; consumes no
+    // RNG; never mutates eng or this object's m_star_/mask.
+    double seam_rung_rb_ratio(const QAQMCEngine& eng, bool right);
+
+    // Block generalization: read-only RB log-ratio for dragging the cut from
+    // m_star_ to m_new (either direction) in ONE rung. Given the worldline,
+    // the diagonal-op choices at the crossed slots are conditionally
+    // independent, so the RB conditional of the k-slot block weight ratio
+    // factorizes exactly into the per-slot Lambda ratios:
+    //
+    //   E[W_tgt/W_cur | worldline] = prod_{p crossed, diagonal} Lambda_tgt(s_p)/Lambda_cur(s_p)
+    //
+    // (flip slots contribute no factor; their sigma^x just advances the local
+    // n^- bookkeeping). Averaging exp(return) over equilibrium samples of
+    // Z_X(m_star_) estimates Z_X(m_new)/Z_X(m_star_). Per-slot log
+    // contributions are O(L_C/N) but NOT independent along the block: the
+    // worldline's imaginary-time correlations make the rung log-sd grow
+    // ~linearly (not sqrt) in k beyond a correlation crossover, so cost/error
+    // improves with k only up to that point -- calibrate k so the rung log-sd
+    // stays <~0.3 (docs/design/seam_drag_curve.md SS7; kagome 4x4/M=4096:
+    // k ~ 64). Does NOT move the cut; mutates only the snapshot cache (entry
+    // recompute). No RNG.
+    double seam_rb_log_ratio_to(const QAQMCEngine& eng, std::int64_t m_new);
+
+    // Re-anchor the cut at m_new WITHOUT work accumulation: m_star_ = m_new
+    // plus a snapshot recompute; seam_mask_ untouched (closure parity does
+    // not reference the cut position, so no repair is needed). The current
+    // configuration is a sample of the OLD ensemble -- callers must
+    // decorrelate before measuring, same contract as set_seam_mask_consistent.
+    void seam_set_position(const QAQMCEngine& eng, std::int64_t m_new);
+
     // ── Hooks called from QAQMCEngine::diagonal_update()/cluster_update() ──
     // Both are no-ops unless p == m_star_ (including when no string is
     // configured: m_star_ == -1 can never equal a valid p >= 0).

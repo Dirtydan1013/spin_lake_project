@@ -447,6 +447,10 @@ public:
         return off_diag_.attempt_string_toggle(*this, local_index, lambda);
     }
     void topology_sweep(double lambda) { off_diag_.topology_sweep(*this, lambda); }
+    double seam_drag_to(std::int64_t m_new) { return off_diag_.seam_drag_to(*this, m_new); }
+    double seam_rung_rb_ratio(bool right) { return off_diag_.seam_rung_rb_ratio(*this, right); }
+    double seam_rb_log_ratio_to(std::int64_t m_new) { return off_diag_.seam_rb_log_ratio_to(*this, m_new); }
+    void seam_set_position(std::int64_t m_new) { off_diag_.seam_set_position(*this, m_new); }
 
     // Compute 4 bond weights with asymmetric delta per endpoint
     // delta_i = delta / z_eff[site_i],  delta_j = delta / z_eff[site_j]
