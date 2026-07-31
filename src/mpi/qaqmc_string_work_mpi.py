@@ -510,12 +510,30 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
     if growth_anchor:
         comm.Barrier()
         t0 = time.perf_counter()
+        # Rank 0 autotunes the per-stage lambdas on a short ladder, then
+        # broadcasts them: with a SHARED protocol the per-stage occupancy
+        # counts and flips can be POOLED across ranks, so a rank whose chain
+        # happens not to flip on a hard stage still contributes counts
+        # instead of poisoning its whole ladder (probe 27113: 47/64 ranks
+        # wasted under per-rank autotune at probe scale).
+        if rank == 0:
+            tune_res = eng.run_growth_residence_ladder(
+                n_samples_per_stage=max(growth_tune_samples, 50),
+                n_sweeps_between_samples=growth_sweeps_between_samples,
+                n_equil_per_stage=growth_equil_per_stage,
+                n_tune_samples=growth_tune_samples,
+                n_toggle_attempts=growth_toggle_attempts)
+            shared_lambdas = np.asarray(tune_res.lambdas, dtype=np.float64)
+        else:
+            shared_lambdas = np.empty(len(string_sites), dtype=np.float64)
+        comm.Bcast(shared_lambdas, root=0)
         res = eng.run_growth_residence_ladder(
             n_samples_per_stage=growth_samples_per_stage,
             n_sweeps_between_samples=growth_sweeps_between_samples,
             n_equil_per_stage=growth_equil_per_stage,
             n_tune_samples=growth_tune_samples,
-            n_toggle_attempts=growth_toggle_attempts)
+            n_toggle_attempts=growth_toggle_attempts,
+            stage_lambdas=shared_lambdas)
         row = dict(log_r=np.asarray(res.log_r),
                    log_r_sem=np.asarray(res.log_r_sem),
                    lambdas=np.asarray(res.lambdas),
@@ -533,35 +551,53 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         all_rows = comm.gather(row, root=0)
         t_growth = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
         if rank == 0:
-            log_oc_ranks = np.array([float(np.sum(r["log_r"])) for r in all_rows])
-            finite = np.isfinite(log_oc_ranks)
-            n_valid = int(finite.sum())
-            if n_valid == 0:
-                raise RuntimeError("growth anchor: every rank has an "
-                                   "unresolved stage (raise samples per stage)")
-            log_o_c = float(log_oc_ranks[finite].mean())
-            sem = (float(log_oc_ranks[finite].std(ddof=1)) / math.sqrt(n_valid)
-                   if n_valid > 1 else
-                   float(np.sqrt(np.sum(all_rows[0]["log_r_sem"] ** 2))))
+            # Pooled per-stage estimate: identical lambdas across ranks make
+            # occupancy counts additive.  Flips pool too — the honest
+            # effective sample size is the TOTAL flip count per stage.
+            p_ranks = np.stack([r["p_on"] for r in all_rows])       # (R, L)
+            flips_ranks = np.stack([r["n_flips"] for r in all_rows])
+            n_s = growth_samples_per_stage
+            p_pool = p_ranks.mean(axis=0)                            # equal n per rank
+            flips_pool = flips_ranks.sum(axis=0)
+            if np.any((p_pool <= 0.0) | (p_pool >= 1.0)):
+                bad = np.where((p_pool <= 0.0) | (p_pool >= 1.0))[0]
+                raise RuntimeError(
+                    f"growth anchor: stage(s) {bad.tolist()} never crossed on "
+                    f"ANY rank — raise growth_samples_per_stage")
+            odds_g = np.log((1.0 - shared_lambdas) / shared_lambdas)
+            log_r_pool = np.log(p_pool / (1.0 - p_pool)) + odds_g
+            # sem: flip-count bound per stage; the per-rank scatter of the
+            # pooled-lambda log_r is reported alongside as a cross-check.
+            log_r_sem_pool = np.sqrt(8.0 / np.maximum(flips_pool, 1))
+            log_o_c = float(np.sum(log_r_pool))
+            sem = float(np.sqrt(np.sum(log_r_sem_pool ** 2)))
             growth_payload = dict(
                 log_o_c=log_o_c, o_c=math.exp(log_o_c), log_o_c_sem=sem,
-                n_ranks_valid=n_valid, n_ranks=int(n_ranks),
-                samples_per_stage=int(growth_samples_per_stage),
+                n_ranks_valid=int(n_ranks), n_ranks=int(n_ranks),
+                samples_per_stage=int(n_s),
                 sweeps_between_samples=int(growth_sweeps_between_samples),
                 elapsed=float(t_growth),
+                lambdas=np.asarray(shared_lambdas),
+                p_on_pooled=p_pool, n_flips_pooled=flips_pool,
+                log_r_pooled=log_r_pool, log_r_sem_pooled=log_r_sem_pool,
                 log_r_ranks=np.stack([r["log_r"] for r in all_rows]),
                 log_r_sem_ranks=np.stack([r["log_r_sem"] for r in all_rows]),
                 lambdas_ranks=np.stack([r["lambdas"] for r in all_rows]),
-                p_on_ranks=np.stack([r["p_on"] for r in all_rows]),
-                n_flips_ranks=np.stack([r["n_flips"] for r in all_rows]),
+                p_on_ranks=p_ranks, n_flips_ranks=flips_ranks,
             )
             if verbose:
-                flips_min = int(growth_payload["n_flips_ranks"].min())
+                flips_min = int(flips_pool.min())
                 print(f"[MPI-STRWORK] growth: O_C={growth_payload['o_c']:.6f} "
                       f"(log O_C={log_o_c:+.4f} ± {sem:.4f}) "
-                      f"ranks_valid={n_valid}/{n_ranks} "
+                      f"pooled over {n_ranks} ranks, "
                       f"min_stage_flips={flips_min} elapsed={t_growth:.1f}s",
                       flush=True)
+                for kk in range(log_r_pool.size):
+                    print(f"[MPI-STRWORK]   growth stage {kk}: "
+                          f"lam={shared_lambdas[kk]:.4f} p={p_pool[kk]:.3f} "
+                          f"flips={int(flips_pool[kk])} "
+                          f"log r={log_r_pool[kk]:+.4f} ± {log_r_sem_pool[kk]:.4f}",
+                          flush=True)
 
     # ── Drag-ladder phase: whole-curve O_C(delta) from the last K's engine ──
     # (docs/design/seam_drag_curve.md).  Each rank runs drag_repeats
@@ -768,7 +804,9 @@ def _save_hdf5(path: str, payload: dict) -> None:
                         "n_ranks", "samples_per_stage",
                         "sweeps_between_samples", "elapsed"):
                 gg.attrs[key] = growth[key]
-            for key in ("log_r_ranks", "log_r_sem_ranks", "lambdas_ranks",
+            for key in ("lambdas", "p_on_pooled", "n_flips_pooled",
+                        "log_r_pooled", "log_r_sem_pooled",
+                        "log_r_ranks", "log_r_sem_ranks", "lambdas_ranks",
                         "p_on_ranks", "n_flips_ranks"):
                 gg.create_dataset(key, data=np.asarray(growth[key]))
 
