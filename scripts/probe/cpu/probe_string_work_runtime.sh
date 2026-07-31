@@ -46,6 +46,10 @@ STRING_SIZE=${STRING_SIZE:-2}
 TARGET_N_TRAJ=${TARGET_N_TRAJ:-4000}
 TARGET_THERMALIZE=${TARGET_THERMALIZE:-5000}
 DECORR=${DECORR:-100}
+# Relaxation per lambda step of the anchor bridge (the vs-ED gates used 4/4;
+# 1/1 under-relaxes hard bridges — watch n_eff / zero_frac).
+N_TOPO_SWEEPS=${N_TOPO_SWEEPS:-1}
+N_QMC_SWEEPS=${N_QMC_SWEEPS:-1}
 
 # Drag-ladder phase target (empty DRAG_DELTAS = phase disabled, both in the
 # probe and in the production estimate).  The probe runs the drag over the
@@ -123,6 +127,8 @@ $MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     --n-trajectories "$PROBE_TRAJ" \
     --n-thermalize "$PROBE_THERMALIZE" \
     --decorrelation-steps "$DECORR" \
+    --n-topology-sweeps-per-lambda "$N_TOPO_SWEEPS" \
+    --n-qaqmc-sweeps-per-lambda "$N_QMC_SWEEPS" \
     ${DRAG_DELTAS:+--drag-deltas "$DRAG_DELTAS"} \
     ${DRAG_DELTAS:+--drag-slots-per-rung "$DRAG_SPR"} \
     ${DRAG_DELTAS:+--drag-samples-per-rung "$PROBE_DRAG_SAMPLES"} \

@@ -65,6 +65,10 @@ N_THERMALIZE=${N_THERMALIZE:-5000}
 # Print rank-0 thermalization progress every this many steps (<= 0 disables).
 EQUIL_PRINT_EVERY=${EQUIL_PRINT_EVERY:-500}
 DECORR=${DECORR:-100}
+# Relaxation per lambda step of the anchor bridge (the vs-ED gates used 4/4;
+# 1/1 under-relaxes hard bridges — watch n_eff / zero_frac).
+N_TOPO_SWEEPS=${N_TOPO_SWEEPS:-1}
+N_QMC_SWEEPS=${N_QMC_SWEEPS:-1}
 SEED=${SEED:-7}
 CKPT_TRAJ=${CKPT_TRAJ:-250}
 # Warm start: CONFIG_IN = previous run's final-config dir (rank{r}.h5) —
@@ -160,6 +164,8 @@ $MPIEXEC \
     --n-thermalize "$N_THERMALIZE" \
     --equil-progress-every "$EQUIL_PRINT_EVERY" \
     --decorrelation-steps "$DECORR" \
+    --n-topology-sweeps-per-lambda "$N_TOPO_SWEEPS" \
+    --n-qaqmc-sweeps-per-lambda "$N_QMC_SWEEPS" \
     --seed "$SEED" \
     --checkpoint-every-trajectories "$CKPT_TRAJ" \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"} \
