@@ -60,6 +60,7 @@ DRAG_DELTAS=${DRAG_DELTAS:-""}
 DRAG_SPR=${DRAG_SPR:-64}
 DRAG_SAMPLES=${DRAG_SAMPLES:-400}
 DRAG_SWEEPS=${DRAG_SWEEPS:-1}
+DRAG_BURN=${DRAG_BURN:-5}
 DRAG_REPEATS=${DRAG_REPEATS:-1}
 PROBE_DRAG_SAMPLES=${PROBE_DRAG_SAMPLES:-4}
 
@@ -133,6 +134,7 @@ $MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     ${DRAG_DELTAS:+--drag-slots-per-rung "$DRAG_SPR"} \
     ${DRAG_DELTAS:+--drag-samples-per-rung "$PROBE_DRAG_SAMPLES"} \
     ${DRAG_DELTAS:+--drag-sweeps-between-samples "$DRAG_SWEEPS"} \
+    ${DRAG_DELTAS:+--drag-burn-per-rung "$DRAG_BURN"} \
     ${DRAG_DELTAS:+--drag-repeats 1} \
     ${DRAG_DELTAS:+--drag-thermalize "$PROBE_THERMALIZE"} \
     --seed 7 2>&1 | tee "$PROBE_LOG"
@@ -162,13 +164,22 @@ print(f"UPPER-BOUND lambda-anchor estimate ≈ {per_traj:.1f}s/traj × "
       f"{target_per_rank} traj/rank = {lam_est / 3600:.2f} h")
 drag_est = 0.0
 if drag_probe > 0.0:
-    # Rung count is identical between probe and production (same grid/spr);
-    # only samples/rung and repeats scale.
-    scale = ($DRAG_SAMPLES / $PROBE_DRAG_SAMPLES) * $DRAG_REPEATS
-    drag_est = drag_probe * scale
-    print(f"drag probe = {drag_probe:.1f}s at $PROBE_DRAG_SAMPLES samples/rung → "
-          f"production drag ≈ ×{scale:.0f} = {drag_est / 3600:.2f} h "
-          f"($DRAG_SAMPLES samples/rung × $DRAG_REPEATS repeats/rank)")
+    # Rung count is identical between probe and production (same grid/spr),
+    # so only the SAMPLING part scales with samples/rung; per-rung burn-in
+    # and thermalization are fixed per pass.  t_step comes from the drag
+    # equilibration progress line, n_rungs from the driver's drag summary.
+    rungs_m = re.search(r"drag: .*rungs=(\d+)", log)
+    step_m = re.findall(r"drag\] equilibration .*, ([0-9.]+) step/s", log)
+    n_rungs = int(rungs_m.group(1)) if rungs_m else 0
+    t_step = 1.0 / float(step_m[-1]) if step_m else 0.0
+    fixed = n_rungs * $DRAG_BURN * t_step
+    samp_part = max(drag_probe - fixed, 0.0)
+    scale = $DRAG_SAMPLES / $PROBE_DRAG_SAMPLES
+    drag_est = (samp_part * scale + fixed) * $DRAG_REPEATS
+    print(f"drag probe = {drag_probe:.1f}s at $PROBE_DRAG_SAMPLES samples/rung "
+          f"({n_rungs} rungs; burn share {fixed:.0f}s) → production drag ≈ "
+          f"{drag_est / 3600:.2f} h ($DRAG_SAMPLES samples/rung × "
+          f"$DRAG_REPEATS repeats/rank)")
 from src.probes import costreport
 costreport.report(lam_est + drag_est, $NTASKS, $CPT)
 print("For a tighter estimate use the per-K 'elapsed=' / 'drag:' lines printed by the driver.")

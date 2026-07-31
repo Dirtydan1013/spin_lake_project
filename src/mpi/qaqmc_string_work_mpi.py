@@ -510,19 +510,21 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 return dict(log_r=np.asarray(res.log_r_mirror),
                             log_r_sem=np.asarray(res.log_r_sem),
                             log_r_left=np.asarray(res.left.log_r),
-                            log_r_right=np.asarray(res.right.log_r))
+                            log_r_right=np.asarray(res.right.log_r)), (
+                    int(res.left.rung_m.size + res.right.rung_m.size))
             res = eng.run_drag_ladder(grid, m_anchor=anchor_m, **kw)
             return dict(log_r=np.asarray(res.log_r),
-                        log_r_sem=np.asarray(res.log_r_sem))
+                        log_r_sem=np.asarray(res.log_r_sem)), int(res.rung_m.size)
 
         rows = []
+        n_rungs_per_pass = 0
         drag_dir = (os.path.join(checkpoint_dir, "drag")
                     if (checkpoint_dir and checkpoint_every_trajectories > 0)
                     else None)
         if drag_dir:
             with RankChunkWriter(drag_dir, rank, run_attrs=drag_run_attrs) as w:
                 for rep in range(drag_repeats):
-                    row = _one_pass()
+                    row, n_rungs_per_pass = _one_pass()
                     rows.append(row)
                     w.write_chunk(rep, datasets=row, attrs=dict(rep=int(rep)))
                     if rank == 0 and verbose:
@@ -530,7 +532,8 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                               f"{drag_repeats} written", flush=True)
         else:
             for rep in range(drag_repeats):
-                rows.append(_one_pass())
+                row, n_rungs_per_pass = _one_pass()
+                rows.append(row)
 
         all_rows = comm.gather(rows, root=0)
         t_drag = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
@@ -547,6 +550,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             drag_payload = dict(
                 m_grid=grid, deltas=deltas, m_anchor=anchor_m,
                 mirror=bool(drag_mirror), n_passes=int(n_passes),
+                n_rungs_per_pass=int(n_rungs_per_pass),
                 samples_per_rung=int(drag_samples_per_rung),
                 sweeps_between_samples=int(drag_sweeps_between_samples),
                 burn_per_rung=int(drag_burn_per_rung),
@@ -572,8 +576,8 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             if verbose:
                 print(f"[MPI-STRWORK] drag: {n_passes} passes x "
                       f"{grid.size} points (mirror={drag_mirror}, "
-                      f"spr={drag_slots_per_rung}) elapsed={t_drag:.1f}s",
-                      flush=True)
+                      f"spr={drag_slots_per_rung}, rungs={n_rungs_per_pass}) "
+                      f"elapsed={t_drag:.1f}s", flush=True)
                 for j in range(grid.size):
                     print(f"[MPI-STRWORK]   delta={deltas[j]:+.3f} (m={grid[j]}): "
                           f"log r={log_r_mean[j]:+.4f} ± "
@@ -636,9 +640,10 @@ def _save_hdf5(path: str, payload: dict) -> None:
         drag = payload.get("drag")
         if drag is not None:
             dg = f.create_group("drag")
-            for key in ("m_anchor", "mirror", "n_passes", "samples_per_rung",
-                        "sweeps_between_samples", "burn_per_rung",
-                        "slots_per_rung", "thermalize", "elapsed"):
+            for key in ("m_anchor", "mirror", "n_passes", "n_rungs_per_pass",
+                        "samples_per_rung", "sweeps_between_samples",
+                        "burn_per_rung", "slots_per_rung", "thermalize",
+                        "elapsed"):
                 dg.attrs[key] = drag[key]
             for key in ("m_grid", "deltas", "log_r_passes", "log_r_sem_passes",
                         "log_r_mean", "log_r_sem",
