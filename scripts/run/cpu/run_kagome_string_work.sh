@@ -3,8 +3,8 @@
 #SBATCH --partition=cpu
 #SBATCH --nodelist=cpunode02
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=32
-#SBATCH --cpus-per-task=4
+#SBATCH --ntasks-per-node=64
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=240gb
 #SBATCH --output=logs/string_work_%j.out
 #SBATCH --error=logs/string_work_%j.err
