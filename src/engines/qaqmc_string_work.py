@@ -108,6 +108,32 @@ class StringDragMirroredResult:
 
 
 @dataclass
+class StringGrowthAnchorResult:
+    """Sector-growth residence ladder estimate of O_C = Z_X / Z_empty.
+
+    Stage k freezes seam bits 0..k-1 ON and lets only bit k toggle at a
+    per-stage lambda_k tuned so the two-sector occupancy is balanced; then
+
+        Z_{k+1}/Z_k = P_on/P_off * (1 - lambda_k)/lambda_k     (exact)
+
+    and O_C = prod_k Z_{k+1}/Z_k.  Equilibrium per stage, so slow half-line
+    mixing costs sweeps, not validity — unlike the lambda-Jarzynski bridge,
+    whose work distribution explodes when a trajectory must thread every
+    stage's bottleneck in one sweep (kagome hexagon loop at Rb=2.4: toggle
+    acceptance 0-2% on the interior stages, n_eff ~ 2% at K=3600).
+    """
+    o_c: float
+    log_o_c: float
+    log_o_c_sem: float        # quadrature over stages
+    lambdas: np.ndarray       # (L,) tuned lambda per stage
+    p_on: np.ndarray          # (L,) occupancy of the toggling bit
+    n_flips: np.ndarray       # (L,) observed sector transitions (mixing check)
+    log_r: np.ndarray         # (L,) per-stage log Z-ratio
+    log_r_sem: np.ndarray     # (L,)
+    n_samples_per_stage: int
+
+
+@dataclass
 class StringWorkRunResult:
     o_c: float                  # estimate of Z_C / Z_empty
     log_o_c: float
@@ -556,6 +582,142 @@ class QAQMCStringWorkRydberg:
             m_forward=m_grid_forward, m_mirror=m_mirror,
             log_r_mirror=log_r_mirror, log_r_sem=log_r_sem,
             r_mirror=np.exp(log_r_mirror), left=left, right=right,
+        )
+
+
+    # ── Growth residence-ladder anchor ───────────────────────────────────
+
+    def _stage_occupancy(self, k: int, lam: float, n_samples: int,
+                         n_sweeps: int, n_attempts: int):
+        """Sample bit k's occupancy at fixed lambda (other bits frozen);
+        returns (occupancy series, n_flips)."""
+        occ = np.empty(n_samples, dtype=np.int8)
+        flips = 0
+        prev = (self._eng.seam_mask >> k) & 1
+        for i in range(n_samples):
+            # cluster_update stales the seam snapshots and only
+            # diagonal_update refreshes them; a raw attempt_string_toggle
+            # trusts the cache (same guard topology_sweep applies on entry —
+            # skipping this biases the residence ratio lambda-dependently).
+            self._eng.recompute_seam_snapshots()
+            for _ in range(n_attempts):
+                self._eng.attempt_string_toggle(k, lam)
+            for _ in range(n_sweeps):
+                self._eng.mc_step()
+            cur = (self._eng.seam_mask >> k) & 1
+            flips += int(cur != prev)
+            prev = cur
+            occ[i] = cur
+        return occ, flips
+
+    def run_growth_residence_ladder(self, n_samples_per_stage: int = 4000,
+                                    n_sweeps_between_samples: int = 1,
+                                    n_equil_per_stage: int = 200,
+                                    n_tune_samples: int = 300,
+                                    tune_rounds: int = 3,
+                                    n_toggle_attempts: int = 1,
+                                    stage_lambdas: np.ndarray | None = None
+                                    ) -> StringGrowthAnchorResult:
+        """Anchor O_C via the sector-growth residence ladder.
+
+        Grows the string one seam bit at a time IN THE ORDER of
+        ``string_sites`` (order affects efficiency — grow along the
+        string/loop adjacency — not correctness; the product telescopes).
+        Each stage: freeze bits 0..k-1 ON (set_seam_mask_consistent, so
+        worldline closure is repaired), equilibrate, autotune lambda_k so
+        the toggling bit's occupancy is balanced, then sample the residence
+        ratio. Ends with the FULL mask set consistently, ready for a drag
+        phase (decorrelate before using the configuration).
+
+        Errors: per-stage sem of the log-odds from max(blocked scatter,
+        sqrt(8/n_flips)) — the flip count is the honest effective sample
+        size when transitions are rare; stages with n_flips < ~10 should be
+        rerun with more samples (check ``n_flips`` in the result).
+        ``stage_lambdas`` overrides the autotune (e.g. rank 0's tuned values
+        broadcast to all ranks for a deterministic protocol).
+        """
+        L = self._length
+        if L < 1:
+            raise RuntimeError("call set_string_sites() first")
+        if stage_lambdas is not None:
+            stage_lambdas = np.asarray(stage_lambdas, dtype=np.float64)
+            if stage_lambdas.shape != (L,):
+                raise ValueError(f"stage_lambdas must have shape ({L},)")
+
+        lambdas = np.empty(L)
+        p_on = np.empty(L)
+        n_flips_arr = np.zeros(L, dtype=np.int64)
+        log_r = np.empty(L)
+        log_r_sem = np.empty(L)
+        for k in range(L):
+            base_mask = (1 << k) - 1
+            self._eng.set_seam_mask_consistent(base_mask)
+            for _ in range(n_equil_per_stage):
+                self._eng.mc_step()
+
+            if stage_lambdas is not None:
+                lam = float(stage_lambdas[k])
+            else:
+                lam = 0.5
+                for _ in range(tune_rounds):
+                    occ, _ = self._stage_occupancy(
+                        k, lam, n_tune_samples, n_sweeps_between_samples,
+                        n_toggle_attempts)
+                    p = float(occ.mean())
+                    if p <= 0.0 or p >= 1.0:
+                        # bit never crossed: push the g-odds hard toward the
+                        # unseen side and try again
+                        odds = lam / (1.0 - lam)
+                        odds *= 30.0 if p <= 0.0 else 1.0 / 30.0
+                        lam = odds / (1.0 + odds)
+                    else:
+                        # balance: choose lambda' so g-odds cancels the
+                        # measured physical ratio
+                        r_phys = (p / (1.0 - p)) * (1.0 - lam) / lam
+                        lam = 1.0 / (1.0 + r_phys)
+                    lam = min(max(lam, 1e-9), 1.0 - 1e-9)
+            lambdas[k] = lam
+
+            occ, flips = self._stage_occupancy(
+                k, lam, n_samples_per_stage, n_sweeps_between_samples,
+                n_toggle_attempts)
+            p = float(occ.mean())
+            n_flips_arr[k] = flips
+            if p <= 0.0 or p >= 1.0:
+                # sector never visited: the ratio is unresolved at this
+                # budget — poison the estimate rather than fake a number
+                log_r[k] = -math.inf if p <= 0.0 else math.inf
+                log_r_sem[k] = math.inf
+                p_on[k] = p
+                continue
+            p_on[k] = p
+            # blocked scatter on the logit (delta method), floored by the
+            # flip-count bound
+            n_blocks = 16
+            blocks = occ[:(occ.size // n_blocks) * n_blocks].reshape(n_blocks, -1)
+            bp = blocks.mean(axis=1)
+            valid = (bp > 0) & (bp < 1)
+            if valid.sum() >= 4:
+                sem_p = float(bp.std(ddof=1)) / math.sqrt(n_blocks)
+                sem_block = sem_p / (p * (1.0 - p))
+            else:
+                sem_block = 0.0
+            sem_flip = math.sqrt(8.0 / max(flips, 1))
+            log_r[k] = (math.log(p / (1.0 - p))
+                        + math.log((1.0 - lam) / lam))
+            log_r_sem[k] = max(sem_block, sem_flip)
+
+        # leave the engine in the full-mask sector for a subsequent drag
+        self._eng.set_seam_mask_consistent(self._full_mask())
+
+        log_o_c = float(np.sum(log_r))
+        log_o_c_sem = float(np.sqrt(np.sum(np.minimum(log_r_sem, 1e150) ** 2)))
+        return StringGrowthAnchorResult(
+            o_c=float(np.exp(log_o_c)), log_o_c=log_o_c,
+            log_o_c_sem=log_o_c_sem,
+            lambdas=lambdas, p_on=p_on, n_flips=n_flips_arr,
+            log_r=log_r, log_r_sem=log_r_sem,
+            n_samples_per_stage=n_samples_per_stage,
         )
 
 

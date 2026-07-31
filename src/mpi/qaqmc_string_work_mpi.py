@@ -189,6 +189,12 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         drag_repeats: int = 1,
                         drag_thermalize: int = -1,
                         drag_equil_at_anchor: int = 100,
+                        growth_anchor: bool = False,
+                        growth_samples_per_stage: int = 4000,
+                        growth_sweeps_between_samples: int = 1,
+                        growth_equil_per_stage: int = 200,
+                        growth_tune_samples: int = 300,
+                        growth_toggle_attempts: int = 1,
                         verbose: bool = True) -> dict | None:
     """config_in: warm-start directory of rank{r}.h5 final configurations from
     a previous run with the same (N, M, Hamiltonian); when given, per-K
@@ -210,8 +216,13 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
         raise ValueError("thermalization/decorrelation counts must be non-negative")
     if n_topology_sweeps_per_lambda < 0 or n_qaqmc_sweeps_per_lambda < 0:
         raise ValueError("per-lambda sweep counts must be non-negative")
-    if not K_values or any(int(K) < 1 for K in K_values):
+    if not K_values and not (drag_grid or growth_anchor):
+        raise ValueError("K_values must be non-empty unless a growth anchor "
+                         "or drag phase is requested")
+    if any(int(K) < 1 for K in K_values):
         raise ValueError("K_values must contain positive integers")
+    if growth_anchor and backend != "cpu":
+        raise ValueError("the growth-anchor phase is CPU-only")
     if resume and backend != "cuda":
         raise ValueError("exact trajectory resume is supported only by backend='cuda'")
     if drag_grid:
@@ -261,6 +272,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
 
     results: dict[int, dict] = {}
     saw_committed_resume = False
+    eng = None
     for K in K_values:
         comm.Barrier()
         t0 = time.perf_counter()
@@ -466,6 +478,91 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                       f"zero_frac={agg['zero_weight_fraction']:.1%} "
                       f"elapsed={t_elapsed:.1f}s", flush=True)
 
+    # ── No-lambda path: build the engine once for growth/drag-only runs ────
+    if eng is None and (drag_grid or growth_anchor):
+        extra = {}
+        eng = engine_type(
+            N=N, M=M, Omega=Omega, Rb=Rb,
+            delta_min=delta_min, delta_max=delta_max,
+            epsilon=epsilon, seed=rank_seed, pos=pos_engine,
+            neighbor_cutoff=(None if neighbor_cutoff < 0 else neighbor_cutoff),
+            delta_groups=delta_groups, box_vectors=box_vectors, **extra,
+        )
+        eng.set_string_sites(string_sites_eng, m_star)
+        if cfg is not None:
+            eng._eng.set_op_string(
+                np.ascontiguousarray(cfg["op_types"], dtype=np.int32),
+                np.ascontiguousarray(cfg["op_sites"], dtype=np.int32))
+            eng.thermalize(0, direction="forward")
+        else:
+            run_equil_with_progress(
+                lambda n: eng.thermalize(n, direction="forward"),
+                n_thermalize, label="MPI-STRWORK init",
+                rank=rank, print_every=equil_progress_every, verbose=verbose)
+
+    # ── Growth residence-ladder anchor (sector growth, one bit per stage) ──
+    # Robust replacement for the lambda-Jarzynski bridge when half-line
+    # mixing is slow (docs/design/seam_drag_curve.md SS9): each rank runs an
+    # independent ladder; rank 0 aggregates per-rank log O_C by scatter.
+    # Ends in the full-mask sector, so a following drag phase can shorten
+    # its reverse thermalization.
+    growth_payload = None
+    if growth_anchor:
+        comm.Barrier()
+        t0 = time.perf_counter()
+        res = eng.run_growth_residence_ladder(
+            n_samples_per_stage=growth_samples_per_stage,
+            n_sweeps_between_samples=growth_sweeps_between_samples,
+            n_equil_per_stage=growth_equil_per_stage,
+            n_tune_samples=growth_tune_samples,
+            n_toggle_attempts=growth_toggle_attempts)
+        row = dict(log_r=np.asarray(res.log_r),
+                   log_r_sem=np.asarray(res.log_r_sem),
+                   lambdas=np.asarray(res.lambdas),
+                   p_on=np.asarray(res.p_on),
+                   n_flips=np.asarray(res.n_flips, dtype=np.int64))
+        if checkpoint_dir and checkpoint_every_trajectories > 0:
+            gdir = os.path.join(checkpoint_dir, "growth")
+            with RankChunkWriter(gdir, rank, run_attrs=dict(
+                    checkpoint_schema=1, phase="growth", seed=rank_seed,
+                    n_ranks=int(n_ranks), N=int(N), M_total=int(2 * M),
+                    samples_per_stage=int(growth_samples_per_stage),
+                    string_sites=np.asarray(list(string_sites), dtype=np.int32),
+            )) as w:
+                w.write_chunk(0, datasets=row, attrs=dict())
+        all_rows = comm.gather(row, root=0)
+        t_growth = comm.reduce(time.perf_counter() - t0, op=MPI.MAX, root=0)
+        if rank == 0:
+            log_oc_ranks = np.array([float(np.sum(r["log_r"])) for r in all_rows])
+            finite = np.isfinite(log_oc_ranks)
+            n_valid = int(finite.sum())
+            if n_valid == 0:
+                raise RuntimeError("growth anchor: every rank has an "
+                                   "unresolved stage (raise samples per stage)")
+            log_o_c = float(log_oc_ranks[finite].mean())
+            sem = (float(log_oc_ranks[finite].std(ddof=1)) / math.sqrt(n_valid)
+                   if n_valid > 1 else
+                   float(np.sqrt(np.sum(all_rows[0]["log_r_sem"] ** 2))))
+            growth_payload = dict(
+                log_o_c=log_o_c, o_c=math.exp(log_o_c), log_o_c_sem=sem,
+                n_ranks_valid=n_valid, n_ranks=int(n_ranks),
+                samples_per_stage=int(growth_samples_per_stage),
+                sweeps_between_samples=int(growth_sweeps_between_samples),
+                elapsed=float(t_growth),
+                log_r_ranks=np.stack([r["log_r"] for r in all_rows]),
+                log_r_sem_ranks=np.stack([r["log_r_sem"] for r in all_rows]),
+                lambdas_ranks=np.stack([r["lambdas"] for r in all_rows]),
+                p_on_ranks=np.stack([r["p_on"] for r in all_rows]),
+                n_flips_ranks=np.stack([r["n_flips"] for r in all_rows]),
+            )
+            if verbose:
+                flips_min = int(growth_payload["n_flips_ranks"].min())
+                print(f"[MPI-STRWORK] growth: O_C={growth_payload['o_c']:.6f} "
+                      f"(log O_C={log_o_c:+.4f} ± {sem:.4f}) "
+                      f"ranks_valid={n_valid}/{n_ranks} "
+                      f"min_stage_flips={flips_min} elapsed={t_growth:.1f}s",
+                      flush=True)
+
     # ── Drag-ladder phase: whole-curve O_C(delta) from the last K's engine ──
     # (docs/design/seam_drag_curve.md).  Each rank runs drag_repeats
     # independent mirrored (or left-only) RB-ladder passes on its own chain;
@@ -573,6 +670,13 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 drag_payload["curves"][int(K)] = dict(
                     log_o_curve=log_o, o_curve=np.exp(log_o),
                     log_o_curve_sem=sem_o)
+            if growth_payload is not None:
+                log_o = growth_payload["log_o_c"] + log_r_mean
+                sem_o = np.sqrt(growth_payload["log_o_c_sem"] ** 2
+                                + drag_payload["log_r_sem"] ** 2)
+                drag_payload["curves"]["growth"] = dict(
+                    log_o_curve=log_o, o_curve=np.exp(log_o),
+                    log_o_curve_sem=sem_o)
             if verbose:
                 print(f"[MPI-STRWORK] drag: {n_passes} passes x "
                       f"{grid.size} points (mirror={drag_mirror}, "
@@ -604,10 +708,11 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             m_star=(-1 if m_star is None else int(m_star)),
             schedule=str(schedule), direction=str(direction),
             K_values=K_values, results=results, drag=drag_payload,
+            growth=growth_payload,
         ))
         if verbose:
             print(f"[MPI-STRWORK] saved HDF5 → {filepath}", flush=True)
-    return {"K_results": results, "drag": drag_payload}
+    return {"K_results": results, "drag": drag_payload, "growth": growth_payload}
 
 
 def _save_hdf5(path: str, payload: dict) -> None:
@@ -652,9 +757,20 @@ def _save_hdf5(path: str, payload: dict) -> None:
                     dg.create_dataset(key, data=np.asarray(drag[key]))
             cg = dg.create_group("curves")
             for K, cur in drag["curves"].items():
-                kg = cg.create_group(f"K{int(K)}")
+                name = f"K{K}" if isinstance(K, int) else str(K)
+                kg = cg.create_group(name)
                 for key in ("log_o_curve", "o_curve", "log_o_curve_sem"):
                     kg.create_dataset(key, data=np.asarray(cur[key]))
+        growth = payload.get("growth")
+        if growth is not None:
+            gg = f.create_group("growth")
+            for key in ("log_o_c", "o_c", "log_o_c_sem", "n_ranks_valid",
+                        "n_ranks", "samples_per_stage",
+                        "sweeps_between_samples", "elapsed"):
+                gg.attrs[key] = growth[key]
+            for key in ("log_r_ranks", "log_r_sem_ranks", "lambdas_ranks",
+                        "p_on_ranks", "n_flips_ranks"):
+                gg.create_dataset(key, data=np.asarray(growth[key]))
 
 
 def _parse_int_list(text: str) -> list[int]:
@@ -690,7 +806,9 @@ def main():
     parser.add_argument("--m-star", type=int, default=-1,
                         help="seam slice (default -1 = M, the midpoint)")
     parser.add_argument("--K-values", type=str, default="200",
-                        help="comma-separated lambda-schedule segment counts")
+                        help="comma-separated lambda-schedule segment counts; "
+                             "'none' skips the lambda-anchor phase entirely "
+                             "(requires --growth-anchor or --drag-*)")
     parser.add_argument("--schedule", type=str, default="cosine",
                         choices=["cosine", "linear"])
     parser.add_argument("--direction", type=str, default="forward",
@@ -752,6 +870,16 @@ def main():
                         help="reverse-sector thermalization before the drag phase "
                              "(-1 = reuse --n-thermalize)")
     parser.add_argument("--drag-equil-at-anchor", type=int, default=100)
+    # ── Growth residence-ladder anchor (sector growth, one bit per stage) ──
+    parser.add_argument("--growth-anchor", action="store_true",
+                        help="anchor O_C via the sector-growth residence "
+                             "ladder (robust when half-line mixing is slow; "
+                             "replaces or cross-checks the lambda anchor)")
+    parser.add_argument("--growth-samples-per-stage", type=int, default=4000)
+    parser.add_argument("--growth-sweeps-between-samples", type=int, default=1)
+    parser.add_argument("--growth-equil-per-stage", type=int, default=200)
+    parser.add_argument("--growth-tune-samples", type=int, default=300)
+    parser.add_argument("--growth-toggle-attempts", type=int, default=1)
     parser.add_argument("--permute-site-labels",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="per-rank random site-label permutation (identical "
@@ -817,7 +945,8 @@ def main():
         delta_min=args.delta_min, delta_max=args.delta_max,
         epsilon=args.epsilon, pos=pos,
         string_sites=string_sites,
-        K_values=_parse_int_list(args.K_values),
+        K_values=([] if args.K_values.strip().lower() in ("", "none")
+                  else _parse_int_list(args.K_values)),
         schedule=args.schedule,
         n_trajectories=args.n_trajectories,
         n_thermalize=args.n_thermalize,
@@ -847,6 +976,12 @@ def main():
         drag_repeats=args.drag_repeats,
         drag_thermalize=args.drag_thermalize,
         drag_equil_at_anchor=args.drag_equil_at_anchor,
+        growth_anchor=args.growth_anchor,
+        growth_samples_per_stage=args.growth_samples_per_stage,
+        growth_sweeps_between_samples=args.growth_sweeps_between_samples,
+        growth_equil_per_stage=args.growth_equil_per_stage,
+        growth_tune_samples=args.growth_tune_samples,
+        growth_toggle_attempts=args.growth_toggle_attempts,
     )
 
 

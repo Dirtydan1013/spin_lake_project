@@ -191,6 +191,41 @@ def test_drag_two_site_ladder_matches_ed():
     _check_family_vs_ed(res_l, ed, "2site left", tol=0.10)
 
 
+def test_growth_anchor_matches_ed():
+    # Sector-growth residence ladder (anchor v2): every partial product
+    # Z_{bits 0..k}/Z_empty must match ED's O_B of the partial string --
+    # a per-stage gate, not just the endpoint (compensating-bias discipline).
+    sites = [1, 2, 3]
+    pos = generate_1d_chain(N)
+    ed = qaqmc_exact_string_zratio(
+        N=N, Omega=OMEGA, delta_min=DELTA_MIN, delta_max=DELTA_MAX, Rb=RB,
+        M=M, B_sets=[[1], [1, 2], [1, 2, 3]], m_star=M, pos=pos,
+        epsilon=EPSILON, neighbor_cutoff=1)
+    partials = [frozenset(sites[:k + 1]) for k in range(len(sites))]
+
+    eng = QAQMCStringWorkRydberg(
+        N=N, M=M, Omega=OMEGA, Rb=RB, delta_min=DELTA_MIN, delta_max=DELTA_MAX,
+        epsilon=EPSILON, seed=909, pos=pos, neighbor_cutoff=1, delta_groups=32)
+    eng.set_string_sites(sites)
+    eng.thermalize(1000)
+    res = eng.run_growth_residence_ladder(n_samples_per_stage=6000,
+                                          n_sweeps_between_samples=1,
+                                          n_equil_per_stage=200,
+                                          n_tune_samples=300)
+    cum = np.cumsum(res.log_r)
+    for k, fs in enumerate(partials):
+        got = float(np.exp(cum[k]))
+        exact = ed["O_B"][fs]
+        rel_err = abs(got - exact) / exact
+        print(f"  [growth] stage {k} (C={sorted(fs)}): O={got:.4f} "
+              f"(lam={res.lambdas[k]:.3f}, p_on={res.p_on[k]:.3f}, "
+              f"flips={res.n_flips[k]})  O_ED={exact:.4f}  rel_err={rel_err:.3f}")
+        assert res.n_flips[k] > 50, f"stage {k} under-mixed"
+        assert rel_err < 0.10, (k, got, exact, rel_err)
+    # ladder must hand the engine back in the full-mask sector (drag segue)
+    assert eng._eng.seam_mask == 0b111
+
+
 def test_drag_composed_curve_matches_ed():
     # End-to-end: O_C(m) = O_C(M) [lambda-Jarzynski anchor] x r_ladder(m).
     eng, pos = _make_engine(seed=777)

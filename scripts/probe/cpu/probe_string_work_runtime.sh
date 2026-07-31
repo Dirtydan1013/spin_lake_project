@@ -65,6 +65,17 @@ DRAG_BURN=${DRAG_BURN:-5}
 DRAG_REPEATS=${DRAG_REPEATS:-1}
 PROBE_DRAG_SAMPLES=${PROBE_DRAG_SAMPLES:-4}
 
+# Growth residence-ladder anchor probe (GROWTH=1): runs the ladder at
+# PROBE_GROWTH_SAMPLES per stage — the timing scales, and the reported
+# min_stage_flips tells you the mixing rate that sets the production
+# GROWTH_SAMPLES.  K=none skips the lambda anchor.
+GROWTH=${GROWTH:-0}
+GROWTH_SAMPLES=${GROWTH_SAMPLES:-4000}
+GROWTH_SWEEPS=${GROWTH_SWEEPS:-1}
+GROWTH_EQUIL=${GROWTH_EQUIL:-200}
+GROWTH_TUNE=${GROWTH_TUNE:-300}
+PROBE_GROWTH_SAMPLES=${PROBE_GROWTH_SAMPLES:-200}
+
 # Probe scale: a couple of trajectories per rank + a short thermalize.
 PROBE_TRAJ_PER_RANK=${PROBE_TRAJ_PER_RANK:-2}
 PROBE_THERMALIZE=${PROBE_THERMALIZE:-50}
@@ -132,6 +143,8 @@ $MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     --decorrelation-steps "$DECORR" \
     --n-topology-sweeps-per-lambda "$N_TOPO_SWEEPS" \
     --n-qaqmc-sweeps-per-lambda "$N_QMC_SWEEPS" \
+    $( [ "$GROWTH" = "1" ] && printf %s --growth-anchor ) \
+    $( [ "$GROWTH" = "1" ] && printf "%s" "--growth-samples-per-stage $PROBE_GROWTH_SAMPLES --growth-sweeps-between-samples $GROWTH_SWEEPS --growth-equil-per-stage $GROWTH_EQUIL --growth-tune-samples $GROWTH_TUNE" ) \
     ${DRAG_DELTAS:+--drag-deltas "$DRAG_DELTAS"} \
     ${DRAG_DELTAS:+--drag-slots-per-rung "$DRAG_SPR"} \
     ${DRAG_DELTAS:+--drag-samples-per-rung "$PROBE_DRAG_SAMPLES"} \
@@ -152,7 +165,9 @@ target_per_rank = ($TARGET_N_TRAJ + $NTASKS - 1) // $NTASKS
 log = open("$PROBE_LOG").read()
 drag_m = re.search(r"drag: .* elapsed=([0-9.]+)s", log)
 drag_probe = float(drag_m.group(1)) if drag_m else 0.0
-lam_probe = probe_elapsed - drag_probe
+growth_m = re.search(r"growth: .* elapsed=([0-9.]+)s", log)
+growth_probe = float(growth_m.group(1)) if growth_m else 0.0
+lam_probe = probe_elapsed - drag_probe - growth_probe
 
 # Rough split: engine init + thermalize is a fixed overhead; per-trajectory
 # cost scales linearly.  The K-line "elapsed=" in the log gives the pure
@@ -164,6 +179,19 @@ print(f"probe wall = {probe_elapsed:.1f}s "
       f"includes init+thermalize {$PROBE_THERMALIZE} steps)")
 print(f"UPPER-BOUND lambda-anchor estimate ≈ {per_traj:.1f}s/traj × "
       f"{target_per_rank} traj/rank = {lam_est / 3600:.2f} h")
+growth_est = 0.0
+if growth_probe > 0.0:
+    n_stages = len("$STRING_SITES".split(","))
+    step_g = re.findall(r"equilibration .*, ([0-9.]+) step/s", log)
+    t_step_g = 1.0 / float(step_g[-1]) if step_g else 0.0
+    fixed_g = n_stages * ($GROWTH_EQUIL + 3 * $GROWTH_TUNE) * t_step_g
+    samp_g = max(growth_probe - fixed_g, 0.0)
+    growth_est = samp_g * ($GROWTH_SAMPLES / $PROBE_GROWTH_SAMPLES) + fixed_g
+    flips_m = re.search(r"min_stage_flips=(\d+)", log)
+    print(f"growth probe = {growth_probe:.1f}s at $PROBE_GROWTH_SAMPLES samples/stage → "
+          f"production growth ≈ {growth_est / 3600:.2f} h ($GROWTH_SAMPLES samples/stage); "
+          f"min_stage_flips={flips_m.group(1) if flips_m else '?'} at probe scale — scale "
+          f"GROWTH_SAMPLES so every stage gets >~200 flips")
 drag_est = 0.0
 if drag_probe > 0.0:
     # Rung count is identical between probe and production (same grid/spr),
@@ -183,6 +211,6 @@ if drag_probe > 0.0:
           f"{drag_est / 3600:.2f} h ($DRAG_SAMPLES samples/rung × "
           f"$DRAG_REPEATS repeats/rank)")
 from src.probes import costreport
-costreport.report(lam_est + drag_est, $NTASKS, $CPT)
+costreport.report(lam_est + growth_est + drag_est, $NTASKS, $CPT)
 print("For a tighter estimate use the per-K 'elapsed=' / 'drag:' lines printed by the driver.")
 PY

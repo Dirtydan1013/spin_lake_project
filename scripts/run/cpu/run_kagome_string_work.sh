@@ -98,6 +98,17 @@ DRAG_SPR=${DRAG_SPR:-64}               # slots per rung
 DRAG_REPEATS=${DRAG_REPEATS:-1}         # independent ladder passes per rank
 DRAG_THERMALIZE=${DRAG_THERMALIZE:--1}  # reverse-sector equil (-1 = N_THERMALIZE)
 
+# ── Growth residence-ladder anchor (docs/design/seam_drag_curve.md SS9) ─────
+# GROWTH=1 anchors O_C by growing the string one seam bit per stage
+# (balanced-lambda sector residence) — the robust choice when half-line
+# mixing is slow (kagome loops at Rb=2.4).  Combine with K_VALUES=none to
+# skip the lambda-Jarzynski anchor entirely, or keep both as a cross-check.
+GROWTH=${GROWTH:-0}
+GROWTH_SAMPLES=${GROWTH_SAMPLES:-4000}   # residence samples per stage
+GROWTH_SWEEPS=${GROWTH_SWEEPS:-1}        # mc_steps between samples
+GROWTH_EQUIL=${GROWTH_EQUIL:-200}        # equilibration per stage
+GROWTH_TUNE=${GROWTH_TUNE:-300}          # samples per lambda-autotune round
+
 # String selection.  Either give explicit site indices via STRING_SITES
 # ("s0,s1,..."), or set STRING_SIZE to auto-pick the most central size-s
 # C_m string copy on the (kagome_bond) lattice.
@@ -171,6 +182,8 @@ $MPIEXEC \
     ${CONFIG_IN:+--config-in "$CONFIG_IN"} \
     ${CONFIG_OUT:+--config-out "$CONFIG_OUT"} \
     $( [ "$PERMUTE_SITES" = "1" ] || printf %s --no-permute-site-labels ) \
+    $( [ "$GROWTH" = "1" ] && printf %s --growth-anchor ) \
+    $( [ "$GROWTH" = "1" ] && printf "%s" "--growth-samples-per-stage $GROWTH_SAMPLES --growth-sweeps-between-samples $GROWTH_SWEEPS --growth-equil-per-stage $GROWTH_EQUIL --growth-tune-samples $GROWTH_TUNE" ) \
     ${DRAG_DELTAS:+--drag-deltas "$DRAG_DELTAS"} \
     ${DRAG_DELTAS:+--drag-samples-per-rung "$DRAG_SAMPLES"} \
     ${DRAG_DELTAS:+--drag-sweeps-between-samples "$DRAG_SWEEPS"} \

@@ -77,6 +77,42 @@ def test_string_drag_driver_single_rank():
             assert "log_o_c_sem_boot" in f["K_results"]["K50"].attrs
 
 
+def test_string_growth_anchor_driver_no_lambda():
+    # K='none' path: growth anchor + drag, no lambda phase at all; the drag
+    # curves must compose against the growth anchor.
+    import h5py
+
+    N, M = 5, 16
+    pos = np.asarray(generate_1d_chain(N), dtype=np.float64)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "growth_mpi.h5")
+        out = run_string_work_mpi(
+            N=N, M=M, Omega=1.0, Rb=1.2, delta_min=0.0, delta_max=1.5,
+            epsilon=0.01, pos=pos, string_sites=[1, 3],
+            K_values=[], schedule="cosine",
+            n_trajectories=1, n_thermalize=200, decorrelation_steps=5,
+            neighbor_cutoff=1, delta_groups=16, seed=21,
+            filepath=path,
+            growth_anchor=True, growth_samples_per_stage=400,
+            growth_tune_samples=100, growth_equil_per_stage=50,
+            drag_grid=[12], drag_mirror=True,
+            drag_samples_per_rung=30, drag_slots_per_rung=2,
+            drag_repeats=1, drag_thermalize=100,
+            verbose=False,
+        )
+        g = out["growth"]
+        assert g is not None and np.isfinite(g["log_o_c"])
+        assert g["n_ranks_valid"] == 1
+        assert g["log_r_ranks"].shape == (1, 2)
+        assert out["K_results"] == {}
+        cur = out["drag"]["curves"]["growth"]
+        np.testing.assert_allclose(
+            cur["log_o_curve"], g["log_o_c"] + out["drag"]["log_r_mean"])
+        with h5py.File(path, "r") as f:
+            assert np.isclose(f["growth"].attrs["o_c"], g["o_c"])
+            assert "growth" in f["drag"]["curves"]
+
+
 def test_string_driver_without_drag_unchanged():
     # No drag flags -> payload absent and the legacy result dict intact.
     N, M = 5, 8
@@ -95,6 +131,8 @@ def test_string_driver_without_drag_unchanged():
 def main():
     test_string_drag_driver_single_rank()
     print("drag driver single-rank plumbing passed")
+    test_string_growth_anchor_driver_no_lambda()
+    print("growth anchor + no-lambda path passed")
     test_string_driver_without_drag_unchanged()
     print("no-drag legacy path passed")
 
