@@ -283,3 +283,42 @@ repeats（rung 數按構造相同），計入 CPU-hours 報告。
   共享一次 sector 橋接。
 - work 分佈寬度隨 |m−anchor| 增長 → 曲線遠端 n_eff 下降是預期行為，
   由逐 m 診斷量化；必要時加密 relax 或縮短單族拖距（production 再調）。
+
+## 9. Anchor v2：growth residence ladder（2026-08-01）
+
+**動機**：λ-Jarzynski anchor 在 production 幾何（6×6 PBC、M=227600、vertex
+hexagon loop C={84..89}、Rb=2.4）上失效——probe 27102/27103/27105：
+n_eff 2–11%、O_C 有 4 倍 K-趨勢（K=1800→3600）、正反向括號反轉。根因
+（toggle 接受率診斷）：half-line 混合慢 + 部分弦 sector 比值小（interior
+stage 接受率 0–2%），一條 trajectory 要在單次 sweep 內穿越全部 6 個
+bottleneck → work 分佈爆寬，K/relax 救不了。
+
+**設計**：逐 bit 成長。stage k 凍結 bits 0..k−1（`set_seam_mask_consistent`）、
+只讓 bit k 在 λ_k toggle；λ_k autotune 到 occupancy 平衡；
+Z_{k+1}/Z_k = (P_on/P_off)·(1−λ_k)/λ_k 精確；O_C = ∏。平衡方法——慢混合
+只花 sweep 數，不毀有效性。flip 數 = 誠實有效樣本數；未解析 stage
+poison（±inf）不給假數字。結束停在 full-mask sector 直接接 drag。
+wrapper `run_growth_residence_ladder`；driver `--growth-anchor`
+（`--K-values none` 可全跳 λ phase）；scripts `GROWTH_*`。
+
+**又一個 E14 快取坑（修掉）**：裸呼叫 `attempt_string_toggle` 吃到 cluster
+弄髒的 seam snapshots → residence 比值隨 λ 系統性偏（λ=0.63 時 19%）。
+取樣迴圈進場 recompute（同 topology_sweep 慣例）。教訓通則化：**任何**
+繞過 `topology_sweep` 直接用 seam 原語的路徑都必須自己 recompute。
+（也影響先前的接受率診斷數字——定性結論不變。）
+
+**池化聚合（27113→27114 的教訓）**：per-rank autotune 下，hard stage 沒
+flip 的 rank 整條 ladder 作廢（47/64），且「倖存者」有強選擇偏差
+（27113 的 −6.8±1.7 是壞數字）。修正：rank 0 短 ladder 調 λ → broadcast
+→ 全體同 λ 採樣 → 逐 stage 池化 occupancy/flips（可加、有效樣本 =
+總 flip 數）。27114（1000 samples/stage 池化）：
+
+    O_C(δ=6) = e^(−15.81 ± 0.43) ≈ 1.4e-7
+    stages: −2.65(σ.10) −4.45(σ.25) −1.08(σ.04) −5.05(σ.32) −0.60(σ.04) −1.96(σ.10)
+    hard stages 1,3（flips 129/80，λ≈0.998）＝主要成本
+
+**狀態**：待兩個一致性檢查（27115 equil/rate ×3、27116 成長順序重排 —
+不同中間 sector、同終點）確認後才定案；量級遠低於 λ-anchor 的 whale
+軼事值（後者不可信）。物理註：drag 曲線往低 δ 續降 + anchor ~1e-7 意味
+sweep 態的 loop coherence 遠低於平衡 |A_v|——若一致性檢查過，這本身就是
+待理解的物理（finite-v 態 vs 平衡態的 off-diagonal 差異）。
