@@ -322,3 +322,16 @@ flip 的 rank 整條 ladder 作廢（47/64），且「倖存者」有強選擇�
 軼事值（後者不可信）。物理註：drag 曲線往低 δ 續降 + anchor ~1e-7 意味
 sweep 態的 loop coherence 遠低於平衡 |A_v|——若一致性檢查過，這本身就是
 待理解的物理（finite-v 態 vs 平衡態的 off-diagonal 差異）。
+
+**§9 後續（2026-08-01 深夜，定案）**：27114–16 的 z~8–20 不一致源於慢混合
+transient：hard stage flip rate ~1%/sample，(a) stage 一律從 bit=OFF 起始、
+(b) tune→production 的 λ 跳躍後立即開錄，兩者的 occupancy transient 佔了
+錄製窗的可觀比例，且 flip-count 誤差棒看不見它。修正：λ-後平衡再開錄、
+半數 rank 從 ON sector 起始（池化下首階互消）、toggle attempts 預設 4
+（toggle walk ≪ mc_step 成本、flip rate 直接乘上去）、誤差棒以 64-chain
+rank scatter 為下限。重跑一致性（27119/27120，兩種成長順序）：
+log O_C = −6.653±0.409 vs −6.701±0.441，**z=0.08 ✓**，min flips 662–1097。
+**O_C(δ=6) = (1.26±0.5)×10⁻³ 定案**（修正前的 1.4e-7 是 transient 假象，
+λ-Jarzynski 的 0.006–0.079 是 whale 軼事——兩代錯誤數字都以一致性檢查
+淘汰）。教訓入庫：稀有翻轉的 residence 估計，(1) 初始化要對稱、
+(2) 換 λ 要重新平衡、(3) 誤差棒必須含鏈間散佈、(4) 永遠做路徑重排一致性檢查。
