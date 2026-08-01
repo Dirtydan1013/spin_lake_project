@@ -615,7 +615,9 @@ class QAQMCStringWorkRydberg:
                                     n_equil_per_stage: int = 200,
                                     n_tune_samples: int = 300,
                                     tune_rounds: int = 3,
-                                    n_toggle_attempts: int = 1,
+                                    n_toggle_attempts: int = 4,
+                                    n_equil_at_lambda: int = 200,
+                                    start_bit_on: bool = False,
                                     stage_lambdas: np.ndarray | None = None
                                     ) -> StringGrowthAnchorResult:
         """Anchor O_C via the sector-growth residence ladder.
@@ -635,6 +637,15 @@ class QAQMCStringWorkRydberg:
         rerun with more samples (check ``n_flips`` in the result).
         ``stage_lambdas`` overrides the autotune (e.g. rank 0's tuned values
         broadcast to all ranks for a deterministic protocol).
+
+        Slow-mixing hygiene (the production kagome lesson — consistency
+        probes 27114/15/16 disagreed by z~8-20 before these): recording only
+        starts after ``n_equil_at_lambda`` samples AT the final lambda (a
+        tune-to-production lambda jump otherwise leaves a long occupancy
+        transient); ``start_bit_on`` lets half the chains start in the ON
+        sector so initialization transients cancel to first order across a
+        pooled ensemble; ``n_toggle_attempts`` > 1 multiplies the flip rate
+        cheaply (a toggle walk costs far less than an mc_step).
         """
         L = self._length
         if L < 1:
@@ -678,6 +689,15 @@ class QAQMCStringWorkRydberg:
                     lam = min(max(lam, 1e-9), 1.0 - 1e-9)
             lambdas[k] = lam
 
+            if start_bit_on:
+                self._eng.set_seam_mask_consistent(base_mask | (1 << k))
+                for _ in range(max(n_equil_per_stage // 4, 10)):
+                    self._eng.mc_step()
+            # burn in AT the final lambda before recording (toggles active)
+            if n_equil_at_lambda > 0:
+                self._stage_occupancy(k, lam, n_equil_at_lambda,
+                                      n_sweeps_between_samples,
+                                      n_toggle_attempts)
             occ, flips = self._stage_occupancy(
                 k, lam, n_samples_per_stage, n_sweeps_between_samples,
                 n_toggle_attempts)

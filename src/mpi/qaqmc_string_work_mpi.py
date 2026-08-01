@@ -194,7 +194,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         growth_sweeps_between_samples: int = 1,
                         growth_equil_per_stage: int = 200,
                         growth_tune_samples: int = 300,
-                        growth_toggle_attempts: int = 1,
+                        growth_toggle_attempts: int = 4,
                         verbose: bool = True) -> dict | None:
     """config_in: warm-start directory of rank{r}.h5 final configurations from
     a previous run with the same (N, M, Hamiltonian); when given, per-K
@@ -533,6 +533,8 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             n_equil_per_stage=growth_equil_per_stage,
             n_tune_samples=growth_tune_samples,
             n_toggle_attempts=growth_toggle_attempts,
+            n_equil_at_lambda=growth_equil_per_stage,
+            start_bit_on=(rank % 2 == 1),
             stage_lambdas=shared_lambdas)
         row = dict(log_r=np.asarray(res.log_r),
                    log_r_sem=np.asarray(res.log_r_sem),
@@ -566,9 +568,13 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                     f"ANY rank — raise growth_samples_per_stage")
             odds_g = np.log((1.0 - shared_lambdas) / shared_lambdas)
             log_r_pool = np.log(p_pool / (1.0 - p_pool)) + odds_g
-            # sem: flip-count bound per stage; the per-rank scatter of the
-            # pooled-lambda log_r is reported alongside as a cross-check.
-            log_r_sem_pool = np.sqrt(8.0 / np.maximum(flips_pool, 1))
+            # sem: rank-scatter of p (64 independent chains, half started in
+            # each sector — includes any residual transient variance) floored
+            # by the flip-count bound
+            sem_p_scatter = p_ranks.std(axis=0, ddof=1) / math.sqrt(n_ranks)
+            sem_scatter = sem_p_scatter / (p_pool * (1.0 - p_pool))
+            log_r_sem_pool = np.maximum(
+                sem_scatter, np.sqrt(8.0 / np.maximum(flips_pool, 1)))
             log_o_c = float(np.sum(log_r_pool))
             sem = float(np.sqrt(np.sum(log_r_sem_pool ** 2)))
             growth_payload = dict(
@@ -917,7 +923,7 @@ def main():
     parser.add_argument("--growth-sweeps-between-samples", type=int, default=1)
     parser.add_argument("--growth-equil-per-stage", type=int, default=200)
     parser.add_argument("--growth-tune-samples", type=int, default=300)
-    parser.add_argument("--growth-toggle-attempts", type=int, default=1)
+    parser.add_argument("--growth-toggle-attempts", type=int, default=4)
     parser.add_argument("--permute-site-labels",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="per-rank random site-label permutation (identical "
