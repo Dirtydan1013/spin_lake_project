@@ -193,6 +193,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         growth_samples_per_stage: int = 4000,
                         growth_sweeps_between_samples: int = 1,
                         growth_equil_per_stage: int = 200,
+                        growth_burn_per_stage: int = -1,
                         growth_tune_samples: int = 300,
                         growth_toggle_attempts: int = 4,
                         verbose: bool = True) -> dict | None:
@@ -533,7 +534,13 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             n_equil_per_stage=growth_equil_per_stage,
             n_tune_samples=growth_tune_samples,
             n_toggle_attempts=growth_toggle_attempts,
-            n_equil_at_lambda=growth_equil_per_stage,
+            # mixing diagnostic 27133: the in-sector dressing transient lasts
+            # ~10-15k samples on the production kagome geometry — a 200-sample
+            # burn leaves the window average biased low (the 1k/8k/32k window
+            # drift).  Burn long enough to record plateau only.
+            n_equil_at_lambda=(growth_burn_per_stage
+                               if growth_burn_per_stage >= 0
+                               else growth_equil_per_stage),
             start_bit_on=(rank % 2 == 1),
             stage_lambdas=shared_lambdas)
         row = dict(log_r=np.asarray(res.log_r),
@@ -922,6 +929,10 @@ def main():
     parser.add_argument("--growth-samples-per-stage", type=int, default=4000)
     parser.add_argument("--growth-sweeps-between-samples", type=int, default=1)
     parser.add_argument("--growth-equil-per-stage", type=int, default=200)
+    parser.add_argument("--growth-burn-per-stage", type=int, default=-1,
+                        help="samples discarded AT the final lambda before "
+                             "recording (default: growth-equil-per-stage); "
+                             "production kagome needs >=16000 (probe 27133)")
     parser.add_argument("--growth-tune-samples", type=int, default=300)
     parser.add_argument("--growth-toggle-attempts", type=int, default=4)
     parser.add_argument("--permute-site-labels",
@@ -1024,6 +1035,7 @@ def main():
         growth_samples_per_stage=args.growth_samples_per_stage,
         growth_sweeps_between_samples=args.growth_sweeps_between_samples,
         growth_equil_per_stage=args.growth_equil_per_stage,
+        growth_burn_per_stage=args.growth_burn_per_stage,
         growth_tune_samples=args.growth_tune_samples,
         growth_toggle_attempts=args.growth_toggle_attempts,
     )

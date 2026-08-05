@@ -107,6 +107,8 @@ GROWTH=${GROWTH:-0}
 GROWTH_SAMPLES=${GROWTH_SAMPLES:-4000}   # residence samples per stage
 GROWTH_SWEEPS=${GROWTH_SWEEPS:-1}        # mc_steps between samples
 GROWTH_EQUIL=${GROWTH_EQUIL:-200}        # equilibration per stage
+GROWTH_BURN=${GROWTH_BURN:--1}           # burn at final lambda before recording
+                                         # (-1 = GROWTH_EQUIL; kagome needs >=16000, probe 27133)
 GROWTH_TUNE=${GROWTH_TUNE:-300}          # samples per lambda-autotune round
 
 # String selection.  Either give explicit site indices via STRING_SITES
@@ -183,7 +185,7 @@ $MPIEXEC \
     ${CONFIG_OUT:+--config-out "$CONFIG_OUT"} \
     $( [ "$PERMUTE_SITES" = "1" ] || printf %s --no-permute-site-labels ) \
     $( [ "$GROWTH" = "1" ] && printf %s --growth-anchor ) \
-    $( [ "$GROWTH" = "1" ] && printf "%s" "--growth-samples-per-stage $GROWTH_SAMPLES --growth-sweeps-between-samples $GROWTH_SWEEPS --growth-equil-per-stage $GROWTH_EQUIL --growth-tune-samples $GROWTH_TUNE" ) \
+    $( [ "$GROWTH" = "1" ] && printf "%s" "--growth-samples-per-stage $GROWTH_SAMPLES --growth-sweeps-between-samples $GROWTH_SWEEPS --growth-equil-per-stage $GROWTH_EQUIL --growth-burn-per-stage $GROWTH_BURN --growth-tune-samples $GROWTH_TUNE" ) \
     ${DRAG_DELTAS:+--drag-deltas "$DRAG_DELTAS"} \
     ${DRAG_DELTAS:+--drag-samples-per-rung "$DRAG_SAMPLES"} \
     ${DRAG_DELTAS:+--drag-sweeps-between-samples "$DRAG_SWEEPS"} \
