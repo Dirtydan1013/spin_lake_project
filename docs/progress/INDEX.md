@@ -19,3 +19,4 @@
 | [E14](experiments/E14_2026-07-12_sse-offdiagonal-string.md) | 07-12 | SSE非對角弦引擎（熱態⟨X_C⟩，Jarzynski） | ED 4/4＋driver端對端；週期邊界宇稱修復bug；回查QAQMC挖出3 bug（seam cache×2＋閉合宇稱重設）全修——舊two-site測試通過是互償假象 | 完成 |
 | [E15](experiments/E15_2026-07-27_entropy-ladder-beta80.md) | 07-27 | 熵ladder低溫延伸β=20→81.75（δ=4.5 6×6） | S/N平台撐到T≈0.012不動、終點0.110(12)≈ln2/6；overlap −4.5σ=冷啟動偏差（丟棄該rung）；β=81.75 config已存可warm-start | 完成 |
 | [E16](experiments/E16_2026-07-28_entropy-ladder-beta179.md) | 07-28 | 熵ladder再延伸β=82→178.7（warm-start首戰） | 平台撐到T≈0.0056、終點0.112(19)≈ln2/6（累計比E13低9倍溫度）；warm-start接縫無偏差；decimation check≲統計誤差 | 完成 |
+| [E17](experiments/E17_2026-08-05_growth-anchor-mixing.md) | 08-05 | Growth anchor window漂移診斷（兩臂occupancy時序，生產M=227600） | 漂移=burn 200≪transient 10–15k被攤進窗平均，非glassy非estimator bug（兩臂同平台=DB直接確認）；平台s1 −1.02(8) s3 −1.00(9)；處方GROWTH_BURN=16000 | 27135跑收斂anchor中 |

@@ -335,3 +335,42 @@ log O_C = −6.653±0.409 vs −6.701±0.441，**z=0.08 ✓**，min flips 662–
 λ-Jarzynski 的 0.006–0.079 是 whale 軼事——兩代錯誤數字都以一致性檢查
 淘汰）。教訓入庫：稀有翻轉的 residence 估計，(1) 初始化要對稱、
 (2) 換 λ 要重新平衡、(3) 誤差棒必須含鏈間散佈、(4) 永遠做路徑重排一致性檢查。
+
+## 10. Anchor 收斂定案：window 漂移 = burn 不足（2026-08-05）
+
+**§9 的「定案」再翻案**。三個取樣窗長度的 anchor 互不一致且單調上升：
+
+    window   1,000 → log O_C = −6.68 ± 0.30   (27119/27120)
+             8,000 →           −5.50 ± 0.29   (27125)
+            32,000 →           −4.46 ± 0.15   (27121 production)
+
+每 e-fold 上升 ~0.6–0.75，1/T transient 模型在 8k 點被否決（預測 −4.68，
+實測 −5.50，z≈2.9）。一度懷疑 glassy / log T 永不收斂。
+
+**兩臂混合診斷（27133，`src/mpi/growth_mixing_diag_mpi.py`）**：生產參數
+（M=227600、shared λ）下把 stage 1/3 單獨拉長到 T=48k、逐 sample 錄
+occupancy、半數 rank 從 ON 起始、不丟 burn。結果：
+
+1. **弛豫是有限的**：dressing transient ~10–15k samples 後 p(t) 進入平台，
+   平台區 32k samples 殘餘漂移 z = −0.10 / −0.75（統計零）。
+2. **兩臂收斂到同一平台**（末端 gap 與 0 一致）→ 平穩分佈唯一，estimator
+   完整性直接確認；慢變數是兩臂共享的 worldline σˣ dressing，與 bit
+   起始 sector 無關。
+3. **window 漂移全由 burn=200 造成**：每個窗都把 10–15k 的爬升段平均進去，
+   窗越長 transient 佔比越小 → 「趨近平台」被誤讀成「永不收斂」。
+   平台 stage 值：stage 1 = −1.020±0.075（8k 窗值 −1.54）、
+   stage 3 = −0.999±0.089（8k 窗值 −1.21）。
+
+**修正**：driver/scripts 新增 `--growth-burn-per-stage` / `GROWTH_BURN`
+（在最終 λ 丟 N samples 再錄，與 mc-only stage equil 解耦）。生產處方：
+**GROWTH_BURN=16000 + GROWTH_SAMPLES=32000**。修正版生產 = job 27135
+（結果待補）。對照組 per-chain flip 率健康且與生產一致（log 印的
+`flips=` 是 rank-0 單鏈，別再誤讀成 pooled）。
+
+**方法論教訓（第五代）**：residence ladder 的紀律清單再加一條——
+(5) burn 長度必須由**時序診斷**（兩臂 p(t) 合流＋平台平坦度）決定，
+不能猜；window-scaling 三點法只能報警，分不清「慢收斂」和「固定
+transient 被攤薄」。備案（未動用）：BRA 式 Ω-anneal anchor
+（arXiv:2412.01384 bipartite reweight-annealing——固定 string、沿 Ω
+重加權到 x-極化參考點 O_C=1，繞開 sector toggle）；若未來幾何/更大 M
+上 transient 變得不可負擔，此路線零件（RB 重加權、ladder 誤差傳播）現成。
