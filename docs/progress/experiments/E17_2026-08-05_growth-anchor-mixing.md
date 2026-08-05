@@ -41,8 +41,13 @@ Window 序列（總 anchor）：
 非 glassy、非 estimator bug（兩臂同平台 = 直接的 detailed-balance 檢查）。
 window-scaling 多點法只能報警，**分不清慢收斂與固定 transient 攤薄**；
 burn 長度必須由兩臂時序診斷決定。§9 的「定案」−6.65（1k 窗）與 27121
-的 −4.46（32k 窗）都是偏低值；收斂 anchor 待 27135（預期 ≳ −4，六 stage
-平台和）。
+的 −4.46（32k 窗）都是偏低值；收斂 anchor（27135，burn 16k + record 32k）：
+**log O_C(δ=6) = −4.289 ± 0.242**（O_C = 0.0137(33)；min stage flips 1209，
+stage 1 tune 到 λ=0.9992 偏鋒利、誤差被它主導）。λ-不變性交叉檢驗 vs
+27133 平台：stage 1 z=−1.10、stage 3 z=+1.67 ✓。最終曲線
+`plots/oc_curve_final_M227600.png`：log O_C 從 δ=5 的 −4.93 單調降到
+δ=1.5 的 −6.66；SL-候選窗 O_C(4.25)=5.5(8)e-3(pt)×e^{±0.24}(anchor)，
+比平衡 |A_v|≈0.82 低 ~150×。
 
 ## 後續
 - → 27135（burn 16k + record 32k 生產）＝最終 anchor；與 27121 drag 曲線
