@@ -374,3 +374,31 @@ transient 被攤薄」。備案（未動用）：BRA 式 Ω-anneal anchor
 （arXiv:2412.01384 bipartite reweight-annealing——固定 string、沿 Ω
 重加權到 x-極化參考點 O_C=1，繞開 sector toggle）；若未來幾何/更大 M
 上 transient 變得不可負擔，此路線零件（RB 重加權、ladder 誤差傳播）現成。
+
+## 11. M=3,000,000 擴展與 BRA 路線的否定（2026-08-06）
+
+**M=3M probe（27139）**：引擎可跑（1.11s/sample ≈ 13.2× 線性 scaling、記憶
+體 OK）。growth ladder 的 stage 0,1,3,5 健康（flip 2–8%/sample），但
+**stage 2,4 崩潰**（flip 0.02–0.075%，λ tune 被推到 0.9994/0.9999）：ramp
+慢 13 倍後部分弦 sector 比值指數變小，toggle 本身的組態瓶頸加深——
+λ-Jarzynski 在 227600 的死因以逐-bit 形式復發。**toggle 型 anchor 的
+M-scaling 是結構性軟肋。**
+
+**BRA（arXiv:2412.01384）全域 anneal 路線否定**：曾提議固定 string 沿
+Ω（實為全域 bond-weight scale g，engine 中 V_ij∝Ω、δ 以 Ω 為單位）anneal
+到 x-極化參考點。誤差傳播算清楚後死刑：per-rung 重加權比值 =
+(g′/g)^{n_bond}，n_bond 是全字串 extensive 量（sd ~ √(2M) ≳ 2000）；
+兩 sector 獨立取樣，bulk 漲落在 log Z 差中**不相消**。sem=0.2 需
+~2G²·Var(n_bond)/0.04 ≈ 10⁹ 級 mc_steps——超預算三個數量級。Wang et al.
+的 demo 在 extensive 尺度 ~10⁴（L≤20、β=2L），我們是 6×10⁶。結論：
+**bipartite（雙獨立鏈）重加權對 intensive 差的變異數是 extensive 的**；
+toggle/residence 家族（單鏈、bulk 恆等相消）才是這個問題的正確方法類。
+局部形變（seam twist-angle 積分）可避開 extensive 病但引入複權重
+（sign problem）——存檔不建。
+
+**M=3M anchor 改走強化 growth**：(1) 成長順序最佳化——順序只影響經過
+哪些部分弦中間態（乘積 telescope）；probe 27142（輪轉 86..85）/
+27143（跳躍 84,86,88,85,87,89）對比 27139 基線的 worst-stage flip rate。
+(2) toggle attempts 4→16/32。(3) 兩臂診斷定 burn 後長 stage。
+drag 曲線與 anchor 解耦先行：spr 標定 probe 27140（spr=8192）/
+27141（4096），目標 rung log-sd ≲0.3 下最大 spr。
