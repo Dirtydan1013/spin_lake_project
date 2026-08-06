@@ -43,8 +43,8 @@ ax.errorbar([6.0], [a_oc],
 ax.axvspan(4.0, 4.5, alpha=0.10, color="C2",
            label=r"SL-candidate window ($Z_l(2)$ peak)")
 ax.set_xlabel(r"$\delta/\Omega$ (seam position $m \to \delta(m)$)")
-ax.set_ylabel(r"$O_C = \langle \prod_{i\in C} \sigma^x_i\rangle$  (hexagon $A_v$)")
-ax.set_title("Sweep-state hexagon loop coherence, kagome_bond 6x6 PBC, "
+ax.set_ylabel(r"$O_C = \langle \prod_{i\in C} \sigma^x_i\rangle$  (hexagon plaquette $B_p$)")
+ax.set_title("Sweep-state hexagon plaquette coherence, kagome_bond 6x6 PBC, "
              "M=227600\n(raw expectation values; drag 27121 x anchor 27135)")
 ax.set_ylim(bottom=0)
 ax.legend(fontsize=8, loc="upper left")

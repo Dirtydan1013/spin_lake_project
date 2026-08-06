@@ -35,10 +35,10 @@ ax.fill_between(deltas, log_oc - ANCHOR_SEM, log_oc + ANCHOR_SEM,
 ax.errorbar([6.0], [ANCHOR], [ANCHOR_SEM], fmt="s", ms=8, color="C3",
             capsize=4, label=fr"anchor: $\log O_C(6)={ANCHOR:.2f}\pm{ANCHOR_SEM:.2f}$")
 ax.axvspan(4.0, 4.5, alpha=0.10, color="C2",
-           label=r"SL-candidate window ($Z_l(2)$ peak, $|A_v|\approx0.82$ eq.)")
+           label=r"SL-candidate window ($Z_l(2)$ peak)")
 ax.set_xlabel(r"$\delta/\Omega$ (seam position $m \to \delta(m)$)")
-ax.set_ylabel(r"$\log\,O_C = \log\langle \prod_{i\in C} \sigma^x_i\rangle$  (hexagon $A_v$)")
-ax.set_title("Sweep-state hexagon loop coherence, kagome_bond 6x6 PBC, "
+ax.set_ylabel(r"$\log\,O_C = \log\langle \prod_{i\in C} \sigma^x_i\rangle$  (hexagon plaquette $B_p$)")
+ax.set_title("Sweep-state hexagon plaquette coherence, kagome_bond 6x6 PBC, "
              "M=227600\n(drag 27121 x corrected growth anchor 27135)")
 ax.legend(fontsize=8, loc="lower right")
 ax.grid(alpha=0.3)
