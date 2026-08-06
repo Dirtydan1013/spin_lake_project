@@ -186,6 +186,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                         drag_sweeps_between_samples: int = 1,
                         drag_burn_per_rung: int = 5,
                         drag_slots_per_rung: int = 1,
+                        drag_bidirectional: bool = False,
                         drag_repeats: int = 1,
                         drag_thermalize: int = -1,
                         drag_equil_at_anchor: int = 100,
@@ -641,6 +642,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
             sweeps_between_samples=int(drag_sweeps_between_samples),
             burn_per_rung=int(drag_burn_per_rung),
             slots_per_rung=int(drag_slots_per_rung),
+            bidirectional=bool(drag_bidirectional),
             repeats=int(drag_repeats),
             string_sites=np.asarray(list(string_sites), dtype=np.int32),
         )
@@ -648,6 +650,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                   n_sweeps_between_samples=drag_sweeps_between_samples,
                   n_burn_per_rung=drag_burn_per_rung,
                   slots_per_rung=drag_slots_per_rung,
+                  bidirectional=drag_bidirectional,
                   n_equil_at_anchor=drag_equil_at_anchor)
 
         def _one_pass():
@@ -701,6 +704,7 @@ def run_string_work_mpi(*, N: int, M: int, Omega: float, Rb: float,
                 sweeps_between_samples=int(drag_sweeps_between_samples),
                 burn_per_rung=int(drag_burn_per_rung),
                 slots_per_rung=int(drag_slots_per_rung),
+                bidirectional=bool(drag_bidirectional),
                 thermalize=int(n_therm_drag), elapsed=float(t_drag),
                 log_r_passes=mat, log_r_sem_passes=within,
                 log_r_mean=log_r_mean,
@@ -910,6 +914,12 @@ def main():
     parser.add_argument("--drag-samples-per-rung", type=int, default=400)
     parser.add_argument("--drag-sweeps-between-samples", type=int, default=1)
     parser.add_argument("--drag-burn-per-rung", type=int, default=5)
+    parser.add_argument("--drag-bidirectional",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="symmetric two-ensemble rung estimates (forward "
+                             "+ reverse RB means averaged) — cancels the "
+                             "one-sided Jensen bias that dominates at large M "
+                             "(probes 27140/27141); REQUIRED for M >~ 1e6")
     parser.add_argument("--drag-slots-per-rung", type=int, default=1,
                         help="slots per RB rung; raise until the rung log-sd is "
                              "~0.3 (cost scales as 1/slots_per_rung at fixed "
@@ -1028,6 +1038,7 @@ def main():
         drag_sweeps_between_samples=args.drag_sweeps_between_samples,
         drag_burn_per_rung=args.drag_burn_per_rung,
         drag_slots_per_rung=args.drag_slots_per_rung,
+        drag_bidirectional=args.drag_bidirectional,
         drag_repeats=args.drag_repeats,
         drag_thermalize=args.drag_thermalize,
         drag_equil_at_anchor=args.drag_equil_at_anchor,

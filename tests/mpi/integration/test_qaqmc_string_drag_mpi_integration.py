@@ -97,9 +97,11 @@ def test_string_growth_anchor_driver_no_lambda():
             growth_tune_samples=100, growth_equil_per_stage=50,
             drag_grid=[12], drag_mirror=True,
             drag_samples_per_rung=30, drag_slots_per_rung=2,
+            drag_bidirectional=True,
             drag_repeats=1, drag_thermalize=100,
             verbose=False,
         )
+        assert out["drag"]["bidirectional"] is True
         g = out["growth"]
         assert g is not None and np.isfinite(g["log_o_c"])
         assert g["n_ranks_valid"] == 1

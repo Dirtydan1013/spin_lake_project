@@ -59,6 +59,7 @@ N_QMC_SWEEPS=${N_QMC_SWEEPS:-1}
 # PROBE_DRAG_SAMPLES x DRAG_REPEATS (rung count identical by construction).
 DRAG_DELTAS=${DRAG_DELTAS:-""}
 DRAG_SPR=${DRAG_SPR:-64}
+DRAG_BIDIR=${DRAG_BIDIR:-0}
 DRAG_SAMPLES=${DRAG_SAMPLES:-400}
 DRAG_SWEEPS=${DRAG_SWEEPS:-1}
 DRAG_BURN=${DRAG_BURN:-5}
@@ -147,6 +148,7 @@ $MPIEXEC python -u -m src.mpi.qaqmc_string_work_mpi \
     $( [ "$GROWTH" = "1" ] && printf "%s" "--growth-samples-per-stage $PROBE_GROWTH_SAMPLES --growth-sweeps-between-samples $GROWTH_SWEEPS --growth-equil-per-stage $GROWTH_EQUIL --growth-tune-samples $GROWTH_TUNE" ) \
     ${DRAG_DELTAS:+--drag-deltas "$DRAG_DELTAS"} \
     ${DRAG_DELTAS:+--drag-slots-per-rung "$DRAG_SPR"} \
+    $( [ -n "$DRAG_DELTAS" ] && [ "$DRAG_BIDIR" = "1" ] && printf "%s" "--drag-bidirectional" ) \
     ${DRAG_DELTAS:+--drag-samples-per-rung "$PROBE_DRAG_SAMPLES"} \
     ${DRAG_DELTAS:+--drag-sweeps-between-samples "$DRAG_SWEEPS"} \
     ${DRAG_DELTAS:+--drag-burn-per-rung "$DRAG_BURN"} \

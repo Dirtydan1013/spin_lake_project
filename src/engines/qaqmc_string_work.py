@@ -82,6 +82,7 @@ class StringDragLadderResult:
     rung_log: np.ndarray      # (n_rungs,) log of each rung's mean RB ratio
     rung_sem: np.ndarray      # (n_rungs,) SEM of log rung ratio
     n_samples_per_rung: int
+    bidirectional: bool = False
 
 
 @dataclass
@@ -449,7 +450,8 @@ class QAQMCStringWorkRydberg:
                         n_burn_per_rung: int = 5,
                         n_equil_at_anchor: int = 0,
                         slots_per_rung: int = 1,
-                        m_anchor: int | None = None) -> StringDragLadderResult:
+                        m_anchor: int | None = None,
+                        bidirectional: bool = False) -> StringDragLadderResult:
         """RB ladder for the drag curve -- the recommended estimator.
 
         Walks the cut from the anchor through ``m_grid`` (record points) in
@@ -486,6 +488,24 @@ class QAQMCStringWorkRydberg:
         rung are Markov-chain correlated -- increase
         ``n_sweeps_between_samples`` until the quoted SEM is honest (the
         rate-independence check in the vs-ED gate covers this).
+
+        ``bidirectional=True`` (the large-M mode): each rung is estimated
+        from BOTH endpoint ensembles -- the forward RB mean sampled at the
+        rung's start plus the reverse RB mean sampled at its end (the very
+        ensemble the walk equilibrates next anyway) -- and the rung log
+        ratio is the symmetric average 0.5*(log fwd_mean - log rev_mean).
+        The finite-sample Jensen bias of log<exp(.)> is ~ -sigma^2/(2n) with
+        OPPOSITE sign in the two directions, so the symmetric average
+        cancels it to leading order.  One-sided ladders accumulate that
+        bias coherently over all rungs and across all passes (probes
+        27140/27141 at M=3e6: -540 vs -1210 for a -0.6 truth, bias ~ spr^2)
+        -- at large M this mode is mandatory; the safe rung log-sd window
+        widens from ~0.3 to ~0.5-0.8.  Reverse evaluations consume no RNG,
+        so the sampled worldline stream is identical to the one-sided walk;
+        the only extra chain work is one final session at the last grid
+        point.  Adjacent rung estimates share an endpoint session, so the
+        quadrature SEM ignores their (small) covariance -- pass-scatter
+        aggregation across independent chains remains the honest error.
         """
         m_grid = self._validate_drag_grid(m_grid)
         if slots_per_rung < 1:
@@ -504,36 +524,103 @@ class QAQMCStringWorkRydberg:
         log_r_var = np.empty(n_grid, dtype=np.float64)
         rung_m, rung_log, rung_sem = [], [], []
         log_cum, var_cum = 0.0, 0.0
+
+        if not bidirectional:
+            m_curr = m_anchor
+            samples = np.empty(n_samples_per_rung, dtype=np.float64)
+            for j, m in enumerate(m_grid):
+                m = int(m)
+                step = 1 if m > m_curr else -1
+                while m_curr != m:
+                    m_next = m_curr + step * min(slots_per_rung, abs(m - m_curr))
+                    for s in range(n_samples_per_rung):
+                        samples[s] = math.exp(self._eng.seam_rb_log_ratio_to(m_next))
+                        for _ in range(n_sweeps_between_samples):
+                            self._eng.mc_step()
+                    mean = float(samples.mean())
+                    sem = float(samples.std(ddof=1)) / math.sqrt(n_samples_per_rung)
+                    log_cum += math.log(mean)
+                    var_cum += (sem / mean) ** 2
+                    m_curr = m_next
+                    rung_m.append(m_curr)
+                    rung_log.append(math.log(mean))
+                    rung_sem.append(sem / mean)
+                    self._eng.seam_drag_to(m_curr)
+                    for _ in range(n_burn_per_rung):
+                        self._eng.mc_step()
+                log_r[j] = log_cum
+                log_r_var[j] = var_cum
+            return StringDragLadderResult(
+                m_anchor=m_anchor, m_grid=m_grid,
+                log_r=log_r, log_r_sem=np.sqrt(log_r_var), r=np.exp(log_r),
+                rung_m=np.array(rung_m), rung_log=np.array(rung_log),
+                rung_sem=np.array(rung_sem),
+                n_samples_per_rung=n_samples_per_rung,
+            )
+
+        # -- bidirectional: symmetric two-ensemble rung estimates ----------
+        # Precompute every rung boundary; each position hosts ONE sampling
+        # session that serves the incoming rung (reverse eval) and the
+        # outgoing rung (forward eval) with the same worldline samples.
+        positions = [m_anchor]
         m_curr = m_anchor
-        samples = np.empty(n_samples_per_rung, dtype=np.float64)
-        for j, m in enumerate(m_grid):
+        for m in m_grid:
             m = int(m)
             step = 1 if m > m_curr else -1
             while m_curr != m:
-                m_next = m_curr + step * min(slots_per_rung, abs(m - m_curr))
-                for s in range(n_samples_per_rung):
-                    samples[s] = math.exp(self._eng.seam_rb_log_ratio_to(m_next))
-                    for _ in range(n_sweeps_between_samples):
-                        self._eng.mc_step()
-                mean = float(samples.mean())
-                sem = float(samples.std(ddof=1)) / math.sqrt(n_samples_per_rung)
-                log_cum += math.log(mean)
-                var_cum += (sem / mean) ** 2
-                m_curr = m_next
-                rung_m.append(m_curr)
-                rung_log.append(math.log(mean))
-                rung_sem.append(sem / mean)
-                self._eng.seam_drag_to(m_curr)
+                m_curr += step * min(slots_per_rung, abs(m - m_curr))
+                positions.append(m_curr)
+        grid_at = {}
+        gi = 0
+        for idx, p in enumerate(positions):
+            if gi < n_grid and p == int(m_grid[gi]):
+                grid_at[idx] = gi
+                gi += 1
+
+        fwd = np.empty(n_samples_per_rung, dtype=np.float64)
+        rev = np.empty(n_samples_per_rung, dtype=np.float64)
+        prev_fwd = None  # (log mean, rel-sem^2) of the outgoing forward eval
+        n_pos = len(positions)
+        for i in range(n_pos):
+            if i > 0:
+                self._eng.seam_drag_to(positions[i])
                 for _ in range(n_burn_per_rung):
                     self._eng.mc_step()
-            log_r[j] = log_cum
-            log_r_var[j] = var_cum
+            has_fwd = i + 1 < n_pos
+            for s in range(n_samples_per_rung):
+                if i > 0:
+                    rev[s] = math.exp(
+                        self._eng.seam_rb_log_ratio_to(positions[i - 1]))
+                if has_fwd:
+                    fwd[s] = math.exp(
+                        self._eng.seam_rb_log_ratio_to(positions[i + 1]))
+                for _ in range(n_sweeps_between_samples):
+                    self._eng.mc_step()
+            if i > 0:
+                r_mean = float(rev.mean())
+                r_sem = float(rev.std(ddof=1)) / math.sqrt(n_samples_per_rung)
+                f_log, f_var = prev_fwd
+                step_log = 0.5 * (f_log - math.log(r_mean))
+                step_var = 0.25 * (f_var + (r_sem / r_mean) ** 2)
+                log_cum += step_log
+                var_cum += step_var
+                rung_m.append(positions[i])
+                rung_log.append(step_log)
+                rung_sem.append(math.sqrt(step_var))
+            if has_fwd:
+                f_mean = float(fwd.mean())
+                f_sem = float(fwd.std(ddof=1)) / math.sqrt(n_samples_per_rung)
+                prev_fwd = (math.log(f_mean), (f_sem / f_mean) ** 2)
+            if i in grid_at:
+                log_r[grid_at[i]] = log_cum
+                log_r_var[grid_at[i]] = var_cum
         return StringDragLadderResult(
             m_anchor=m_anchor, m_grid=m_grid,
             log_r=log_r, log_r_sem=np.sqrt(log_r_var), r=np.exp(log_r),
             rung_m=np.array(rung_m), rung_log=np.array(rung_log),
             rung_sem=np.array(rung_sem),
             n_samples_per_rung=n_samples_per_rung,
+            bidirectional=True,
         )
 
 
@@ -542,7 +629,8 @@ class QAQMCStringWorkRydberg:
                                 n_sweeps_between_samples: int = 1,
                                 n_burn_per_rung: int = 5,
                                 n_equil_at_anchor: int = 100,
-                                slots_per_rung: int = 1) -> StringDragMirroredResult:
+                                slots_per_rung: int = 1,
+                                bidirectional: bool = False) -> StringDragMirroredResult:
         """Mirror-averaged drag curve about the symmetric anchor m = M.
 
         Runs the left family down ``m_grid_forward`` (strictly decreasing,
@@ -572,7 +660,8 @@ class QAQMCStringWorkRydberg:
                       n_sweeps_between_samples=n_sweeps_between_samples,
                       n_burn_per_rung=n_burn_per_rung,
                       n_equil_at_anchor=n_equil_at_anchor,
-                      slots_per_rung=slots_per_rung)
+                      slots_per_rung=slots_per_rung,
+                      bidirectional=bidirectional)
         left = self.run_drag_ladder(m_grid_forward, m_anchor=m_anchor, **kwargs)
         m_mirror = 2 * m_anchor - m_grid_forward
         right = self.run_drag_ladder(m_mirror, m_anchor=m_anchor, **kwargs)

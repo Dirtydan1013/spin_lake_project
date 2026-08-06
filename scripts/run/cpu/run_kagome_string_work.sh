@@ -95,6 +95,7 @@ DRAG_SAMPLES=${DRAG_SAMPLES:-400}       # equilibrium samples per rung
 DRAG_SWEEPS=${DRAG_SWEEPS:-1}           # mc_steps between rung samples
 DRAG_BURN=${DRAG_BURN:-5}               # mc_steps after each rung move
 DRAG_SPR=${DRAG_SPR:-64}               # slots per rung
+DRAG_BIDIR=${DRAG_BIDIR:-0}            # 1 = symmetric fwd/rev rungs (REQUIRED for M >~ 1e6)
 DRAG_REPEATS=${DRAG_REPEATS:-1}         # independent ladder passes per rank
 DRAG_THERMALIZE=${DRAG_THERMALIZE:--1}  # reverse-sector equil (-1 = N_THERMALIZE)
 
@@ -191,6 +192,7 @@ $MPIEXEC \
     ${DRAG_DELTAS:+--drag-sweeps-between-samples "$DRAG_SWEEPS"} \
     ${DRAG_DELTAS:+--drag-burn-per-rung "$DRAG_BURN"} \
     ${DRAG_DELTAS:+--drag-slots-per-rung "$DRAG_SPR"} \
+    $( [ -n "$DRAG_DELTAS" ] && [ "$DRAG_BIDIR" = "1" ] && printf "%s" "--drag-bidirectional" ) \
     ${DRAG_DELTAS:+--drag-repeats "$DRAG_REPEATS"} \
     ${DRAG_DELTAS:+--drag-thermalize "$DRAG_THERMALIZE"} \
     $( [ -n "$DRAG_DELTAS" ] && [ "$DRAG_MIRROR" != "1" ] && printf %s --no-drag-mirror ) \

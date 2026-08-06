@@ -65,16 +65,18 @@ def _ed_o_b(pos, m_values):
 
 
 def _ladder_families(eng, n_samples_per_rung, n_sweeps_between_samples,
-                     slots_per_rung=1):
+                     slots_per_rung=1, bidirectional=False):
     eng.thermalize(1000, direction="reverse")  # full-mask sector at the anchor
     res_r = eng.run_drag_ladder(
         np.array(GRID_RIGHT), n_samples_per_rung=n_samples_per_rung,
         n_sweeps_between_samples=n_sweeps_between_samples,
-        n_equil_at_anchor=100, slots_per_rung=slots_per_rung, m_anchor=M)
+        n_equil_at_anchor=100, slots_per_rung=slots_per_rung, m_anchor=M,
+        bidirectional=bidirectional)
     res_l = eng.run_drag_ladder(
         np.array(GRID_LEFT), n_samples_per_rung=n_samples_per_rung,
         n_sweeps_between_samples=n_sweeps_between_samples,
-        n_equil_at_anchor=100, slots_per_rung=slots_per_rung, m_anchor=M)
+        n_equil_at_anchor=100, slots_per_rung=slots_per_rung, m_anchor=M,
+        bidirectional=bidirectional)
     return res_r, res_l
 
 
@@ -94,6 +96,35 @@ def test_drag_ladder_curve_matches_ed():
                                     n_sweeps_between_samples=2)
     _check_family_vs_ed(res_r, ed, "right", tol=0.08)
     _check_family_vs_ed(res_l, ed, "left", tol=0.08)
+
+
+def test_drag_ladder_bidirectional_matches_ed_and_spr_consistent():
+    # Symmetric fwd/rev rung estimator (the large-M mode): must hit ED like
+    # the one-sided ladder, AND agree with itself across rung block sizes.
+    # The spr-consistency clause is the gate that would have caught the
+    # M=3e6 one-sided Jensen bias (probes 27140/27141: -540 vs -1210 for a
+    # O(-1) truth, per-rung bias ~ spr^2) -- a biased rung estimator gives
+    # spr-DEPENDENT curves, an unbiased one cannot.
+    results = {}
+    for spr, seed in ((1, 41), (4, 42)):
+        eng, pos = _make_engine(seed=seed)
+        ed = _ed_o_b(pos, GRID_RIGHT + GRID_LEFT + [M])
+        res_r, res_l = _ladder_families(eng, n_samples_per_rung=800,
+                                        n_sweeps_between_samples=2,
+                                        slots_per_rung=spr,
+                                        bidirectional=True)
+        assert res_r.bidirectional and res_l.bidirectional
+        _check_family_vs_ed(res_r, ed, f"right-bidir spr={spr}", tol=0.08)
+        _check_family_vs_ed(res_l, ed, f"left-bidir spr={spr}", tol=0.08)
+        results[spr] = (res_r, res_l)
+    for fam, name in ((0, "right"), (1, "left")):
+        a, b = results[1][fam], results[4][fam]
+        diff = abs(float(a.log_r[-1] - b.log_r[-1]))
+        sem = float(np.sqrt(a.log_r_sem[-1] ** 2 + b.log_r_sem[-1] ** 2))
+        print(f"  [spr-consistency {name}] |dlog r|={diff:.4f} sem={sem:.4f}")
+        assert diff < max(3.0 * sem, 0.08), (
+            f"bidirectional ladder is spr-dependent on the {name} family: "
+            f"|dlog r|={diff:.4f} (sem {sem:.4f})")
 
 
 def test_drag_ladder_rate_independence():
