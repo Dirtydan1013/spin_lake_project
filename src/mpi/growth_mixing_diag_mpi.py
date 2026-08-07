@@ -64,7 +64,12 @@ def main() -> None:
     p.add_argument("--epsilon", type=float, default=0.01)
     p.add_argument("--delta-groups", type=int, default=600)
     p.add_argument("--string-sites", type=str, default="84,85,86,87,88,89")
-    p.add_argument("--stage-lambdas", type=str, default=DEFAULT_LAMBDAS)
+    p.add_argument("--stage-lambdas", type=str, default=DEFAULT_LAMBDAS,
+                   help="comma-separated per-stage lambdas; pass 'tune' to "
+                        "autotune on rank 0 and broadcast (needed for any "
+                        "site order / M whose lambdas were never measured)")
+    p.add_argument("--tune-samples", type=int, default=300,
+                   help="samples per autotune round when --stage-lambdas tune")
     p.add_argument("--record-stages", type=str, default="1,3")
     p.add_argument("--T", type=int, default=48000,
                    help="samples recorded per long stage")
@@ -84,7 +89,9 @@ def main() -> None:
     seed_r = _rank_seed(args.seed, rank)
 
     sites = [int(s) for s in args.string_sites.split(",")]
-    lambdas = np.asarray([float(x) for x in args.stage_lambdas.split(",")])
+    autotune = args.stage_lambdas.strip().lower() == "tune"
+    lambdas = (np.empty(len(sites), dtype=np.float64) if autotune else
+               np.asarray([float(x) for x in args.stage_lambdas.split(",")]))
     record_stages = {int(s) for s in args.record_stages.split(",")}
     L = len(sites)
     if lambdas.shape != (L,):
@@ -102,7 +109,7 @@ def main() -> None:
 
     if rank == 0:
         print(f"[MIXDIAG] N={N}, M={args.M}, ranks={n_ranks}, sites={sites}, "
-              f"lambdas={np.round(lambdas, 4).tolist()}, "
+              f"lambdas={'(autotune)' if autotune else np.round(lambdas, 4).tolist()}, "
               f"record_stages={sorted(record_stages)}, T={args.T}, "
               f"short={args.short_samples}", flush=True)
 
@@ -114,6 +121,23 @@ def main() -> None:
     eng.set_string_sites(sites_eng)
     eng.thermalize(args.n_thermalize, direction="forward")
     core = eng._eng
+
+    if autotune:
+        # Same protocol as the production driver: rank 0 tunes on a short
+        # ladder, everyone samples at the SHARED lambdas (per-rank tuning
+        # would make the two arms incomparable).
+        if rank == 0:
+            t0 = time.perf_counter()
+            tune_res = eng.run_growth_residence_ladder(
+                n_samples_per_stage=max(args.tune_samples, 50),
+                n_sweeps_between_samples=1,
+                n_equil_per_stage=args.n_equil_per_stage,
+                n_tune_samples=args.tune_samples,
+                n_toggle_attempts=args.n_toggle_attempts)
+            lambdas = np.asarray(tune_res.lambdas, dtype=np.float64)
+            print(f"[MIXDIAG] rank-0 autotune done ({time.perf_counter()-t0:.0f}s): "
+                  f"lambdas={np.round(lambdas, 4).tolist()}", flush=True)
+        comm.Bcast(lambdas, root=0)
 
     start_on = (rank % 2 == 1)
     stage_occ: dict[int, np.ndarray] = {}
